@@ -14,9 +14,11 @@
 //!   another machine's host names or a private domain.
 //! - `$HOME/.config/faber-privacy/not-private`: names the sources find that are
 //!   public anyway, or ordinary words that would only raise false hits. A name
-//!   comes off whole: the part before a dot and the windows of a long name too.
-//!   A first word it shares with another private repository stays listed: if
-//!   that word is public too, list it in `not-private` itself.
+//!   comes off whole: the part before its first dot and the windows of a long
+//!   name too. A first word it shares with another private repository stays
+//!   listed, unless the word is that part before the dot (`gizmo.api` takes
+//!   `gizmo` off even while `gizmo-web` is private). If a word that stays is
+//!   public too, list it in `not-private` itself.
 //!
 //! With `FABER_PRIVACY_KEY` exported (ADR-0058):
 //!
@@ -28,8 +30,9 @@
 //! It prints counts, never names. `--list` prints the names themselves, for a
 //! local terminal only, and needs no key. A name stays listed after its source
 //! is gone: one that was private once stays worth catching. Only `not-private`
-//! takes a name off. After `--write`, run the tree gate with the key: a hit on an
-//! ordinary word means that word belongs in `not-private`.
+//! takes a name off, besides the account's own login and display name, which
+//! are public and never listed. After `--write`, run the tree gate with the
+//! key: a hit on an ordinary word means that word belongs in `not-private`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -217,7 +220,7 @@ fn lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// What [`derive`] read, kept apart from the reading so the rules in
+/// What [`derive()`] read, kept apart from the reading so the rules in
 /// [`candidates`] can be tested.
 struct Sources {
     /// Private repository names.
@@ -253,9 +256,9 @@ struct Derived {
 ///
 /// - `not_private`, and every token such a name expands to ([`listed_tokens`]:
 ///   its own, its dotted head, its windows), even one that another private name
-///   shares: declaring a name public takes off all it put on by itself. A first
-///   word that another private repository shares stays listed until that word
-///   is in `not_private` itself;
+///   shares: declaring a name public takes off all it put on by itself. So a
+///   first word that another private repository shares stays listed until that
+///   word is in `not_private` itself, or is the dotted head of a name there;
 /// - the account's login and display name and each word of them;
 /// - tokens shorter than [`MIN_TOKEN`], which the scan never digests.
 ///
@@ -410,9 +413,14 @@ mod tests {
         let d = denied(&sources(&["gizmo-api", "gizmo-web"], &[], &["gizmo-api"]));
         assert!(d.contains(&"gizmo".to_string()));
         assert!(!d.contains(&"gizmoapi".to_string()));
-        // Only the word itself takes it off.
+        // The word itself takes it off.
         let d = denied(&sources(&["gizmo-api", "gizmo-web"], &[], &["gizmo"]));
         assert!(!d.contains(&"gizmo".to_string()));
+        // So does a declared name it is the dotted head of: that name put the
+        // word on by itself, although the other repository shares it too.
+        let d = denied(&sources(&["gizmo.api", "gizmo-web"], &[], &["gizmo.api"]));
+        assert!(!d.contains(&"gizmo".to_string()));
+        assert!(d.contains(&"gizmoweb".to_string()));
     }
 
     #[test]
