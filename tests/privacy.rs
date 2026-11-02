@@ -104,7 +104,10 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             continue;
         }
         let path = entry.path();
-        if path.is_dir() {
+        // The entry's own type, not `path.is_dir()`, which follows a link: a
+        // link is published as the path it holds, and one to a directory above
+        // it would walk that directory again, over and over.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
             walk(&path, out);
         } else {
             out.push(path);
@@ -112,12 +115,21 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Text, for scanning purposes, is anything without a NUL byte near the front —
-/// which keeps icons, `.icns` bundles and lockfile binaries out of the scan
-/// without maintaining an extension list. Bytes that are not UTF-8 are replaced,
-/// as `examples/privacy_scan.rs` does, so one stray Latin-1 byte cannot hide a
+/// What publishing `path` publishes, as text.
+///
+/// For a symbolic link that is the path it holds: git stores the link, not
+/// what it points at. Reading through the link would scan a file that is not
+/// published, or, where the target is absent (as in CI), nothing at all.
+///
+/// Otherwise, text is anything without a NUL byte near the front — which keeps
+/// icons, `.icns` bundles and lockfile binaries out of the scan without
+/// maintaining an extension list. Bytes that are not UTF-8 are replaced, as
+/// `examples/privacy_scan.rs` does, so one stray Latin-1 byte cannot hide a
 /// whole file.
 fn read_text(path: &Path) -> Option<String> {
+    if let Ok(target) = std::fs::read_link(path) {
+        return Some(target.to_string_lossy().into_owned());
+    }
     let bytes = std::fs::read(path).ok()?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
         return None;
@@ -156,6 +168,56 @@ fn a_tracked_path_keeps_the_bytes_git_printed() {
     use std::os::unix::ffi::OsStrExt;
     let raw = b"docs/caf\xe9.md";
     assert_eq!(git_path(raw).as_os_str().as_bytes(), raw);
+}
+
+/// An empty directory of its own under cargo's scratch space.
+#[cfg(unix)]
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("privacy-{name}-{}", std::process::id()));
+    // Left over from a run that failed before cleaning up, if anything.
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create a scratch directory");
+    dir
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_is_scanned_as_the_path_it_holds() {
+    use std::os::unix::fs::symlink;
+    let dir = scratch_dir("links");
+    // Assembled at run time: spelled out, these lines would trip the gate.
+    let home = format!("/Users/{}/notes", "adalovelace");
+    let credential = format!("token = {}{}", "ghp_", "0123456789abcdefghijklmnopqrstuv");
+    // A link into someone's home points at nothing on any other machine, CI
+    // included, and git publishes the path all the same.
+    symlink(&home, dir.join("dangling")).expect("link to a home path");
+    // A link to a file: the file is not what the link publishes.
+    std::fs::write(dir.join("target.txt"), &credential).expect("write the target");
+    symlink("target.txt", dir.join("link")).expect("link to the target");
+    let dangling = read_text(&dir.join("dangling"));
+    let link = read_text(&dir.join("link"));
+    std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+
+    let dangling = dangling.expect("a link to nothing is still read");
+    assert!(carries_personal_path(&dangling), "the home path is scanned");
+    assert_eq!(link.as_deref(), Some("target.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_fallback_walk_lists_a_link_and_does_not_follow_it() {
+    use std::os::unix::fs::symlink;
+    let dir = scratch_dir("walk");
+    std::fs::write(dir.join("file.txt"), "text").expect("write a file");
+    // A link to the directory it sits in: followed, the walk would go round.
+    symlink(".", dir.join("loop")).expect("link to the directory");
+    let mut found = Vec::new();
+    walk(&dir, &mut found);
+    found.sort();
+    std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+
+    assert_eq!(found, [dir.join("file.txt"), dir.join("loop")]);
 }
 
 #[test]
