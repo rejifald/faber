@@ -13,7 +13,8 @@
 //! - `$HOME/.config/faber-privacy/extra-names`: names no source shows, such as
 //!   another machine's host names or a private domain.
 //! - `$HOME/.config/faber-privacy/not-private`: names the sources find that are
-//!   public anyway, or ordinary words that would only raise false hits.
+//!   public anyway, or ordinary words that would only raise false hits. A name
+//!   comes off whole: the part before a dot and the windows of a long name too.
 //!
 //! With `FABER_PRIVACY_KEY` exported (ADR-0058):
 //!
@@ -246,9 +247,15 @@ struct Derived {
 ///   `gizmo-web` → `gizmo`), so a project is caught by its own name, not only
 ///   by its repositories'.
 ///
-/// Never listed: `not_private`, the account's login and display name and each
-/// word of them, and tokens shorter than [`MIN_TOKEN`], which the scan never
-/// digests. faber's own repositories are not read at all.
+/// Never listed:
+///
+/// - `not_private`, and every token such a name expands to ([`listed_tokens`]:
+///   its own, its dotted head, its windows), even one that another private name
+///   shares: declaring a name public takes off all it put on;
+/// - the account's login and display name and each word of them;
+/// - tokens shorter than [`MIN_TOKEN`], which the scan never digests.
+///
+/// faber's own repositories are not read at all.
 fn candidates(sources: &Sources) -> Derived {
     let mut names: Vec<&str> = Vec::new();
     let mut firsts: HashMap<String, usize> = HashMap::new();
@@ -263,21 +270,7 @@ fn candidates(sources: &Sources) -> Derived {
 
     let mut deny = BTreeSet::new();
     for name in names {
-        deny.insert(name_token(name));
-        if let Some((head, _)) = name.split_once('.') {
-            deny.insert(name_token(head));
-        }
-        // Joined and lowercased as the scan joins them. A name of exactly
-        // MAX_JOIN words yields its own token again, and a shorter one nothing.
-        let spans = words(name);
-        for window in spans.windows(MAX_JOIN) {
-            deny.insert(
-                window
-                    .iter()
-                    .map(|w| name[w.clone()].to_ascii_lowercase())
-                    .collect(),
-            );
-        }
+        deny.extend(listed_tokens(name));
     }
     deny.extend(
         firsts
@@ -286,7 +279,11 @@ fn candidates(sources: &Sources) -> Derived {
             .map(|(word, _)| word),
     );
 
-    let mut never: BTreeSet<String> = sources.not_private.iter().map(|n| name_token(n)).collect();
+    let mut never: BTreeSet<String> = sources
+        .not_private
+        .iter()
+        .flat_map(|n| listed_tokens(n))
+        .collect();
     for own in &sources.own {
         never.insert(name_token(own));
         never.extend(own.split_whitespace().map(name_token));
@@ -294,6 +291,31 @@ fn candidates(sources: &Sources) -> Derived {
     never.remove("");
     deny.retain(|token| token.len() >= MIN_TOKEN && !never.contains(token));
     Derived { deny, never }
+}
+
+/// Every token one name stands for: its own ([`name_token`]); for a dotted name,
+/// the part before its first dot; and each run of [`MAX_JOIN`] adjacent words.
+/// Not yet filtered: it may hold an empty or short token, and repeats.
+///
+/// [`candidates`] lists these for a source name and takes the same ones off for
+/// a `not_private` name, so the two sides cannot drift apart.
+fn listed_tokens(name: &str) -> Vec<String> {
+    let mut tokens = vec![name_token(name)];
+    if let Some((head, _)) = name.split_once('.') {
+        tokens.push(name_token(head));
+    }
+    // Joined and lowercased as the scan joins them. A name of exactly MAX_JOIN
+    // words yields its own token again, and a shorter one nothing.
+    let spans = words(name);
+    for window in spans.windows(MAX_JOIN) {
+        tokens.push(
+            window
+                .iter()
+                .map(|w| name[w.clone()].to_ascii_lowercase())
+                .collect(),
+        );
+    }
+    tokens
 }
 
 /// A repository name's first word: up to its first `-`, `_` or `.`.
@@ -410,6 +432,29 @@ mod tests {
         assert!(!derived.deny.contains("publicorg"));
         assert!(derived.never.contains("publicorg"));
         assert!(derived.deny.contains("gizmoapi"));
+    }
+
+    #[test]
+    fn a_not_private_name_takes_off_everything_listing_it_would_put_on() {
+        // More than MAX_JOIN words and a domain: its own token, the part before
+        // the dot, and three windows of MAX_JOIN words.
+        let name = "my-app-v2-api.example";
+        assert_eq!(
+            words(name).len(),
+            MAX_JOIN + 2,
+            "my, app, v, 2, api, example"
+        );
+        let derived = candidates(&sources(&[], &[name], &[name]));
+        assert!(derived.deny.is_empty(), "{:?}", derived.deny);
+        for token in ["myappv2", "appv2api", "v2apiexample", "myappv2api"] {
+            assert!(derived.never.contains(token), "{token}");
+        }
+
+        // The dotted head alone, which a name of up to MAX_JOIN words has too.
+        let name = "widgetco.example";
+        let derived = candidates(&sources(&[], &[name], &[name]));
+        assert!(derived.deny.is_empty(), "{:?}", derived.deny);
+        assert!(derived.never.contains("widgetco"));
     }
 
     #[test]
