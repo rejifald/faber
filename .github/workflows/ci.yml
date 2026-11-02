@@ -1,0 +1,63 @@
+name: CI
+
+# For now: formatting, lints and the tests of what this repository holds, above
+# all the tree gate (tests/privacy.rs), which checks every tracked file. The rest
+# of faber's CI arrives with its code.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: linux · fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Each check below runs even when an earlier one failed, so one red step
+      # never hides another's verdict.
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The name check runs in its own step below, the only one the key reaches.
+      - name: Test
+        if: ${{ !cancelled() }}
+        run: cargo test --verbose -- --skip tree_names_no_private_project
+
+      # Names are checked under the FABER_PRIVACY_KEY secret (ADR-0058). It is
+      # required on every run GitHub gives secrets to, so a missing secret fails
+      # here rather than skipping the check. A fork's or Dependabot's pull request
+      # gets no secrets: it skips, with a warning.
+      - name: Privacy gate (names)
+        if: ${{ !cancelled() }}
+        env:
+          FABER_PRIVACY_KEY: ${{ secrets.FABER_PRIVACY_KEY }}
+          FABER_PRIVACY_KEY_REQUIRED: ${{ !github.event.pull_request || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+        run: cargo test --test privacy

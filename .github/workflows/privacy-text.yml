@@ -1,0 +1,87 @@
+name: Privacy (text)
+
+# The tree gate (tests/privacy.rs, run by ci.yml) covers tracked files. This
+# covers the other half of what a public repo publishes: commit messages, PR
+# titles and bodies, issue text and comments. A PR's commit messages and the
+# release notes generated from them are covered by the `pull_request` leg,
+# because the notes are built from those same messages and PR titles.
+#
+# Posted text is already public by the time this runs, so the issue/comment legs
+# are an alarm, not a prevention: a failed run is the signal to edit or delete
+# the text. The run never prints the matched token (public log) -- see
+# src/privacy.rs.
+#
+# Names are checked under the FABER_PRIVACY_KEY secret (ADR-0058). It is
+# required wherever GitHub passes secrets, so a missing secret fails the run. A
+# fork's or Dependabot's pull request gets none: its scan skips names, with a
+# warning, and still checks credentials and home paths.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scan:
+    name: privacy · text
+    runs-on: ubuntu-latest
+    steps:
+      # Everything but `pull_request` builds the scanner from the default branch,
+      # never from a PR ref: these events can be triggered by anyone, and must not
+      # run a contributor's code. `pull_request` has a read-only token, and secrets
+      # only for a branch of this repository, whose author can already write here,
+      # so the merge ref is acceptable there (as for ci.yml).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # The posted text comes from the event payload file, read with jq. It is
+      # never interpolated into the shell, so it cannot inject commands.
+      - name: Extract the text under scan
+        run: |
+          mkdir -p "$RUNNER_TEMP/scan"
+          jq -r '[.issue.title, .issue.body, .pull_request.title, .pull_request.body,
+                  .comment.body, .review.body] | map(select(. != null)) | join("\n\n")' \
+            "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/scan/event.txt"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git log "$BASE_SHA..$HEAD_SHA" --format=%B > "$RUNNER_TEMP/scan/commits.txt"
+          fi
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+      # Built in a step of its own, so no build script runs where the key is.
+      - name: Build the scanner
+        run: cargo build --quiet --example privacy_scan
+
+      - name: Scan (matches are never printed)
+        env:
+          FABER_PRIVACY_KEY: ${{ secrets.FABER_PRIVACY_KEY }}
+          FABER_PRIVACY_KEY_REQUIRED: ${{ !github.event.pull_request || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+        run: cargo run --quiet --example privacy_scan -- "$RUNNER_TEMP"/scan/*.txt
