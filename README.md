@@ -1,15 +1,15 @@
 <p align="center">
-  <img src=".github/assets/banner.svg" alt="faber: your own CI runners, on your own hardware. VM-isolated, hermetic, built-in mirrors, trust-gated." width="100%">
+  <img src=".github/assets/banner.svg" alt="faber: your own CI runners, on your own hardware. Faster jobs, service containers, isolated, trust-gated." width="100%">
 </p>
 
-**faber runs your CI jobs on hardware you own.** When a job is queued, faber starts a
-fresh runner for that one job, lets it run, and then throws the runner away. Today it
-works with **GitHub Actions**, on **Macs with Apple silicon**. Other platforms may
-follow.
+**faber runs your CI jobs on hardware you own.** A *runner* is the computer that
+actually carries out a CI job. When a job is queued, faber starts a fresh runner for
+that one job, lets it run, and then throws the runner away. Today it works with
+**GitHub Actions**, on **Macs with Apple silicon**. Other platforms may follow.
 
 You keep writing workflows exactly as you do today. Logs, checks, re-runs and secrets
-are managed on GitHub, where they always were. faber only changes *which computer* does
-the work.
+are managed on GitHub, where they always were. faber only changes *which computer* does the
+work.
 
 > [!WARNING]
 > **Only your own code.** faber runs jobs on your machine, so only send it code you
@@ -20,9 +20,9 @@ the work.
 > [!IMPORTANT]
 > **Your secrets come to your Mac.** To run a job, GitHub sends that job's secrets
 > (deploy keys, API tokens, anything in `secrets.*`) to the runner, which now sits on
-> your machine. That is how every self-hosted runner works and it is expected, but
-> it means your Mac now holds them while the job runs. Give faber only the jobs whose
-> secrets you're comfortable having there.
+> your machine. Every self-hosted runner works this way, but it means your Mac holds
+> those secrets while the job runs. Give faber only the jobs whose secrets you're
+> comfortable having there.
 
 > **Status:** faber is moving into this repository from its previous home, piece by
 > piece. Commands that use files not here yet will work once those files arrive.
@@ -34,7 +34,7 @@ the work.
 - **Caches stay warm.** Git history, `node_modules` downloads and Git LFS files can be
   served from your own disk instead of fetched from the internet on every run.
 - **You pick the tools.** Need a particular browser build, JDK or Postgres version?
-  Put it in your runner image once. No more waiting on hosted images to catch up.
+  Put it in your runner image once. No more waiting for hosted images to catch up.
 - **Every job starts clean.** Each job gets its own throwaway runner, so nothing leaks
   from one run into the next.
 - **It saves money.** GitHub bills macOS minutes at a premium, and Git LFS bandwidth
@@ -45,12 +45,14 @@ the work.
   and it only starts as many jobs as fit in the rest.
 
 What it's **not** for: running CI for strangers, or replacing your CI service. faber
-gives your CI a runner; it doesn't run pipelines itself.
+gives your CI a computer to run on; the pipelines themselves are still defined and run
+by your CI service (GitHub Actions, today).
 
 ## What you need
 
-- A Mac with **Apple silicon**. faber runs your Linux jobs in a small Linux virtual
-  machine it manages for you.
+- A Mac with **Apple silicon**. faber runs your Linux jobs inside a small Linux
+  *virtual machine* (VM), a separate computer simulated in software, which it manages
+  for you.
 - Admin rights on that Mac, once, for setup.
 - The [GitHub CLI](https://cli.github.com) (`gh`), signed in.
 - A few minutes while faber builds. It is built from source; the installer offers to
@@ -72,8 +74,8 @@ cd ~/.faber/src && ./install.sh
 
 The installer asks whether you want the menu-bar app too, builds faber, and finishes
 with `sudo faber setup`. Setup shows you exactly what it is about to do and asks before
-it changes anything. faber then runs in the background as its own hidden user, starts
-when the Mac starts, and doesn't need you logged in.
+it changes anything. After that, faber runs in the background under its own hidden
+user accounts (not yours), starts when the Mac starts, and doesn't need you logged in.
 
 ### 2. Connect it to GitHub
 
@@ -81,8 +83,9 @@ when the Mac starts, and doesn't need you logged in.
 faber auth link
 ```
 
-This opens GitHub's token page with the right permissions already filled in. Pick the
-repositories this Mac should run jobs for, create the token, then hand it to faber:
+This opens GitHub's page for creating an access token, with the right permissions
+already filled in. Pick the repositories this Mac should run jobs for, create the
+token, then hand it to faber:
 
 ```bash
 sudo faber auth set
@@ -96,9 +99,9 @@ Opt a repository in by giving it the `faber` topic:
 gh repo edit owner/demo --add-topic faber
 ```
 
-Then change `runs-on` in that repo's workflow. This line sends your own jobs to faber
-and keeps fork pull requests, other people's pull requests and Dependabot on GitHub's
-runners:
+Then change `runs-on` in that repo's workflow. The long expression below sends your
+own jobs to faber and keeps fork pull requests, other people's pull requests and
+Dependabot on GitHub's runners:
 
 ```yaml
 jobs:
@@ -114,8 +117,10 @@ example `["alice","bob"]`.
 
 ### 4. Give it a runner image
 
-Linux jobs run inside a container image you control. One that works out of the box
-ships with faber; build it and hand it to faber's Linux VM:
+Linux jobs run inside a *container*: an isolated, disposable environment started from
+an *image* (a snapshot of an operating system plus the tools your jobs need). You
+control that image. One that works out of the box ships with faber; build it and hand
+it to faber's Linux VM:
 
 ```bash
 docker build -t faber-runner:local docker/runner
@@ -143,6 +148,36 @@ faber dashboard
 
 Your job shows up within about 20 seconds.
 
+## How it works
+
+```text
+          GitHub                                 your Mac
+ ┌──────────────────────┐      polls       ┌─────────────────────────────────────┐
+ │ queued job           │ ◄─────────────── │ faber daemon (its own hidden user)  │
+ │                      │                  │  1. check: is this job trusted?     │
+ │ one-time runner      │ ───────────────► │  2. check: is there room for it?    │
+ │ registration         │                  │  3. start a runner for this one job │
+ └──────────────────────┘                  │        │                            │
+            ▲                              │        ▼                            │
+            │ job, logs, secrets           │  ┌──────── Linux VM ─────────────┐  │
+            └──────────────────────────────┼──┤ fresh container + runner      │  │
+                                           │  │ (deleted when the job ends)   │  │
+                                           │  └───────────────────────────────┘  │
+                                           └─────────────────────────────────────┘
+```
+
+1. **faber asks GitHub** every 20 seconds or so whether any opted-in repo has a queued
+   job. It only ever calls out: nothing on the internet connects in to your Mac.
+2. **It checks the job** is yours and safe to run (see [Safety](#safety)), and refuses
+   it if not.
+3. **It waits for room**, so jobs never crowd out you or each other.
+4. **It asks GitHub for a one-time runner registration**, a pass that lets a runner
+   take exactly that one job, and starts a runner with it inside a fresh container in
+   faber's Linux VM.
+5. **GitHub hands the job to that runner.** Logs and results go straight back to GitHub,
+   as with any runner.
+6. **When the job ends, everything is deleted**: the runner, its container, its network.
+
 ## Features
 
 Each feature is marked:
@@ -155,16 +190,16 @@ Each feature is marked:
 
 Every Linux job gets a brand-new container, its own private network, and a runner that
 is registered for that one job only. When the job ends, all of it is deleted. The
-containers live inside a Linux VM that faber owns, so jobs never run directly on your
-Mac, and by default they can reach the internet but not your home network or the Mac
-itself. If a job genuinely needs a machine on your network, you can open exactly one
-address and port for it with `sudo faber grant add`.
+containers live inside faber's Linux VM, so jobs never run directly on your Mac. By
+default they can reach the internet but not your home network or the Mac itself. If a
+job genuinely needs a machine on your network, you can open exactly one address and
+port for it with `sudo faber grant add`.
 
 ### macOS jobs in their own VM · In progress
 
-Jobs that need macOS (an iOS build, say) will each run in a fresh macOS virtual machine
-that is cloned from an image you prepare once and thrown away afterwards. Much of this
-is already in place, but it doesn't run real jobs yet.
+Jobs that need macOS (an iOS build, say) will each run in a fresh macOS virtual machine,
+copied from an image you prepare once and thrown away afterwards. Much of this is
+already in place, but it doesn't run real jobs yet.
 
 ### A job only starts when it fits · On
 
@@ -180,8 +215,9 @@ keep_memory_gib = 16   # memory CI must leave free for you
 keep_cpus = 4          # cores CI must leave free for you
 ```
 
-faber also holds back new jobs while macOS reports memory pressure. If you want it to
-count CPU as well as memory, add `cpu = "auto"` under `[autolimit]` (opt-in).
+faber also holds back new jobs while macOS reports it is running low on memory. If you
+want it to count CPU as well as memory, add `cpu = "auto"` under `[autolimit]`
+(opt-in).
 
 ### Databases and other services, per job · Opt-in
 
@@ -211,24 +247,28 @@ You can add other services the same way, such as an S3-compatible store.
 
 - **Git mirror.** faber keeps a copy of each repo's history on your Mac and lends it to
   jobs, so `actions/checkout` fetches only what's new. Even a full-history checkout
-  becomes cheap. Turn it on per profile with `git_mirror = true`; your workflow needs
-  one extra step before checkout.
+  becomes cheap. Turn it on with `git_mirror = true` on a *profile* (a group of jobs in
+  `config.toml` that share labels and an image); your workflow needs one extra step
+  before checkout.
 - **Git LFS and npm mirror.** A local cache answers LFS and npm downloads, so a file is
   fetched from the internet once instead of on every run. Turn it on with a `[mirror]`
   section.
 - **Build cache that survives between runs.** Give a repo a folder that persists from
-  one job to the next (`cache_volume = true`), exposed to the job as `$FABER_CACHE_DIR`.
+  one job to the next (`cache_volume = true`), available to the job as
+  `$FABER_CACHE_DIR`.
 
-These mirrors are not available while any of your jobs is allowed to run its own
-Docker daemon, because that would expose faber's GitHub token to the job.
+The git mirror and the LFS mirror are switched off while any of your jobs is allowed to
+run its own Docker (`dind = true`, see [Safety](#safety)), because such a job could
+reach faber's GitHub token.
 
 ### The right Playwright version for every branch · On, and Opt-in
 
 If your runner image includes Playwright's browsers, it can only include one version.
-faber notices when a job's lockfile asks for a different version and warns you on the
-dashboard (on by default). Turn on `[runner_image] build = "on-demand"` and faber goes
-further: it builds a small variant of your image with the version the branch asks for,
-once, and keeps it while it's in use. You decide which versions it may build.
+faber notices when a job's lockfile (the file that pins your exact dependency versions)
+asks for a different version and warns you on the dashboard (on by default). Turn on
+`[runner_image] build = "on-demand"` and faber goes further: it builds a small variant
+of your image with the version the branch asks for, once, and keeps it while it's in
+use. You decide which versions it may build.
 
 ### Automatic retry when faber was at fault · Opt-in
 
@@ -257,8 +297,8 @@ of everyone else's.
   you, so you rarely touch the file by hand.
 - **`faber status`** prints the last 24 hours in your terminal: what ran, what failed
   and why. It works even when faber is stopped.
-- faber warns you weeks ahead when GitHub is about to retire your runner image's runner
-  version, so jobs don't suddenly stop.
+- faber warns you weeks ahead when GitHub is about to retire the runner version in your
+  image, so jobs don't suddenly stop.
 
 ### Automatic updates · In progress
 
@@ -269,38 +309,27 @@ start. The switch exists (`[update] enabled = true`), but no signed release has 
 published yet, so for now you update by pulling the source and re-running the
 installer.
 
-## How it works
+## Safety
 
-```text
-          GitHub                                 your Mac
- ┌──────────────────────┐      polls       ┌─────────────────────────────────────┐
- │ queued job           │ ◄─────────────── │ faber daemon (its own hidden user)  │
- │                      │                  │  1. check: is this job trusted?     │
- │ one-time runner      │ ───────────────► │  2. check: is there room for it?    │
- │ registration         │                  │  3. start a runner for this one job │
- └──────────────────────┘                  │        │                            │
-            ▲                              │        ▼                            │
-            │ job, logs, secrets           │  ┌──────── Linux VM ─────────────┐  │
-            └──────────────────────────────┼──┤ fresh container + runner      │  │
-                                           │  │ (deleted when the job ends)   │  │
-                                           │  └───────────────────────────────┘  │
-                                           └─────────────────────────────────────┘
-```
+faber is built for **your own trusted code**. It is not a safe place to run strangers'
+code, and no self-hosted runner is a fortress. What faber does is put several walls
+between a job and the rest of your Mac.
 
-1. **faber asks GitHub** every 20 seconds or so whether any opted-in repo has a queued job.
-   It only ever calls out: nothing on the internet connects in to your Mac.
-2. **It checks the job** is yours and safe to run (see below), and refuses it if not.
-3. **It waits for room**, so jobs never crowd out you or each other.
-4. **It asks GitHub for a one-time runner registration** that is good for exactly that
-   job, and starts a runner with it inside a fresh container in faber's Linux VM.
-5. **GitHub hands the job to that runner.** Logs and results go straight back to GitHub,
-   as with any runner.
-6. **When the job ends, everything is deleted**: the runner, its container, its network.
+### Who gets to run
 
-## Why it's reasonably safe
+Two layers keep untrusted work off your machine:
 
-No self-hosted runner is a fortress, and faber doesn't pretend to be one. But it stacks
-several walls between a job and the rest of your Mac:
+1. **Your workflow decides.** The `runs-on` line in the
+   [quick start](#3-send-your-jobs-to-faber) sends fork pull requests, pull requests
+   from people you haven't listed, and Dependabot to GitHub's runners. This is the rule
+   that matters most.
+2. **faber checks again.** Before every job, faber refuses public repositories (unless
+   you allow them), events that can carry outside code (such as `pull_request_target`),
+   and code written by anyone who isn't the owner, an organization member or a
+   collaborator. When it can't tell, it says no. You can make these rules stricter in
+   `config.toml`, and there is deliberately no switch that allows fork pull requests.
+
+### What a job can reach
 
 - **Jobs never run on your Mac directly.** They run in a virtual machine faber owns,
   inside a container of their own, as a user that isn't you.
@@ -310,38 +339,20 @@ several walls between a job and the rest of your Mac:
 - **Nothing carries over.** Each runner is registered for a single job and deleted
   afterwards, so one job can't leave something behind for the next. (The optional
   per-repo build cache is the one thing you can choose to keep.)
-- **faber itself runs as its own hidden users**, not as you. It never has your login,
+- **faber itself runs as its own hidden user accounts**, not as you. It never has your login,
   your keychain or your browser sessions.
 - **Nothing listens for the internet.** faber only makes outgoing requests. Its
   dashboard is reachable from your Mac only.
-- **Its GitHub access is narrow.** faber uses a fine-grained token that reaches only the
-  repos you picked, with only the permissions your features need.
-- **It says no when unsure.** If faber can't tell whether a job is trustworthy, it
-  doesn't run it.
+- **Its GitHub access is narrow.** faber's GitHub token reaches only the repos you
+  picked, with only the permissions your features need.
 
-The limits, plainly: a job runs with whatever access its workflow and secrets give it,
-and anything that can run Docker itself (`dind = true`) can take over the Linux VM. So
-the most important rule is still the one below.
+### The limits
 
-## Only trusted code
-
-faber is built for **your own trusted code**. It is not a sandbox for strangers' code.
-Two layers keep untrusted work away from your machine:
-
-1. **Your workflow decides.** The `runs-on` line in the quick start sends fork pull
-   requests, pull requests from people you haven't listed, and Dependabot to GitHub's
-   runners. This is the rule that matters most.
-2. **faber checks again.** Before every job, faber refuses public repositories (unless
-   you allow them), events that can carry outside code (such as `pull_request_target`),
-   and code written by anyone who isn't the owner, an organization member or a
-   collaborator. When it can't
-   tell, it says no. You can make these rules stricter in `config.toml`, and there is
-   deliberately no switch that allows fork pull requests.
-
-One more rule: only let a job run Docker itself (`dind = true`) if it really builds
-images. Anything that can control that Docker daemon controls the whole Linux VM. If you
-only need a database, use [services](#databases-and-other-services-per-job--opt-in)
-instead.
+A job runs with whatever access its workflow and secrets give it. And a job that may
+run Docker itself (the `dind = true` setting) can take over the whole Linux VM, because
+whatever controls that Docker controls the VM. Only turn it on for jobs that really
+build container images. If you only need a database, use
+[services](#databases-and-other-services-per-job--opt-in) instead.
 
 ## FAQ
 
@@ -361,10 +372,11 @@ Not by default. faber refuses public repositories, because anyone can open a pul
 request against them. Keep public CI on GitHub's runners.
 
 **Does faber see my secrets?**
-Yes, in the sense that they leave GitHub. A job's secrets go from GitHub to its runner
-on your Mac, as with any self-hosted runner. They live in that job's throwaway runner
-and are deleted with it, but treat the Mac as a place that holds them. faber's own GitHub token is a fine-grained token that reaches only the repos
-you picked, with only the permissions the features you turned on need.
+Yes, in the sense that they leave GitHub: a job's secrets go to its runner on your Mac,
+as with any self-hosted runner. They live in that job's throwaway runner and are
+deleted with it, but treat the Mac as a place that holds them. faber's own GitHub token
+reaches only the repos you picked, with only the permissions the features you turned
+on need.
 
 **Does it work on Linux or Windows?**
 macOS with Apple silicon today. Running faber on a Linux machine is in progress;
@@ -377,10 +389,10 @@ images you built, because they may be your only copy.
 ## Going deeper
 
 More detailed guides are on their way into this repository: the full configuration
-reference, the git mirror and download mirror guides, how admission decides what to
-run, and the design decisions behind each feature. Until they arrive, the dashboard's
-Settings page edits every setting and checks your input, and `faber check-config`
-tells you whether your file is valid.
+reference, the git mirror and download mirror guides, how faber decides which jobs it
+will run, and the design decisions behind each feature. Until they arrive, the
+dashboard's Settings page edits every setting and checks your input, and
+`faber check-config` tells you whether your file is valid.
 
 ## License
 
