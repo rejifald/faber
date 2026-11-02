@@ -15,6 +15,8 @@
 //! - `$HOME/.config/faber-privacy/not-private`: names the sources find that are
 //!   public anyway, or ordinary words that would only raise false hits. A name
 //!   comes off whole: the part before a dot and the windows of a long name too.
+//!   A first word it shares with another private repository stays listed: if
+//!   that word is public too, list it in `not-private` itself.
 //!
 //! With `FABER_PRIVACY_KEY` exported (ADR-0058):
 //!
@@ -251,7 +253,9 @@ struct Derived {
 ///
 /// - `not_private`, and every token such a name expands to ([`listed_tokens`]:
 ///   its own, its dotted head, its windows), even one that another private name
-///   shares: declaring a name public takes off all it put on;
+///   shares: declaring a name public takes off all it put on by itself. A first
+///   word that another private repository shares stays listed until that word
+///   is in `not_private` itself;
 /// - the account's login and display name and each word of them;
 /// - tokens shorter than [`MIN_TOKEN`], which the scan never digests.
 ///
@@ -400,6 +404,15 @@ mod tests {
             !d.contains(&"solo".to_string()),
             "one repository's first word is not a project name"
         );
+
+        // Declaring one of them public takes off its own name, not the word the
+        // other still shares: that word still names a private project.
+        let d = denied(&sources(&["gizmo-api", "gizmo-web"], &[], &["gizmo-api"]));
+        assert!(d.contains(&"gizmo".to_string()));
+        assert!(!d.contains(&"gizmoapi".to_string()));
+        // Only the word itself takes it off.
+        let d = denied(&sources(&["gizmo-api", "gizmo-web"], &[], &["gizmo"]));
+        assert!(!d.contains(&"gizmo".to_string()));
     }
 
     #[test]

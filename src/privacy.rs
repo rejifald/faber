@@ -121,8 +121,8 @@ pub const KEY_REQUIRED_ENV: &str = "FABER_PRIVACY_KEY_REQUIRED";
 /// and the key becomes easier to guess than a digest.
 pub const MIN_KEY_BYTES: usize = 32;
 
-/// Shortest token worth hashing. Nothing on the denylist is this short, and
-/// skipping the noise keeps the scan to a few seconds in a debug build.
+/// Shortest token worth hashing: nothing shorter is digested or listed.
+/// Skipping the noise keeps the scan to a few seconds in a debug build.
 pub const MIN_TOKEN: usize = 4;
 
 /// Most adjacent words joined into one token, so a name of up to four words is
@@ -166,7 +166,9 @@ pub const TOKEN_PREFIXES: &[(&str, usize)] = &[
 pub const PEM_HEAD: &str = "-----BEGIN";
 pub const PEM_TAIL: &str = "PRIVATE KEY";
 
-/// Home-directory names that describe a role or a fixture rather than a person.
+/// Home-directory names that describe a role or a fixture rather than a person,
+/// under every root in [`HOME_ROOTS`]. `runner` is the account GitHub's hosted
+/// runners use: `/Users/runner` on macOS, `/home/runner` on Linux.
 /// `/Users/ci` predates ADR-0025, which replaced that isolated-deploy user
 /// with the hidden `_faber` / `_faber_vm` role accounts (`src/setup/`) — it
 /// stays generic here only because this suite's own tests still write it as a
@@ -183,6 +185,9 @@ pub const PEM_TAIL: &str = "PRIVATE KEY";
 pub const GENERIC_USERS: &[&str] = &[
     "ci", "user", "you", "me", "owner", "runner", "root", "someone", "test", "tester",
 ];
+
+/// Where people's home directories live: `/Users/` on macOS, `/home/` on Linux.
+pub const HOME_ROOTS: &[&str] = &["/Users/", "/home/"];
 
 /// SHA-256's block size, which HMAC pads the key to.
 const BLOCK: usize = 64;
@@ -319,7 +324,8 @@ impl GateError {
             }
             GateError::NothingListed => {
                 "FABER_PRIVACY_KEY is set but DENIED holds no digest, so nothing would be \
-                 checked: add the keyed digests with print_digest (src/privacy.rs)"
+                 checked: fill it with `cargo run --example privacy_denylist -- --write`, or \
+                 add one name with print_digest (see src/privacy.rs)"
             }
         }
     }
@@ -584,14 +590,17 @@ pub fn carries_secret(line: &str) -> bool {
     line.contains(PEM_HEAD) && line.contains(PEM_TAIL)
 }
 
-/// `/Users/<somebody>` where somebody is a person rather than a role.
+/// `/Users/<somebody>` or `/home/<somebody>` where somebody is a person rather
+/// than a role.
 pub fn carries_personal_path(line: &str) -> bool {
-    line.match_indices("/Users/").any(|(i, _)| {
-        let seg: String = line[i + "/Users/".len()..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
-            .collect();
-        !seg.is_empty() && !GENERIC_USERS.contains(&seg.as_str())
+    HOME_ROOTS.iter().any(|root| {
+        line.match_indices(root).any(|(i, _)| {
+            let seg: String = line[i + root.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
+                .collect();
+            !seg.is_empty() && !GENERIC_USERS.contains(&seg.as_str())
+        })
     })
 }
 
@@ -893,14 +902,20 @@ mod tests {
     #[test]
     fn role_home_directories_are_not_personal() {
         assert!(!carries_personal_path("/Users/ci/Library/Logs/faber"));
+        assert!(!carries_personal_path("/home/runner/work/faber/faber"));
         assert!(!carries_personal_path(
             "dscl . -read /Users/root AuthenticationAuthority"
         ));
         assert!(!carries_personal_path(
             "under /Users/ there is a home per account"
         ));
-        let personal = format!("/Users/{}/Development/faber", "adalovelace");
-        assert!(carries_personal_path(&personal));
+        assert!(!carries_personal_path("and on Linux under /home/"));
+        // Both roots spelled out, not read from HOME_ROOTS: dropping one from
+        // the list must fail here.
+        for root in ["/Users/", "/home/"] {
+            let personal = format!("{root}{}/Development/faber", "adalovelace");
+            assert!(carries_personal_path(&personal), "{root}");
+        }
     }
 
     #[test]
