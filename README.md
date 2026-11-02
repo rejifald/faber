@@ -278,4 +278,4 @@ Requires Rust 1.96 or later.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
