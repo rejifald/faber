@@ -54,7 +54,7 @@ fn published_files(root: &Path) -> Vec<PathBuf> {
                 .stdout
                 .split(|b| *b == 0)
                 .filter(|s| !s.is_empty())
-                .map(|s| root.join(String::from_utf8_lossy(s).as_ref()))
+                .map(|s| root.join(git_path(s)))
                 .collect();
             if !files.is_empty() {
                 files.sort();
@@ -67,6 +67,21 @@ fn published_files(root: &Path) -> Vec<PathBuf> {
     walk(root, &mut files);
     files.sort();
     files
+}
+
+/// A path as `git ls-files -z` prints it: raw bytes, which on Unix need not be
+/// UTF-8. Decoded lossily, such a name would point at no file, and the scan
+/// would skip its content without a word.
+#[cfg(unix)]
+fn git_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(bytes).into()
+}
+
+/// Elsewhere git prints paths as UTF-8.
+#[cfg(not(unix))]
+fn git_path(bytes: &[u8]) -> PathBuf {
+    String::from_utf8_lossy(bytes).as_ref().into()
 }
 
 /// The fallback enumeration, used only when git cannot answer.
@@ -99,13 +114,48 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Text, for scanning purposes, is anything without a NUL byte near the front —
 /// which keeps icons, `.icns` bundles and lockfile binaries out of the scan
-/// without maintaining an extension list.
+/// without maintaining an extension list. Bytes that are not UTF-8 are replaced,
+/// as `examples/privacy_scan.rs` does, so one stray Latin-1 byte cannot hide a
+/// whole file.
 fn read_text(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.iter().take(8192).any(|b| *b == 0) {
         return None;
     }
-    String::from_utf8(bytes).ok()
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[test]
+fn a_file_that_is_not_utf8_is_still_scanned() {
+    // Assembled at run time: spelled out, these lines would trip the gate.
+    let credential = format!("token = {}{}", "ghp_", "0123456789abcdefghijklmnopqrstuv");
+    let home = format!("see /Users/{}/notes", "adalovelace");
+    // One stray byte: "café" as a Latin-1 editor saves it.
+    let mut bytes = b"caf\xe9\n".to_vec();
+    bytes.extend_from_slice(format!("{credential}\n{home}\n").as_bytes());
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("privacy-not-utf8-{}.txt", std::process::id()));
+    std::fs::write(&path, &bytes).expect("write the fixture");
+    let text = read_text(&path);
+    std::fs::remove_file(&path).expect("remove the fixture");
+
+    let text = text.expect("a stray byte does not make a file binary");
+    assert!(
+        text.lines().any(carries_secret),
+        "the credential is scanned"
+    );
+    assert!(
+        text.lines().any(carries_personal_path),
+        "the home path is scanned"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tracked_path_keeps_the_bytes_git_printed() {
+    use std::os::unix::ffi::OsStrExt;
+    let raw = b"docs/caf\xe9.md";
+    assert_eq!(git_path(raw).as_os_str().as_bytes(), raw);
 }
 
 #[test]

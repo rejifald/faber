@@ -32,7 +32,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use faber::privacy::{key_from_env, name_token, DENIED, MIN_TOKEN};
+use faber::privacy::{key_from_env, name_token, words, DENIED, MAX_JOIN, MIN_TOKEN};
 
 fn main() {
     let mut write = false;
@@ -238,6 +238,10 @@ struct Derived {
 /// - every name from the sources;
 /// - the part of a dotted name before its first dot (`widgetco.example` →
 ///   `widgetco`), so the name is caught with or without its domain;
+/// - for a name of more than [`MAX_JOIN`] words, each run of `MAX_JOIN`
+///   adjacent words (`my-app-v2-api` → `myappv2`, `appv2api`): the scan joins
+///   no more words than that, so written with separators the whole name never
+///   forms one token;
 /// - a first word that two or more repository names share (`gizmo-api` and
 ///   `gizmo-web` → `gizmo`), so a project is caught by its own name, not only
 ///   by its repositories'.
@@ -262,6 +266,17 @@ fn candidates(sources: &Sources) -> Derived {
         deny.insert(name_token(name));
         if let Some((head, _)) = name.split_once('.') {
             deny.insert(name_token(head));
+        }
+        // Joined and lowercased as the scan joins them. A name of exactly
+        // MAX_JOIN words yields its own token again, and a shorter one nothing.
+        let spans = words(name);
+        for window in spans.windows(MAX_JOIN) {
+            deny.insert(
+                window
+                    .iter()
+                    .map(|w| name[w.clone()].to_ascii_lowercase())
+                    .collect(),
+            );
         }
     }
     deny.extend(
@@ -333,6 +348,26 @@ mod tests {
     fn a_dotted_name_is_listed_with_and_without_its_domain() {
         let s = sources(&["widgetco.example"], &[], &[]);
         assert_eq!(denied(&s), ["widgetco", "widgetcoexample"]);
+    }
+
+    #[test]
+    fn a_name_longer_than_a_join_is_listed_by_its_windows_too() {
+        use faber::privacy::tokens;
+
+        let name = "my-app-v2-api";
+        assert_eq!(words(name).len(), MAX_JOIN + 1, "my, app, v, 2, api");
+        let d = denied(&sources(&[], &[name], &[]));
+        assert_eq!(d, ["appv2api", "myappv2", "myappv2api"]);
+        // Written with separators the whole name never forms a token, which is
+        // why the windows are listed: the scan meets them instead.
+        let scanned: Vec<String> = tokens(&format!("deploy {name} now"))
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert!(!scanned.contains(&name_token(name)));
+        for window in ["myappv2", "appv2api"] {
+            assert!(scanned.contains(&window.to_string()), "{window:?}");
+        }
     }
 
     #[test]

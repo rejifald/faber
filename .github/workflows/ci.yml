@@ -24,6 +24,7 @@ jobs:
   linux:
     name: linux · fmt · clippy · test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,15 +42,23 @@ jobs:
         run: cargo fmt --all --check
 
       # Each check below runs even when an earlier one failed, so one red step
-      # never hides another's verdict.
+      # never hides another's verdict. Every cargo command that resolves
+      # dependencies passes `--locked`: CI builds exactly what Cargo.lock records,
+      # and a manifest that drifted from it fails here instead of being quietly
+      # re-resolved to whatever is newest today.
       - name: Clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      # The name check runs in its own step below, the only one the key reaches.
+      # Both tree tests run only in "Privacy gate (names)" below, the one step the
+      # key reaches: a path they print is masked only where the key is (ADR-0058),
+      # and here a file name would reach the public log as it is.
       - name: Test
         if: ${{ !cancelled() }}
-        run: cargo test --verbose -- --skip tree_names_no_private_project
+        run: >-
+          cargo test --locked --verbose --
+          --skip tree_names_no_private_project
+          --skip tree_carries_no_credentials_or_personal_paths
 
       # Names are checked under the FABER_PRIVACY_KEY secret (ADR-0058). It is
       # required on every run GitHub gives secrets to, so a missing secret fails
@@ -60,4 +69,4 @@ jobs:
         env:
           FABER_PRIVACY_KEY: ${{ secrets.FABER_PRIVACY_KEY }}
           FABER_PRIVACY_KEY_REQUIRED: ${{ !github.event.pull_request || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
-        run: cargo test --test privacy
+        run: cargo test --locked --test privacy
