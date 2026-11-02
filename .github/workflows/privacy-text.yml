@@ -1,0 +1,143 @@
+name: Privacy (text)
+
+# The tree gate (tests/privacy.rs, run by ci.yml) covers tracked files. This
+# covers the other half of what a public repo publishes: commit messages, branch
+# names, PR titles and bodies, issue text and comments. A PR's commit messages
+# and the release notes generated from them are covered by the `pull_request`
+# leg, because the notes are built from those same messages and PR titles.
+#
+# Posted text is already public by the time this runs, so the issue/comment legs
+# are an alarm, not a prevention: a failed run is the signal to edit or delete
+# the text. The run never prints the matched token (public log) -- see
+# src/privacy.rs.
+#
+# Names are checked under the FABER_PRIVACY_KEY secret (ADR-0058), and only in
+# text from a trusted author: a pull request from a branch of this repository
+# (not Dependabot's), or an issue, comment or review by the repository's owner,
+# a member or a collaborator. Anyone at all can post the rest, and a keyed scan
+# of it would report which of its lines name something listed: post a list of
+# guesses, read the public log, and the guesses in DENIED are confirmed without
+# the key. So an untrusted author's text skips names, as a fork's or
+# Dependabot's pull request does, with a warning; credentials and home paths are
+# still checked. Where the author is trusted the key is required, so a missing
+# secret fails the run.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted, edited]
+  pull_request_review_comment:
+    types: [created, edited]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scan:
+    name: privacy · text
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Who wrote the text decides whether names are checked (see the header).
+      # Decided first, from fields GitHub sets, before any other code runs, and
+      # read back as this step's output, which no later step can rewrite (a job
+      # variable could be, through $GITHUB_ENV). A fork's pull request and the
+      # reviews on it get no secrets, so they are never trusted.
+      - name: Decide whether the author is trusted
+        id: trust
+        env:
+          TRUSTED: >-
+            ${{
+              (github.event_name == 'pull_request'
+                && github.event.pull_request.head.repo.full_name == github.repository
+                && github.actor != 'dependabot[bot]')
+              || ((github.event_name == 'issues' || github.event_name == 'issue_comment')
+                && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+                  github.event.comment.author_association || github.event.issue.author_association))
+              || ((github.event_name == 'pull_request_review'
+                  || github.event_name == 'pull_request_review_comment')
+                && github.event.pull_request.head.repo.full_name == github.repository
+                && contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'),
+                  github.event.review.author_association || github.event.comment.author_association))
+            }}
+        run: echo "trusted=$TRUSTED" >> "$GITHUB_OUTPUT"
+
+      # Everything but `pull_request` builds the scanner from the default branch,
+      # never from a PR ref: these events can be triggered by anyone, and must not
+      # run a contributor's code. `pull_request` has a read-only token, and secrets
+      # only for a branch of this repository, whose author can already write here,
+      # so the merge ref is acceptable there (as for ci.yml). Neither checkout
+      # keeps the token: the scanner's build scripts run next, and the history
+      # `git log` reads below is already fetched.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'pull_request'
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # The posted text comes from the event payload file, read with jq. It is
+      # never interpolated into the shell, so it cannot inject commands. Each
+      # event yields only the text its own author wrote: an owner's comment must
+      # not carry an outsider's issue into the keyed scan. An event missing from
+      # this list fails the step rather than scan somebody else's text.
+      - name: Extract the text under scan
+        run: |
+          mkdir -p "$RUNNER_TEMP/scan"
+          jq -r --arg event "$GITHUB_EVENT_NAME" '
+            if $event == "pull_request" then
+              [.pull_request.title, .pull_request.head.ref, .pull_request.body]
+            elif $event == "issues" then [.issue.title, .issue.body]
+            elif $event == "issue_comment" or $event == "pull_request_review_comment" then
+              [.comment.body]
+            elif $event == "pull_request_review" then [.review.body]
+            else error("no text is listed for \($event) events")
+            end | map(select(. != null)) | join("\n\n")' \
+            "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/scan/event.txt"
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git log "$BASE_SHA..$HEAD_SHA" --format=%B > "$RUNNER_TEMP/scan/commits.txt"
+          fi
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+      # Built in a step of its own, so no build script runs where the key is.
+      # Every cargo command passes `--locked`: CI builds exactly what Cargo.lock
+      # records, and a manifest that drifted from it fails here instead of being
+      # quietly re-resolved to whatever is newest today and run beside the key.
+      - name: Build the scanner
+        run: cargo build --locked --quiet --example privacy_scan
+
+      # Exactly one of the two scans runs, as the first step decided.
+      - name: Scan, names included (matches are never printed)
+        if: steps.trust.outputs.trusted == 'true'
+        env:
+          FABER_PRIVACY_KEY: ${{ secrets.FABER_PRIVACY_KEY }}
+          FABER_PRIVACY_KEY_REQUIRED: "true"
+        run: cargo run --locked --quiet --example privacy_scan -- "$RUNNER_TEMP"/scan/*.txt
+
+      # Neither variable reaches this one: it checks credentials and home paths,
+      # and warns that names were skipped.
+      - name: Scan, names skipped (matches are never printed)
+        if: steps.trust.outputs.trusted != 'true'
+        run: cargo run --locked --quiet --example privacy_scan -- "$RUNNER_TEMP"/scan/*.txt

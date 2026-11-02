@@ -1,0 +1,32 @@
+[package]
+name = "faber"
+# Not the release version. Releases are stamped by .github/workflows/release.yml
+# into its own checkout, never committed (ADR-0031). This is the floor the next
+# release bumps from when it is higher than the last published one, and what a
+# local build reports before its `+g<sha>`.
+version = "0.3.12"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+description = "Local just-in-time GitHub Actions runner provisioner — run your own CI on your own Mac."
+repository = "https://github.com/rejifald/faber"
+
+[dependencies]
+# The privacy gate's HMAC (`src/privacy.rs`) drives SHA-256's raw compression
+# function, which `compress` exports.
+sha2 = { version = "0.10", features = ["compress"] }
+
+[lints.clippy]
+all = "warn"
+
+# The denylist generator's rules are unit-tested; `cargo test` runs them like the
+# library's.
+[[example]]
+name = "privacy_denylist"
+test = true
+
+# The privacy gate digests every token of the tree under HMAC-SHA256 on each
+# keyed `cargo test` (ADR-0058). Unoptimized, SHA-256 alone makes that test
+# several times slower; this crate is small, so optimizing it costs little.
+[profile.dev.package.sha2]
+opt-level = 3

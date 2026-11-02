@@ -1,0 +1,5 @@
+/target
+.DS_Store
+
+# Agent worktrees: local only, never committed, and never swept by repo-wide tools.
+/.claude/worktrees/
