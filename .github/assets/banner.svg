@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 400" width="1280" height="400" role="img" aria-label="faber — just-in-time GitHub Actions runners on your own Mac">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B211C"/>
+      <stop offset="1" stop-color="#15100D"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="208" cy="200" r="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E46B2B" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#E46B2B" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.14"/>
+      <stop offset="0.4" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="iso" width="40" height="20" patternUnits="userSpaceOnUse">
+      <path d="M0 10 L20 0 L40 10 L20 20 Z" fill="none" stroke="#EFE4D6" stroke-opacity="0.045" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1280" height="400" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="400" rx="24" fill="url(#iso)"/>
+  <rect width="1280" height="400" rx="24" fill="url(#glow)"/>
+  <rect x="0.5" y="0.5" width="1279" height="399" rx="23.5" fill="none" stroke="url(#rim)"/>
+
+  <!-- the mark: the forge cube from design/mark, on a 100-unit tile scaled to 224px -->
+  <g transform="translate(96 88) scale(2.24)">
+    <polygon points="50,21 79,35.5 67.854,41.073 50,32.146 32.146,41.073 21,35.5" fill="#EFE4D6" fill-opacity="0.95"/>
+    <polygon points="21,64.5 50,79 50,67.854 32.5,59.104 32.5,41.25 21,35.5" fill="#EFE4D6" fill-opacity="0.7"/>
+    <polygon points="79,64.5 50,79 50,67.854 67.5,59.104 67.5,41.25 79,35.5" fill="#EFE4D6" fill-opacity="0.45"/>
+    <polygon points="50,35.5 64.5,42.75 50,50 35.5,42.75" fill="#F7955A"/>
+    <polygon points="35.5,57.25 50,64.5 50,50 35.5,42.75" fill="#E46B2B"/>
+    <polygon points="64.5,57.25 50,64.5 50,50 64.5,42.75" fill="#B9521C"/>
+  </g>
+
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="368" y="180" font-size="104" font-weight="700" letter-spacing="-3" fill="#EFE4D6">faber</text>
+    <text x="372" y="232" font-size="30" font-weight="500" fill="#EFE4D6" fill-opacity="0.82">Your own CI, on your own Mac.</text>
+    <text x="372" y="268" font-size="22" fill="#EFE4D6" fill-opacity="0.55">Just-in-time GitHub Actions runners — one job each, then gone.</text>
+  </g>
+
+  <g font-family="'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" fill="#EFE4D6" fill-opacity="0.78">
+    <text x="372" y="330">poll <tspan fill="#F7955A" fill-opacity="1">→</tspan> gate <tspan fill="#F7955A" fill-opacity="1">→</tspan> runner <tspan fill="#F7955A" fill-opacity="1">→</tspan> one job <tspan fill="#F7955A" fill-opacity="1">→</tspan> gone</text>
+  </g>
+
+  <text x="1216" y="364" text-anchor="end" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="17" fill="#EFE4D6" fill-opacity="0.32">faber est suae quisque fortunae</text>
+</svg>
