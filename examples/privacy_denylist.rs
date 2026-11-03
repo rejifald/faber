@@ -7,18 +7,20 @@
 //!   signed in to, and the organisations it belongs to;
 //! - this machine's host names.
 //!
-//! Two local files, never committed, adjust that set. Each holds one name per
-//! line; a line starting with `#` is a comment.
+//! Two local files, never committed, adjust that set. They live in
+//! `$XDG_CONFIG_HOME/faber-privacy/`, else `$HOME/.config/faber-privacy/`. A
+//! missing file counts as empty, so one put anywhere else is ignored without a
+//! word. Each holds one name per line; a line starting with `#` is a comment.
 //!
-//! - `$HOME/.config/faber-privacy/extra-names`: names no source shows, such as
-//!   another machine's host names or a private domain.
-//! - `$HOME/.config/faber-privacy/not-private`: names the sources find that are
-//!   public anyway, or ordinary words that would only raise false hits. A name
-//!   comes off whole: the part before its first dot and the windows of a long
-//!   name too. A first word it shares with another private repository stays
-//!   listed, unless the word is that part before the dot (`gizmo.api` takes
-//!   `gizmo` off even while `gizmo-web` is private). If a word that stays is
-//!   public too, list it in `not-private` itself.
+//! - `extra-names`: names no source shows, such as another machine's host
+//!   names or a private domain.
+//! - `not-private`: names the sources find that are public anyway, or ordinary
+//!   words that would only raise false hits. A name comes off whole: every
+//!   token it would be listed under (its own, the part before its first dot,
+//!   the windows of a long name) comes off, even one listed for another reason
+//!   too. So `gizmo.api` takes `gizmo` off even while `gizmo-web` is private,
+//!   but `gizmo-api` leaves it listed: `gizmo` is none of its tokens. If a
+//!   word that stays is public too, list it in `not-private` itself.
 //!
 //! With `FABER_PRIVACY_KEY` exported (ADR-0058):
 //!
@@ -30,8 +32,9 @@
 //! It prints counts, never names. `--list` prints the names themselves, for a
 //! local terminal only, and needs no key. A name stays listed after its source
 //! is gone: one that was private once stays worth catching. Only `not-private`
-//! takes a name off, besides the account's own login and display name, which
-//! are public and never listed. After `--write`, run the tree gate with the
+//! takes a name off, besides the account's own login and display name and each
+//! word of them: they are public, so they are never listed, not even as the
+//! name of a private repository. After `--write`, run the tree gate with the
 //! key: a hit on an ordinary word means that word belongs in `not-private`.
 
 use std::collections::{BTreeSet, HashMap};
@@ -256,9 +259,9 @@ struct Derived {
 ///
 /// - `not_private`, and every token such a name expands to ([`listed_tokens`]:
 ///   its own, its dotted head, its windows), even one that another private name
-///   shares: declaring a name public takes off all it put on by itself. So a
-///   first word that another private repository shares stays listed until that
-///   word is in `not_private` itself, or is the dotted head of a name there;
+///   or a shared first word puts on too: declaring a name public takes off all
+///   it put on by itself. A shared first word that no `not_private` name
+///   expands to stays listed;
 /// - the account's login and display name and each word of them;
 /// - tokens shorter than [`MIN_TOKEN`], which the scan never digests.
 ///
@@ -421,6 +424,16 @@ mod tests {
         let d = denied(&sources(&["gizmo.api", "gizmo-web"], &[], &["gizmo.api"]));
         assert!(!d.contains(&"gizmo".to_string()));
         assert!(d.contains(&"gizmoweb".to_string()));
+        // And so does a declared name it is a window of: split as the scan
+        // splits it, `MyAppV2-web` is my, app, v, 2 and web, so its first
+        // window is the word `MyAppV2-api` shares with it.
+        let d = denied(&sources(
+            &["MyAppV2-api", "MyAppV2-web"],
+            &[],
+            &["MyAppV2-web"],
+        ));
+        assert!(!d.contains(&"myappv2".to_string()));
+        assert!(d.contains(&"myappv2api".to_string()));
     }
 
     #[test]
