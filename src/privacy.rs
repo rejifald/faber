@@ -172,8 +172,8 @@ pub const PEM_TAIL: &str = "PRIVATE KEY";
 /// `/Users/ci` predates ADR-0025, which replaced that isolated-deploy user
 /// with the hidden `_faber` / `_faber_vm` role accounts (`src/setup/`) — it
 /// stays generic here only because this suite's own tests still write it as a
-/// role-path example (see `role_home_directories_are_not_personal` in
-/// `tests/privacy.rs`).
+/// role-path example (see `role_home_directories_are_not_personal` in this
+/// file's tests).
 /// `/Users/tester` is the stand-in `$HOME` that `platform::macos`'s
 /// literal-path regression test sets — neither names anyone. `/Users/root` is
 /// macOS's own superuser, read as a directory record (`dscl . -read /Users/root`)
@@ -916,6 +916,10 @@ mod tests {
             let personal = format!("{root}{}/Development/faber", "adalovelace");
             assert!(carries_personal_path(&personal), "{root}");
         }
+        // Anywhere in a line, not only where a path starts: a home root inside
+        // a longer path still names someone's directory.
+        let inside = format!("/var/home/{}/notes", "adalovelace");
+        assert!(carries_personal_path(&inside));
     }
 
     #[test]
