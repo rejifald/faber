@@ -57,7 +57,7 @@ first_line="${policy%%$'\n'*}"
 [[ "$first_line" == "policy: release" ]] \
   || fail "the binary enforces '$first_line', not the release policy (is the sandbox-policy feature on?)"
 
-# Until the cut sets the release repository's numeric ID, the policy carries the
+# A binary built before the release repository's numeric ID was set carries the
 # placeholder 0, which refuses every release. A follower that installed such a
 # build could never verify another update and would be stranded on it.
 repository_id="$(field repository_id)"

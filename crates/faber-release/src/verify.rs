@@ -427,17 +427,25 @@ mod tests {
         assert!(reason.starts_with("bundle"), "{reason}");
     }
 
-    /// The release policy ships with the repository-ID placeholder until the cut
-    /// (#123). It must refuse everything, genuine bundles included, and say why.
+    /// The release policy pins the release repository's ID, never the
+    /// placeholder.
     #[test]
-    fn the_release_policy_placeholder_refuses_every_release() {
-        assert_eq!(
-            RELEASE_POLICY.repository_id, 0,
-            "update this test when the cut sets the ID"
-        );
+    fn the_release_policy_pins_the_release_repository() {
+        assert_eq!(RELEASE_POLICY.repository_id, 1_442_751_713);
+    }
+
+    /// A binary built with the repository-ID placeholder must refuse everything,
+    /// genuine bundles included, and say why: this sandbox release passes every
+    /// other check.
+    #[test]
+    fn the_placeholder_id_refuses_every_release() {
+        let placeholder = Policy {
+            repository_id: 0,
+            ..SANDBOX_POLICY
+        };
         let (sums, bundle) = release("v0.0.2");
         let reason = refused(check(
-            &RELEASE_POLICY,
+            &placeholder,
             &saved_root(),
             &sums,
             &bundle,

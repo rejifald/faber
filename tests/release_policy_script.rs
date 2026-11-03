@@ -41,27 +41,14 @@ fn check(policy: &str, repository_id: &str, workflow_ref: &str) -> (bool, String
 #[cfg(not(feature = "sandbox-policy"))]
 #[test]
 fn the_script_reads_the_policy_faber_release_prints() {
-    // Until the cut the printed repository ID is the placeholder 0, which the
-    // script refuses by design. Stand in for the real one: it is the only line
-    // that changes at the cut.
-    let policy = describe_active_policy()
-        .lines()
-        .map(|line| {
-            if line.starts_with("repository_id: ") {
-                "repository_id: 424242"
-            } else {
-                line
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
+    let policy = describe_active_policy();
+    let repository_id = active_policy().repository_id.to_string();
     let workflow_ref = active_policy()
         .signer_workflow
         .strip_prefix("https://github.com/")
         .expect("the signer is a github.com workflow URL");
 
-    let (accepted, out) = check(&policy, "424242", workflow_ref);
+    let (accepted, out) = check(&policy, &repository_id, workflow_ref);
     assert!(
         accepted,
         "the script refused the policy faber-release prints:\n{out}"
@@ -71,7 +58,7 @@ fn the_script_reads_the_policy_faber_release_prints() {
     assert!(!accepted, "a run in another repository was accepted");
     let (accepted, _) = check(
         &policy,
-        "424242",
+        &repository_id,
         "owner/demo/.github/workflows/release.yml@refs/heads/main",
     );
     assert!(!accepted, "a run of another workflow was accepted");

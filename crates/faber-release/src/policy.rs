@@ -47,17 +47,15 @@ pub struct Policy {
 const GITHUB_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const SLSA_PROVENANCE_V1: &str = "https://slsa.dev/provenance/v1";
 
-/// faber's own releases.
+/// faber's own releases, from `rejifald/faber`.
 ///
-/// **`repository_id` is a placeholder until the cut.** The fresh public
-/// repository ADR-0031 releases from does not exist yet, so neither does its ID.
-/// `0` is no repository's ID, so a binary built today refuses every release (a
-/// unit test pins that), and the cut sets the real value (#123).
+/// `repository_id` is that repository's ID, set at the cut once the repository
+/// was final (ADR-0031). Binaries built before then carry the placeholder `0`,
+/// which matches no repository, so they refuse every release.
 pub const RELEASE_POLICY: Policy = Policy {
     name: "release",
     issuer: GITHUB_OIDC_ISSUER,
-    // PLACEHOLDER — set at the cut (#123). Fails closed while it is 0.
-    repository_id: 0,
+    repository_id: 1_442_751_713,
     signer_workflow:
         "https://github.com/rejifald/faber/.github/workflows/release.yml@refs/heads/main",
     source_ref: "refs/heads/main",
