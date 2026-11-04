@@ -1,0 +1,109 @@
+#!/usr/bin/python3
+"""faber's wall probe: vsock port 6101, one line, a few UDP datagrams (ADR-0026).
+
+systemd accepts each connection (faber-wall-probe.socket, Accept=yes) and
+starts one instance with the connection as its only socket. The launcher on the
+host sends one line, `probe A.B.C.D PORT COUNT`, naming its own address on this
+VM's network; this sends COUNT datagrams of 8 zero bytes there, so the host's
+wall counters can prove the VM's traffic passes through them. The target is the
+launcher's, never chosen here. It replies `sent N` with the datagrams actually
+sent, and exits. Anything else is refused without a reply.
+"""
+
+import os
+import socket
+import sys
+import time
+
+LISTEN_FDS_START = 3
+MAX_LINE = 64
+TIMEOUT_S = 2.0
+MAX_COUNT = 16
+PAYLOAD = bytes(8)
+
+
+def connection():
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        sys.exit("faber-wall-probe: LISTEN_PID is not this process; start it from its socket unit")
+    if os.environ.get("LISTEN_FDS") != "1":
+        sys.exit("faber-wall-probe: expected exactly one connection from systemd")
+    return socket.socket(fileno=LISTEN_FDS_START)
+
+
+def read_line(conn):
+    """One LF-terminated line of at most MAX_LINE bytes within TIMEOUT_S, or None."""
+    deadline = time.monotonic() + TIMEOUT_S
+    buf = b""
+    while b"\n" not in buf:
+        left = deadline - time.monotonic()
+        if left <= 0 or len(buf) >= MAX_LINE:
+            return None
+        conn.settimeout(left)
+        try:
+            chunk = conn.recv(MAX_LINE - len(buf))
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    line, _, rest = buf.partition(b"\n")
+    if rest:
+        return None
+    return line
+
+
+def number(text, low, high):
+    if not (text.isascii() and text.isdigit()) or str(int(text)) != text:
+        return None
+    n = int(text)
+    return n if low <= n <= high else None
+
+
+def parse(line):
+    """`probe A.B.C.D PORT COUNT` as (address, port, count), or None."""
+    try:
+        parts = line.decode("ascii").split(" ")
+    except UnicodeDecodeError:
+        return None
+    if len(parts) != 4 or parts[0] != "probe":
+        return None
+    octets = parts[1].split(".")
+    if len(octets) != 4 or any(number(o, 0, 255) is None for o in octets):
+        return None
+    port = number(parts[2], 1, 65535)
+    count = number(parts[3], 1, MAX_COUNT)
+    if port is None or count is None:
+        return None
+    return parts[1], port, count
+
+
+def send(address, port, count):
+    sent = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        for _ in range(count):
+            try:
+                udp.sendto(PAYLOAD, (address, port))
+                sent += 1
+            except OSError:
+                pass
+    return sent
+
+
+def main():
+    conn = connection()
+    line = read_line(conn)
+    request = parse(line) if line is not None else None
+    if request is None:
+        conn.close()
+        sys.exit(1)
+    sent = send(*request)
+    try:
+        conn.settimeout(TIMEOUT_S)
+        conn.sendall(b"sent %d\n" % sent)
+    except OSError:
+        pass
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()

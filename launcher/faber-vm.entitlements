@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The only entitlement faber-vm has, and build.sh fails if the signed binary carries any
+	     other. It lets the process create VMs and, on macOS 26 and later, its own vmnet
+	     networks (#76). Deliberately no com.apple.vm.networking: that is the bridged-networking
+	     entitlement, and leaving it out keeps bridging impossible. -->
+	<key>com.apple.security.virtualization</key>
+	<true/>
+</dict>
+</plist>

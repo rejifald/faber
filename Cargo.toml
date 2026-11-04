@@ -1,3 +1,9 @@
+[workspace]
+members = ["crates/faber-release", "crates/faber-mirror"]
+# The menu-bar app is its own package with its own lockfile (Tauri), and stays
+# outside the workspace; it depends on `faber-release` by path.
+exclude = ["desktop/src-tauri"]
+
 [package]
 name = "faber"
 # Not the release version. Releases are stamped by .github/workflows/release.yml
@@ -12,9 +18,58 @@ description = "Local just-in-time GitHub Actions runner provisioner — run your
 repository = "https://github.com/rejifald/faber"
 
 [dependencies]
-# The privacy gate's HMAC (`src/privacy.rs`) drives SHA-256's raw compression
-# function, which `compress` exports.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "net", "signal"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Only to tell `[mirror.lfs]` with no `[mirror]` of its own (an implicit parent
+# table, which `toml` cannot report) from one under a written `[mirror]`. The
+# version `toml` already builds.
+toml_edit = { version = "0.22", default-features = false, features = ["parse"] }
+# SHA-256 over a downloaded release asset, before faber will execute it. The
+# privacy gate's HMAC (`src/privacy.rs`) drives its raw compression function,
+# which `compress` exports.
 sha2 = { version = "0.10", features = ["compress"] }
+clap = { version = "4", features = ["derive"] }
+# Operator-facing output (ADR-0050, `src/out.rs`): the SGR codes, and the
+# per-stream colour decision (`NO_COLOR`, `CLICOLOR`, `TERM`). Both are what
+# clap's default `color` feature already builds, at the versions it locks.
+anstyle = "1"
+anstream = "1"
+thiserror = "2"
+anyhow = "1"
+axum = "0.7"
+# The control socket (ADR-0028): axum 0.7's own `serve` takes only a TCP
+# listener, so the Unix-socket listener drives hyper directly. Both are the
+# versions axum already pulls in.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Release verification (ADR-0031): the policy, the attestation check, the
+# SHA256SUMS and version-binding helpers. A crate of its own so the menu-bar app
+# verifies by the same code (#172); the sigstore pins live in its manifest.
+faber-release = { path = "crates/faber-release" }
+# The pull-through mirror's contract (ADR-0047):
+# its port, its alias and the shape of its health report. The daemon uses the
+# library only; the service binary runs in the `faber-mirror` container.
+faber-mirror = { path = "crates/faber-mirror" }
+
+[features]
+# Swaps the compiled-in release-verification policy for the throwaway sandbox
+# repository's, so a follower built with it verifies the sandbox's releases
+# (#122). Never on by default, and `release.yml` refuses to publish a binary
+# built with it. There is no runtime override of the policy, by design. The
+# policy itself lives in `faber-release`; this only forwards the feature.
+sandbox-policy = ["faber-release/sandbox-policy"]
+
+[dev-dependencies]
+# `test-util` unlocks tokio's pausable clock, so a test can prove a timeout fires
+# without actually waiting it out on the wall clock.
+tokio = { version = "1", features = ["test-util"] }
+# `ServiceExt::oneshot`: drive the axum router in a test without a socket.
+tower = { version = "0.5", features = ["util"] }
 
 [lints.clippy]
 all = "warn"
@@ -24,6 +79,11 @@ all = "warn"
 [[example]]
 name = "privacy_denylist"
 test = true
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
 
 # The privacy gate digests every token of the tree under HMAC-SHA256 on each
 # keyed `cargo test` (ADR-0058). Unoptimized, SHA-256 alone makes that test

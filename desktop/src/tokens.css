@@ -1,0 +1,84 @@
+/* faber's colours: the one token source every surface reads (ADR-0037).
+
+   The tray popover and the full panel link this file from their HTML; the
+   daemon embeds it, with `include_str!`, into the dashboard, sign-in and
+   standby pages it serves (src/web.rs, src/control.rs, src/standby.rs). It is
+   the only file where a colour literal may live: tests/design_tokens.rs fails on
+   one anywhere else.
+
+   Names are roles, not hues-per-surface. A new colour is a new role in BOTH
+   blocks below. A value one surface needs, like the popover's floating shadow,
+   is its own role here, never a second palette. */
+
+:root {
+  color-scheme: light dark;
+
+  /* light (default) */
+  --bg: #f4f5f7;
+  --surface: #ffffff;
+  --surface-2: #f0f2f5;
+  --elevate: #ffffff;
+  --border: #e2e5ea;
+  --border-soft: #edeff3;
+  --border-control: #888c91; /* a control's own boundary (checkbox, input, select, outlined button): 3:1, WCAG 1.4.11 */
+  --fg: #1b2027;
+  --fg-strong: #0b0e12;
+  --muted: #5c6570;
+  --faint: #848d97;
+
+  --accent: #c97909;      /* amber, forge */
+  --accent-ink: #372102;  /* text on amber fill */
+  --accent-text: #9c5d07; /* amber as text on the page: --accent is too light for it */
+  --accent-soft: rgba(217, 130, 10, 0.12);
+
+  --green: #197b35;
+  --green-soft: rgba(26, 127, 55, 0.12);
+  --red: #cf222e;
+  --red-soft: rgba(207, 34, 46, 0.10);
+  --amber: #936200;
+  --amber-soft: rgba(154, 103, 0, 0.12);
+
+  /* a list row the pointer is over, and one being pressed or held open: a neutral lift toward
+     white in both themes (#369). Light lifts rather than darkens because --faint holds only
+     3.09:1 on --bg, so any darker row would take it under its 3:1 floor. */
+  --row-hover: rgba(255, 255, 255, 0.7);
+  --row-press: rgba(255, 255, 255, 1);
+
+  /* a card resting on the page, and the popover floating over the desktop */
+  --shadow: 0 1px 2px rgba(15, 20, 25, 0.06), 0 6px 20px rgba(15, 20, 25, 0.06);
+  --shadow-float: 0 1px 2px rgba(15, 20, 25, 0.06), 0 16px 42px rgba(15, 20, 25, 0.2);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0c1014;
+    --surface: #151a21;
+    --surface-2: #1a2029;
+    --elevate: #191f27;
+    --border: #262d37;
+    --border-soft: #1e242d;
+    --border-control: #656c75;
+    --fg: #dfe6ee;
+    --fg-strong: #f2f6fb;
+    --muted: #8b95a1;
+    --faint: #626c78;
+
+    --accent: #f5a524;
+    --accent-ink: #2a1804;
+    --accent-text: #f5a524;
+    --accent-soft: rgba(245, 165, 36, 0.14);
+
+    --green: #3fb950;
+    --green-soft: rgba(63, 185, 80, 0.15);
+    --red: #f8534b;
+    --red-soft: rgba(248, 81, 73, 0.14);
+    --amber: #e3a72f;
+    --amber-soft: rgba(227, 167, 47, 0.15);
+
+    --row-hover: rgba(242, 246, 251, 0.05);
+    --row-press: rgba(242, 246, 251, 0.07);
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.36);
+    --shadow-float: 0 1px 2px rgba(0, 0, 0, 0.5), 0 18px 46px rgba(0, 0, 0, 0.5);
+  }
+}

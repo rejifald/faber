@@ -1,0 +1,49 @@
+[package]
+name = "faber-mirror"
+version = "0.3.12"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+description = "faber's pull-through mirror service: one faber-owned container per host that jobs fetch through (ADR-0047)."
+repository = "https://github.com/rejifald/faber"
+
+# A library and a binary. The binary is the service that runs in the
+# `faber-mirror` container; the library is what it shares with the daemon: the
+# port, the health report's shape, and the adapter seam. The daemon depends on
+# the library only, so the two cannot disagree about either.
+
+[[bin]]
+name = "faber-mirror"
+path = "src/main.rs"
+
+[dependencies]
+# The versions faber itself already uses, so the workspace builds one copy.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util", "io-std", "fs", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# The adapters' upstreams (GitHub's LFS batch API and its object downloads; the
+# npm registry), with the TLS faber itself uses. `stream`: a request the npm
+# adapter forwards (a publish) streams its body upstream rather than buffering it.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+# sha256 over every filled LFS object (stored only when it hashes to its oid),
+# sha512 over every npm tarball (kept only when it matches `dist.integrity`).
+sha2 = "0.10"
+# The legacy `shasum` of npm packages published before `integrity` existed;
+# the same RustCrypto family and version as sha2, already in the lockfile.
+sha1 = "0.10"
+# `dist.integrity` is an SRI string: the hash in base64. Already in the lockfile.
+base64 = "0.22"
+# The download allowlist parses and checks hosts (`url::Host`); reqwest's own version.
+url = "2"
+# Streaming bodies in and out; axum already pulls this version in.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# `ServiceExt::oneshot`: drive the router in a test without a socket.
+tower = { version = "0.5", features = ["util"] }
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,13 @@
+[Unit]
+Description=faber's wall probe: a few UDP datagrams to the address the host names
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/faber-wall-probe
+DynamicUser=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_VSOCK
+RuntimeMaxSec=10

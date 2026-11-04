@@ -1,0 +1,85 @@
+# faber systemd system unit (ADR-0025): the Linux analogue of the LaunchDaemon
+# in deploy/io.github.rejifald.faber.plist. It runs at boot, with nobody logged
+# in, as faber's own system account rather than as any person's.
+#
+# `sudo faber setup` fills in the placeholder tokens below from the SYSTEM
+# layout (src/platform/layout.rs), writes the result to
+# /etc/systemd/system/faber.service as root 0644, then runs `systemctl
+# daemon-reload` and `systemctl enable --now faber.service`. (The tokens are
+# spelled out rather than shown here: the renderer's test asserts that none
+# survives, and a literal one in this comment would trip it.)
+#
+# Docker access is membership of the `docker` group, which setup grants. That
+# is root-equivalent on this host until ADR-0026 puts job code behind a wall.
+
+[Unit]
+Description=faber: local just-in-time GitHub Actions runner provisioner ({{LABEL}})
+After=network-online.target docker.service
+Wants=network-online.target
+
+# systemd's default is 5 restarts per 10s, after which it gives up and leaves
+# the unit "failed", a circuit breaker that Restart=always below must not trip.
+# A self-update that ships an instant-crashing binary is exactly the case
+# Restart=always exists for; ADR-0006 already treats a stranded fleet as the
+# costlier failure. RestartSec still paces a real crash loop.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User={{USER}}
+# The primary group is the operator's group: systemd gives it the three
+# directories below, and everything the daemon writes takes it, so the
+# operator reads config, logs and the audit trail through it. The account's
+# own group, which alone reads the GitHub token in /etc/faber/credentials, is
+# kept as a supplementary group: the operator is never in it.
+Group={{GROUP}}
+SupplementaryGroups={{TOKEN_GROUP}}
+ExecStart={{FABER_BIN}} run
+
+# HOME is the state directory, so the process environment and the SYSTEM layout
+# agree on it. PATH holds nothing an operator can write (ADR-0025).
+Environment=HOME={{HOME}}
+Environment=PATH=/usr/bin:/bin:/usr/sbin:/sbin
+WorkingDirectory={{HOME}}
+
+# /var/lib/faber, /var/cache/faber and /var/log/faber, owned by the account
+# and group above. setup creates them first with the same owner, group and
+# mode, so systemd finds them as it expects. stdout and stderr go to the
+# journal; the audit trail lands in the logs directory.
+StateDirectory=faber
+StateDirectoryMode=0750
+CacheDirectory=faber
+CacheDirectoryMode=0750
+LogsDirectory=faber
+LogsDirectoryMode=0750
+
+# The operator reads config, logs and the audit trail through the operator
+# group, and can write none of them.
+UMask=0027
+
+# 1. Restart on ANY exit, including a clean exit(0). The self-updater
+#    (ADR-0006, crate::update) swaps its own binary and then simply exits,
+#    relying on the manager to start the new one. Restart=on-failure would
+#    not catch that clean exit and would strand this host on the version it
+#    was installed with. This is launchd's KeepAlive, reproduced.
+Restart=always
+RestartSec=2
+
+# 2. A stop grace period at least as long as the longest job, mirroring the
+#    plist's ExitTimeOut. Cut this shorter and systemd SIGKILLs a mid-drain
+#    faber, orphaning whatever runner was still in flight on GitHub.
+TimeoutStopSec=600
+
+# 3. Signal faber itself, not its whole cgroup. faber keeps one `docker wait`
+#    child per in-flight runner (crate::docker) and manages their lifetime
+#    itself across a drain; KillMode=control-group would signal those watchers
+#    out from under the drain still using them. The runner containers are
+#    detached (`docker run -d`), so they live in dockerd's cgroup either way.
+KillMode=process
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

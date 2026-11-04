@@ -1,0 +1,10 @@
+# The build context is the repository root (see Dockerfile). Only what cargo
+# needs to build the workspace goes in.
+.git
+.claude
+target
+desktop
+ui/node_modules
+ui/dist
+**/node_modules
+**/.DS_Store

@@ -121,7 +121,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
 
-      # Built in a step of its own, so no build script runs where the key is.
+      # Built in a step of its own, and run below as a plain binary, so nothing
+      # compiles and no build script runs where the key is: a cargo command there
+      # would re-run build.rs, which watches `ui/dist`, absent in this job.
       # Every cargo command passes `--locked`: CI builds exactly what Cargo.lock
       # records, and a manifest that drifted from it fails here instead of being
       # quietly re-resolved to whatever is newest today and run beside the key.
@@ -134,10 +136,10 @@ jobs:
         env:
           FABER_PRIVACY_KEY: ${{ secrets.FABER_PRIVACY_KEY }}
           FABER_PRIVACY_KEY_REQUIRED: "true"
-        run: cargo run --locked --quiet --example privacy_scan -- "$RUNNER_TEMP"/scan/*.txt
+        run: target/debug/examples/privacy_scan "$RUNNER_TEMP"/scan/*.txt
 
       # Neither variable reaches this one: it checks credentials and home paths,
       # and warns that names were skipped.
       - name: Scan, names skipped (matches are never printed)
         if: steps.trust.outputs.trusted != 'true'
-        run: cargo run --locked --quiet --example privacy_scan -- "$RUNNER_TEMP"/scan/*.txt
+        run: target/debug/examples/privacy_scan "$RUNNER_TEMP"/scan/*.txt

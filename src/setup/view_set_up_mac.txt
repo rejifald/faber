@@ -1,0 +1,35 @@
+faber setup · plan for this Mac · nothing has changed yet
+
+  operator  owner (uid 501)
+  binary    /usr/local/bin/faber 0.4.0+gabc1234
+  layout    SYSTEM: state in /Library/Application Support/faber, logs in /Library/Logs/faber
+
+  nothing to change: this host is set up
+
+preflight                                     ok 2
+
+accounts                                      ok 7
+
+directories                                   ok 7
+
+binaries                                      ok 2
+
+per-user instances                            ok 1
+
+config and state                              ok 2
+
+log files                                     ok 3
+
+setup record                                  ok 1
+
+VMs (ADR-0026)                                ok 21
+
+service                                       ok 1
+
+keep awake                                    ok 1
+
+menu-bar app                                  ok 1
+
+Linux VM image                                ok 1
+
+nothing to change: this host is set up

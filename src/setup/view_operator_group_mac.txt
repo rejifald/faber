@@ -1,0 +1,74 @@
+faber setup · plan for this Mac · nothing has changed yet
+
+  operator  owner (uid 501)
+  binary    /usr/local/bin/faber 0.4.0+gabc1234
+  layout    SYSTEM: state in /Library/Application Support/faber, logs in /Library/Logs/faber
+
+  + 1 to create   ~ 14 to change   x 0 refused
+
+  At a glance
+    ~ change   you join group _faber_operator, to read config, logs and the audit trail
+    ~ change   you leave group _faber, so only faber reads its GitHub token
+    ~ change   the faber service is drained and restarted
+
+preflight                                     ok 2
+
+accounts                                      + 1 create   ~ 3 change   ok 4
+  + create   group _faber_operator     gid 450
+  ~ change   group _faber_operator     adds you (owner)
+  ~ change   group _faber_operator     adds _faber, which shares what it writes for you
+  ~ change   group _faber              takes you (owner) out: only faber reads its GitHub token
+
+directories                                   ~ 5 change   ok 2
+  ~ change   /Library/Application Support/faber
+                                       451:451 750 -> _faber:_faber_operator 750 (this directory
+                                       only, never its contents)
+  ~ change   /Library/Application Support/faber/bin
+                                       451:451 755 -> _faber:_faber_operator 755 (this directory
+                                       only, never its contents)
+  ~ change   /Library/Application Support/faber/registry-auth
+                                       451:451 700 -> _faber:_faber_operator 700 (this directory
+                                       only, never its contents)
+  ~ change   /Library/Logs/faber       0:451 750 -> root:_faber_operator 750 (this directory only,
+                                       never its contents)
+  ~ change   /Library/Caches/faber     451:451 750 -> _faber:_faber_operator 750 (this directory
+                                       only, never its contents)
+
+binaries                                      ok 2
+
+per-user instances                            ok 1
+
+config and state                              ~ 1 change   ok 1
+  ~ change   /Library/Application Support/faber/config.toml
+                                       kept: it exists already (--remigrate copies
+                                       /Users/owner/Library/Application Support/faber/config.toml
+                                       again), given group _faber_operator, which you read it
+                                       through
+
+log files                                     ~ 3 change
+  ~ change   /Library/Logs/faber/stdout.log
+                                       given group _faber_operator, which you read it through
+  ~ change   /Library/Logs/faber/stderr.log
+                                       given group _faber_operator, which you read it through
+  ~ change   /Library/Logs/faber/audit.jsonl
+                                       given group _faber_operator, which you read it through
+
+GitHub token                                  ok 1
+
+setup record                                  ~ 1 change
+  ~ change   /etc/faber/setup.json     written last; it makes this host SYSTEM
+
+VMs (ADR-0026)                                ok 21
+
+service                                       ~ 1 change
+  ~ change   /Library/LaunchDaemons/io.github.rejifald.faber.plist
+                                       the faber service: drained, stopped and started again, in
+                                       group _faber_operator
+
+keep awake                                    ok 1
+
+menu-bar app                                  ok 1
+
+Linux VM image                                ok 1
+
++ 1 to create   ~ 14 to change   x 0 refused   (--verbose: commands and modes)

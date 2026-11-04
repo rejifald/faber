@@ -1,0 +1,10 @@
+node_modules/
+# Build output. dist/.gitkeep stays tracked so build.rs always has a directory
+# to watch: cargo reruns a build script on every build when a watched path is
+# missing.
+dist/*
+!dist/.gitkeep
+# The story browser's static build (npm run storybook:build).
+storybook-static/
+# TypeScript's incremental build state (tsc -b).
+*.tsbuildinfo

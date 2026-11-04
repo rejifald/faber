@@ -18,8 +18,8 @@
 //! minutes on one GPU, with no dictionary and no prior suspicion needed. A keyed
 //! digest cannot be checked against even one guess without the key.
 //!
-//! The key is held in two places only: each repository's `FABER_PRIVACY_KEY`
-//! Actions secret, and the owner's environment. Where it is absent the name
+//! The key is held only in each repository's `FABER_PRIVACY_KEY` Actions secret
+//! and on the owner's own machine (ADR-0058). Where it is absent the name
 //! check cannot run, so a gate says so loudly ([`announce_skip`]) instead of
 //! passing in silence. Where CI sets `FABER_PRIVACY_KEY_REQUIRED=true`, an absent
 //! key fails the gate instead.

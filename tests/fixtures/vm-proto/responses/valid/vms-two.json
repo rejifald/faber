@@ -1,0 +1,1 @@
+{"id":6,"reply":{"vms":{"vms":[{"slot":0,"kind":"macos","claim":"123456789-1760700000","state":"ready","started_unix":1760700000},{"slot":1,"kind":"linux","claim":"linux-engine","state":"in_service","started_unix":1760700000}]}}}

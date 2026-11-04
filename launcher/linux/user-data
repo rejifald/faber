@@ -1,0 +1,15 @@
+#cloud-config
+# The throwaway build VM's cloud-init config (ADR-0026). `sudo faber setup`
+# appends the write_files section from the files beside this one, so each is
+# kept once, as itself.
+#
+# No way in: no users, no SSH keys, no passwords.
+users: []
+disable_root: true
+ssh_pwauth: false
+growpart:
+  mode: auto
+  devices: ["/"]
+resize_rootfs: true
+runcmd:
+  - [/usr/local/libexec/faber-provision]

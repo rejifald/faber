@@ -1,0 +1,195 @@
+faber setup · plan for this Mac · nothing has changed yet
+
+  operator  owner (uid 501), home /Users/owner
+  binary    /usr/local/bin/faber 0.4.0+gabc1234
+  layout    SYSTEM: state in /Library/Application Support/faber, logs in /Library/Logs/faber
+
+  + 31 to create   ~ 9 to change   ! 4 warnings   x 0 refused
+
+  At a glance
+    ! warning  VM jobs cannot run yet: no VM launcher or guest agent beside this binary
+    ! warning  the menu-bar app is not installed: its release archive is not beside the launcher
+    + create   two hidden role accounts, _faber and _faber_vm
+    ~ change   you join group _faber_operator, to read config, logs and the audit trail
+    ~ change   your per-user faber is drained and stopped
+    + create   config.toml and audit.jsonl copied from your per-user install; the originals stay
+    + create   the VM wall as a system service
+    + create   faber as a system service
+    ~ change   3 old per-user faber folders are renamed aside once the new daemon answers
+    ~ change   system sleep and Power Nap are turned off
+
+preflight                                     ok 2
+  ok         operator owner (uid 501)  reads config, logs and the audit trail through group
+                                       _faber_operator, and never the GitHub token
+  ok         this binary, /usr/local/bin/faber
+                                       nothing faber's own accounts can write
+
+accounts                                      + 5 create   ~ 2 change
+  + create   group _faber              gid 450
+             $ /usr/sbin/dseditgroup -o create -i 450 -r "faber daemon" _faber
+  + create   group _faber_vm           gid 451
+             $ /usr/sbin/dseditgroup -o create -i 451 -r "faber VM host" _faber_vm
+  + create   group _faber_operator     gid 452
+             $ /usr/sbin/dseditgroup -o create -i 452 -r "faber operator" _faber_operator
+  + create   user _faber               uid 450, no password, hidden
+             $ /usr/sbin/sysadminctl -addUser _faber -UID 450 -GID 450 -shell /usr/bin/false -home \
+                 "/Library/Application Support/faber" -roleAccount
+             $ /usr/bin/dscl . -create /Users/<_faber> Password "*"
+             $ /usr/bin/dscl . -delete /Users/<_faber> AuthenticationAuthority
+               (only if it has one; then checked, as for _www)
+             $ /usr/bin/dscl . -create /Users/<_faber> IsHidden 1
+             $ /usr/bin/dscl . -create /Users/<_faber> NFSHomeDirectory \
+                 "/Library/Application Support/faber"
+  + create   user _faber_vm            uid 451, no password, hidden
+             $ /usr/sbin/sysadminctl -addUser _faber_vm -UID 451 -GID 451 -shell /usr/bin/false \
+                 -home /var/db/faber-vm -roleAccount
+             $ /usr/bin/dscl . -create /Users/<_faber_vm> Password "*"
+             $ /usr/bin/dscl . -delete /Users/<_faber_vm> AuthenticationAuthority
+               (only if it has one; then checked, as for _www)
+             $ /usr/bin/dscl . -create /Users/<_faber_vm> IsHidden 1
+             $ /usr/bin/dscl . -create /Users/<_faber_vm> NFSHomeDirectory /var/db/faber-vm
+  ~ change   group _faber_operator     adds you (owner)
+             $ /usr/sbin/dseditgroup -o edit -a owner -t user _faber_operator
+  ~ change   group _faber_operator     _faber in group _faber_operator: the daemon shares what it
+                                       writes for you through this group, from its next start
+             $ /usr/sbin/dseditgroup -o edit -a _faber -t user _faber_operator
+
+directories                                   + 7 create
+  + create   /etc/faber                root:wheel 755
+  + create   /Library/Application Support/faber
+                                       _faber:_faber_operator 750
+  + create   /Library/Application Support/faber/bin
+                                       _faber:_faber_operator 755
+  + create   /Library/Application Support/faber/registry-auth
+                                       _faber:_faber_operator 700
+  + create   /Library/Logs/faber       root:_faber_operator 750
+  + create   /Library/Caches/faber     _faber:_faber_operator 750
+  + create   /var/db/faber-vm          _faber_vm:_faber 710
+
+binaries                                      + 1 create   ok 1
+  ok         /usr/local/bin/faber      this binary (0.4.0+gabc1234)
+  + create   /Library/Application Support/faber/bin/faber
+                                       this binary (0.4.0+gabc1234), owned by _faber: the copy the
+                                       daemon runs and updates
+
+per-user instances                            ~ 1 change
+  ~ change   /Users/owner/Library/LaunchAgents/io.github.rejifald.faber.plist
+                                       owner's per-user faber: running: drain its control socket or
+                                       127.0.0.1:8787 (waits for admitted jobs), stop
+                                       gui/501/io.github.rejifald.faber, move
+                                       /Users/owner/Library/LaunchAgents/io.github.rejifald.faber.plist
+                                       aside to
+                                       /Users/owner/Library/LaunchAgents/io.github.rejifald.faber.plist.pre-system-<time>
+
+config and state                              + 2 create   ok 2
+  + create   /Library/Application Support/faber/config.toml
+                                       copied from
+                                       /Users/owner/Library/Application Support/faber/config.toml
+                                       (120 bytes; the original stays, its sha256 goes in the
+                                       record)
+  + create   /Library/Logs/faber/audit.jsonl
+                                       copied from /Users/owner/Library/Logs/faber/audit.jsonl (4096
+                                       bytes; the original stays, its sha256 goes in the record)
+  ok         source config check       the config to migrate passes this binary's check-config, run
+                                       as owner before anything is drained or stopped
+  ok         config check              /usr/local/bin/faber check-config runs on it as _faber before
+                                       the service starts; a failure stops setup and restores what
+                                       it stopped
+
+log files                                     + 2 create
+  + create   /Library/Logs/faber/stdout.log
+                                       empty, _faber:_faber_operator 640
+  + create   /Library/Logs/faber/stderr.log
+                                       empty, _faber:_faber_operator 640
+
+setup record                                  + 1 create
+  + create   /etc/faber/setup.json     root-owned 0644, written last before the service starts: it
+                                       is what makes this host SYSTEM
+
+VMs (ADR-0026)                                + 12 create   ~ 2 change   ! 3 warnings
+  ! warning  /var/db/faber/bin/faber-vm
+                                       no launcher to install: none beside this binary (faber-vm or
+                                       faber-launcher-aarch64-apple-darwin) and no --launcher PATH.
+                                       VM jobs cannot run until it is installed; re-run setup with
+                                       it
+  ! warning  /Library/Application Support/faber/bin/faber-agent
+                                       no guest agent to install: none named faber-agent or
+                                       faber-agent-aarch64-apple-darwin in the launcher's directory.
+                                       macOS VM jobs cannot build their tools disk until it is
+                                       installed; re-run setup with the release's assets in one
+                                       directory
+  ! warning  /Library/LaunchDaemons/io.github.rejifald.faber.vm-supervisor.plist
+                                       not installed: it runs the launcher, which is not installed
+  + create   /var/db/faber/bin         _faber:_faber 755, under directories only root can change:
+                                       the supervisor (_faber_vm) runs the launcher in it, and a
+                                       release swaps it there
+  + create   /usr/local/libexec/faber/docker
+                                       Docker CLI 29.9.2 from
+                                       https://download.docker.com/mac/static/stable/aarch64/docker-29.9.2.tgz:
+                                       the archive's SHA-256 checked against the pin before it is
+                                       unpacked, only docker/docker kept and its own SHA-256
+                                       checked, root:wheel 0755. The daemon runs it by this path;
+                                       its staged copy is run as _faber (never as root) and must
+                                       report Docker version 29.9.2
+  + create   /var/db/faber-vm/run      _faber_vm:_faber 710
+  + create   /var/db/faber-vm/state    _faber_vm:_faber_vm 700
+  + create   /var/db/faber-vm/clones   _faber_vm:_faber_vm 700
+  + create   /var/db/faber-vm/linux    _faber_vm:_faber_vm 700
+  + create   /var/db/faber/tools-disks
+                                       _faber:_faber 755: the supervisor (_faber_vm) reads the tools
+                                       disks _faber builds
+  + create   /var/db/faber/images      root:wheel 755, and every directory above it root's
+  ~ change   /etc/faber/wall/plan.json
+                                       16 VM networks: slots 0-13 macOS, 14 the Linux engine, 15 the
+                                       image build, rendered once this run's config.toml is in
+                                       place, from the macos-vm and docker profiles it names
+  ~ change   /etc/faber/wall/stored.json
+                                       the rules for that plan and /etc/faber/grants.toml, rendered
+                                       once this run's config.toml is in place, from the macos-vm
+                                       and docker profiles it names
+  + create   /var/db/faber/wall        root:wheel 755: only root writes the checker's verdict, and
+                                       _faber reads it
+  + create   /var/log/faber-wall.log   empty, root:wheel 640
+  + create   /var/log/faber-vm-supervisor.log
+                                       empty, _faber_vm:wheel 640
+  + create   /Library/LaunchDaemons/io.github.rejifald.faber.wall.plist
+                                       root:wheel 0644: root runs /usr/local/bin/faber wall-daemon,
+                                       enforcing the stored rules; logs to /var/log/faber-wall.log;
+                                       plutil -lint, then launchctl enable, bootstrap and kickstart
+
+service                                       + 1 create
+  + create   /Library/LaunchDaemons/io.github.rejifald.faber.plist
+                                       plutil -lint, then launchctl enable, bootstrap and kickstart
+                                       system/io.github.rejifald.faber; ready once the control
+                                       socket answers
+
+your old per-user files                       ~ 3 change
+  ~ change   /Users/owner/Library/Application Support/faber
+                                       renamed aside to <name>.pre-system-<time> once the new daemon
+                                       answers: the backup stays, and nothing faber reads stays in
+                                       this home (--keep-legacy leaves it)
+  ~ change   /Users/owner/Library/Logs/faber
+                                       renamed aside to <name>.pre-system-<time> once the new daemon
+                                       answers: the backup stays, and nothing faber reads stays in
+                                       this home (--keep-legacy leaves it)
+  ~ change   /Users/owner/Library/Caches/faber
+                                       renamed aside to <name>.pre-system-<time> once the new daemon
+                                       answers: the backup stays, and nothing faber reads stays in
+                                       this home (--keep-legacy leaves it)
+
+keep awake                                    ~ 1 change
+  ~ change   sleep and Power Nap       system sleep and Power Nap: pmset -a sleep 0; pmset -a
+                                       powernap 0 (a sleeping Mac suspends every job)
+
+menu-bar app                                  ! 1 warning
+  ! warning  /Applications/faber.app   no menu-bar app to install (missing): no
+                                       faber-app-aarch64-apple-darwin.tar.gz in the launcher's
+                                       directory. Re-run setup with the release's assets in one
+                                       directory, or, for a source build, with its app archive
+                                       beside the launcher (docs/manual-update.md)
+
+Linux VM image                                ok 1
+  ok         /var/db/faber/images/linux/disk.raw
+                                       Debian 20261015-2632, provisioned by this release
+
++ 31 to create   ~ 9 to change   ! 4 warnings   x 0 refused

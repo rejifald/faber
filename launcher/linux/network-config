@@ -1,0 +1,14 @@
+# cloud-init network config v2, for the throwaway build VM only. The image
+# keeps its own systemd-networkd file (10-faber.network), because the
+# long-lived VM boots without cloud-init.
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "en*"
+    dhcp4: true
+    dhcp-identifier: mac
+    dhcp4-overrides:
+      use-dns: false
+    nameservers:
+      addresses: [1.1.1.1, 1.0.0.1]

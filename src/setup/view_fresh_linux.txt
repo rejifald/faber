@@ -1,0 +1,74 @@
+faber setup · plan for this host · nothing has changed yet
+
+  operator  owner (uid 501)
+  binary    /usr/local/bin/faber 0.4.0+gabc1234
+  layout    SYSTEM: state in /var/lib/faber, logs in /var/log/faber
+
+  + 17 to create   ~ 7 to change   x 0 refused
+
+  At a glance
+    + create   two role accounts, _faber and _faber_vm
+    ~ change   you join group _faber_operator, to read config, logs and the audit trail
+    ~ change   _faber joins group docker, root-equivalent until ADR-0026
+    ~ change   your per-user faber is drained and stopped
+    + create   config.toml and audit.jsonl copied from your per-user install; the originals stay
+    + create   faber as a system service
+    ~ change   3 old per-user faber folders are renamed aside once the new daemon answers
+
+preflight                                     ok 2
+
+accounts                                      + 5 create   ~ 3 change
+  + create   group _faber              gid 450
+  + create   group _faber_vm           gid 451
+  + create   group _faber_operator     gid 452
+  + create   user _faber               uid 450
+  + create   user _faber_vm            uid 451
+  ~ change   group _faber_operator     adds you (owner)
+  ~ change   group _faber_operator     adds _faber, which shares what it writes for you
+  ~ change   _faber in group docker    Docker access, which is root-equivalent on this host until
+                                       ADR-0026 puts job code behind a wall
+
+directories                                   + 7 create
+  + create   /etc/faber
+  + create   /var/lib/faber
+  + create   /var/lib/faber/bin
+  + create   /var/lib/faber/registry-auth
+  + create   /var/log/faber
+  + create   /var/cache/faber
+  + create   /var/lib/faber-vm
+
+binaries                                      + 1 create   ok 1
+  + create   /var/lib/faber/bin/faber  the daemon's own copy of this binary
+
+per-user instances                            ~ 1 change
+  ~ change   /Users/owner/Library/LaunchAgents/io.github.rejifald.faber.plist
+                                       owner's per-user faber, running: drained (waits for admitted
+                                       jobs), stopped, and this file moved aside
+
+config and state                              + 2 create   ok 2
+  + create   /var/lib/faber/config.toml
+                                       copied from owner's per-user install; the original stays
+  + create   /var/log/faber/audit.jsonl
+                                       copied from owner's per-user install; the original stays
+  ok         config check              run as _faber before the service starts; a failure stops
+                                       setup and restores what it stopped
+
+setup record                                  + 1 create
+  + create   /etc/faber/setup.json     written last; it makes this host SYSTEM
+
+service                                       + 1 create
+  + create   /etc/systemd/system/faber.service
+                                       the faber service; ready once its control socket answers
+
+your old per-user files                       ~ 3 change
+  ~ change   /Users/owner/.config/faber
+                                       renamed aside once the new daemon answers (--keep-legacy
+                                       leaves it)
+  ~ change   /Users/owner/.local/state/faber
+                                       renamed aside once the new daemon answers (--keep-legacy
+                                       leaves it)
+  ~ change   /Users/owner/.cache/faber
+                                       renamed aside once the new daemon answers (--keep-legacy
+                                       leaves it)
+
++ 17 to create   ~ 7 to change   x 0 refused   (--verbose: commands and modes)

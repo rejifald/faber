@@ -1,0 +1,60 @@
+{
+  "title": "faber UI catalogue",
+  "output": "../docs/design/catalog.md",
+  "command": "npm --prefix ui run catalog",
+  "intro": [
+    "Every kit part in `ui/src/kit/`, with when to use it, its states and its props (ADR-0042).",
+    "Read by whoever composes a screen. The rules are in [guidelines.md](guidelines.md); sizes come from the control ladder (ADR-0039).",
+    "",
+    "Every entry has a story per state in `ui/src/kit/*.stories.tsx`, browsed with `npm run storybook` (ADR-0043). `catalog:check` fails on an entry without one."
+  ],
+  "storyExportPattern": "^export const \\w+",
+  "propsSuffix": "Props",
+  "groups": [
+    {
+      "name": "Kit",
+      "type": "components",
+      "intro": "Base UI parts wrapped once, sized from the control ladder. Screens import these from `ui/src/kit`, never Base UI.",
+      "sources": [
+        "src/kit/*.tsx"
+      ],
+      "exclude": [
+        "**/*.stories.tsx",
+        "**/*.spec.tsx",
+        "**/*.test.tsx"
+      ],
+      "story": "{dir}/{file}.stories.tsx",
+      "requireStory": true
+    },
+    {
+      "name": "Blocks",
+      "type": "components",
+      "intro": "The popover's and the dashboard's pieces, composed from the kit: each is one row, mark or section of a screen, with a story per state.",
+      "sources": [
+        "src/blocks/*.tsx"
+      ],
+      "exclude": [
+        "**/*.stories.tsx",
+        "**/*.spec.tsx",
+        "**/*.test.tsx"
+      ],
+      "story": "{dir}/{file}.stories.tsx",
+      "requireStory": true
+    },
+    {
+      "name": "Screens",
+      "type": "components",
+      "intro": "Each surface's screens, composed from the kit.",
+      "sources": [
+        "src/screens/*.tsx"
+      ],
+      "exclude": [
+        "**/*.stories.tsx",
+        "**/*.spec.tsx",
+        "**/*.test.tsx"
+      ],
+      "story": "{dir}/{file}.stories.tsx",
+      "requireStory": true
+    }
+  ]
+}

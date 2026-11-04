@@ -1,0 +1,47 @@
+{
+  "name": "faber-ui",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "faber's popover and dashboard: React, Base UI and Tailwind (ADR-0042).",
+  "scripts": {
+    "dev": "vite --mode dashboard",
+    "dev:popover": "vite --mode popover",
+    "build": "tsc --noEmit && vite build --mode dashboard && vite build --mode popover",
+    "lint": "eslint .",
+    "catalog": "node scripts/catalog.mjs",
+    "catalog:check": "node scripts/catalog.mjs --check",
+    "test": "node --test 'scripts/*.test.mjs'",
+    "storybook": "storybook dev --port 6006 --no-open",
+    "storybook:build": "storybook build --quiet"
+  },
+  "dependencies": {
+    "@base-ui/react": "1.9.0",
+    "@visx/scale": "4.0.0",
+    "@visx/shape": "4.0.0",
+    "lucide-react": "1.61.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@storybook/react-vite": "10.6.3",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "eslint": "10.13.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "17.13.0",
+    "jsdom": "30.1.3",
+    "storybook": "10.6.3",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.0",
+    "vite": "8.3.5"
+  },
+  "engines": {
+    "node": ">=22.12"
+  }
+}

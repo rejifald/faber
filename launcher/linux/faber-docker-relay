@@ -1,0 +1,100 @@
+#!/usr/bin/python3
+"""faber's Docker relay: vsock port 2375 to /run/docker.sock (ADR-0026).
+
+systemd hands over the listening vsock socket (faber-docker-vsock.socket,
+Accept=no). Each client is connected to Docker's own Unix socket and the bytes
+are pumped both ways, one thread per direction.
+
+Why not systemd-socket-proxyd: it ends the whole connection on the first EOF,
+so once the docker CLI half-closes its stdin, as an attached `docker run` or a
+`docker exec` does, the output still on its way back is lost. Here an EOF on
+one side becomes shutdown(SHUT_WR) on the other, and a connection ends only
+when both directions have ended. An error in either direction shuts both down.
+"""
+
+import os
+import socket
+import sys
+import threading
+import time
+
+DOCKER_SOCKET = "/run/docker.sock"
+LISTEN_FDS_START = 3
+CHUNK = 64 * 1024
+
+
+class Link:
+    """One client and its Docker connection, closed once both directions end."""
+
+    def __init__(self, client, upstream):
+        self.client = client
+        self.upstream = upstream
+        self.lock = threading.Lock()
+        self.open_directions = 2
+
+    def pump(self, src, dst):
+        try:
+            while True:
+                data = src.recv(CHUNK)
+                if not data:
+                    break
+                dst.sendall(data)
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            self.abort()
+        finally:
+            self.direction_done()
+
+    def abort(self):
+        for sock in (self.client, self.upstream):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def direction_done(self):
+        with self.lock:
+            self.open_directions -= 1
+            last = self.open_directions == 0
+        if last:
+            self.client.close()
+            self.upstream.close()
+
+
+def listener():
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        sys.exit("faber-docker-relay: LISTEN_PID is not this process; start it from its socket unit")
+    if os.environ.get("LISTEN_FDS") != "1":
+        sys.exit("faber-docker-relay: expected exactly one socket from systemd")
+    return socket.socket(fileno=LISTEN_FDS_START)
+
+
+def serve(client):
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        upstream.connect(DOCKER_SOCKET)
+    except OSError as e:
+        print(f"faber-docker-relay: cannot reach {DOCKER_SOCKET}: {e}", file=sys.stderr)
+        upstream.close()
+        client.close()
+        return
+    link = Link(client, upstream)
+    for src, dst in ((client, upstream), (upstream, client)):
+        threading.Thread(target=link.pump, args=(src, dst), daemon=True).start()
+
+
+def main():
+    sock = listener()
+    while True:
+        try:
+            client, _ = sock.accept()
+        except OSError as e:
+            # EMFILE and friends must not kill the relay.
+            print("faber-docker-relay: accept failed: %s" % e, file=sys.stderr, flush=True)
+            time.sleep(1)
+            continue
+        serve(client)
+
+
+if __name__ == "__main__":
+    main()

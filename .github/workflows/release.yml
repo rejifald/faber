@@ -1,0 +1,662 @@
+name: Release
+
+# ADR-0031's release flow. A release is two deliberate acts by the owner:
+#
+#   1. Actions -> Release -> Run workflow, on `main`, choosing patch/minor/major.
+#      This workflow builds the macOS target, checksums and attests the assets,
+#      and leaves exactly one DRAFT release whose tag does not exist yet.
+#   2. Releases -> Publish, with the draft and its notes in view. Publishing is
+#      what creates the `v*` tag, and only the owner may do it.
+#
+# Nothing here fires on a push, a tag or a merge: an auto-updating fleet must
+# never be able to acquire a new version by accident (ADR-0006).
+#
+# Job layout, and why it is split this way:
+#
+#   plan    contents: read   refuse any ref but main; refuse unless CI
+#           actions: read    dispatched on this exact main tip passed, macOS
+#                            legs included; compute the version;
+#                            assemble the notes and scan them for private names
+#   build   contents: read   stamp the version, build, check `--version` exactly
+#                            (the daemon, the faber-vm launcher and faber-agent)
+#                            and that each binary's compiled-in verification
+#                            policy names this repository and this workflow
+#   attest  id-token/attest  checksum the assets, sign SHA256SUMS keylessly
+#   draft   contents: write  gh CLI only: delete older drafts, create the draft
+#
+# Only `draft` can write to the repository, and it runs no action at all, first-
+# or third-party: nothing it executes is code fetched at run time. The attest
+# step lives in this file on purpose: a follower's policy pins the signer
+# workflow to `release.yml@refs/heads/main`, so moving the step (into a reusable
+# workflow, say) is a trust-root change, not a refactor.
+#
+# Linux is not released. Linux has no VM wall (ADR-0026 defers it) and setup puts
+# `_faber` in group docker there, which is root on the host, so no Linux binary
+# ships until a Linux wall is decided. CI still builds and tests Linux on every
+# change. Bringing a Linux leg back means adding its matrix entry, putting the
+# launcher, golden-prep, agent and app steps back behind per-leg conditions (they
+# are macOS only), and listing its assets in deploy/release.sh's expected assets.
+# tests/workflow_pins.rs keeps the two lists in step, and assumes every leg stages
+# every asset, so it needs to learn those conditions at the same time.
+#
+# Every `uses:` is pinned to a full commit SHA, with the release it was in as a
+# comment. No cache is restored anywhere: every workflow on `main` shares
+# `main`'s caches, so code running in any of them could plant an entry this
+# release would then build from and attest as genuine.
+#
+# The build is pinned as far as GitHub lets it be. The Rust and Node versions and
+# the runner images are exact, never "stable", "22" or "latest", so the day's
+# toolchain does not decide what gets signed, and a build can be repeated. The
+# `build` job prints the versions it ran (Xcode and Swift are the image's, so
+# they are recorded rather than pinned). Bump a pin in a reviewed PR, when the
+# new version has been out for a week: the cooldown dependabot.yml applies to
+# everything else, which cannot reach these.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the last published version to bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+
+# Nothing by default. Each job asks for exactly what it needs.
+permissions: {}
+
+# One release run at a time: two concurrent dispatches would each delete the
+# other's draft.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pinned toolchains, each one version used in every job that needs it.
+  # tests/workflow_pins.rs fails if either stops being an exact x.y.z.
+  PINNED_RUST_VERSION: "1.99.1"
+  PINNED_NODE_VERSION: "22.23.4"
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read # the CI-run lookup below
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      # First, before anything is checked out, built or deleted. A branch run
+      # must not be able to delete `main`'s draft, and a follower would refuse
+      # its attestation anyway (the policy pins refs/heads/main).
+      - name: Refuse any ref but main
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release runs only on refs/heads/main, not $GITHUB_REF. Nothing was built or deleted."
+            exit 1
+          fi
+          echo "ref: $GITHUB_REF at $GITHUB_SHA"
+
+      # CI does not run on a push to main, and its macOS legs never run on a
+      # pull request (ci.yml says why). The tip shipped here is proven by a
+      # separate CI run the owner dispatches on main first:
+      #   gh workflow run ci.yml --ref main
+      # It is a separate run on purpose: CI restores caches and uses faber's
+      # own runners, and nothing from it may reach this run's artifacts (see
+      # the header). This only reads that run's result.
+      - name: Refuse unless CI dispatched on this exact commit passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          required=(
+            "linux · fmt · clippy · test · ui · infra"
+            "test · macos-latest"
+            "desktop · cargo check"
+            "launcher · macos"
+          )
+          runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=workflow_dispatch&per_page=100" \
+            --jq '.workflow_runs[] | select(.head_branch == "main" and .conclusion == "success") | .id')"
+          if [[ -z "$runs" ]]; then
+            echo "::error::No successful ci.yml run dispatched on main at $GITHUB_SHA. Run 'gh workflow run ci.yml --ref main', wait for it to pass, then release again. Nothing was built or deleted."
+            exit 1
+          fi
+          for id in $runs; do
+            jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100")"
+            missing=()
+            for job in "${required[@]}"; do
+              c="$(jq -r --arg n "$job" '[.jobs[] | select(.name == $n) | .conclusion][0] // empty' <<<"$jobs")"
+              [[ "$c" == "success" ]] || missing+=("$job (${c:-absent})")
+            done
+            if (( ${#missing[@]} == 0 )); then
+              echo "CI run $id passed at $GITHUB_SHA, macOS legs included."
+              exit 0
+            fi
+            echo "CI run $id at $GITHUB_SHA lacks a passing job: ${missing[*]}"
+          done
+          echo "::error::No dispatched ci.yml run at $GITHUB_SHA passed every required job (listed above). Nothing was built or deleted."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # notes are a log range against the last published tag
+          persist-credentials: false
+
+      # From the last *published*, non-pre-release release: a draft is not
+      # something any host has seen, and a tag without a release (the archive's
+      # v0.3.12) is not something any host upgraded from. Highest version, not
+      # GitHub's "latest" flag, which a token can move (ADR-0031, What the spikes
+      # found).
+      #
+      # Cargo.toml's committed version is a floor, not the release version: the
+      # next release is a bump of whichever is higher. It is what makes the first
+      # release of a fresh repository (no published release at all) start above
+      # every version the archive ever tagged, so no host compares against a
+      # version that went backwards.
+      - name: Compute the next version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          semver='^[0-9]+\.[0-9]+\.[0-9]+$'
+          LAST="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' | sort -V | tail -n1)"
+          FLOOR="$(grep -m1 -E '^version = "' Cargo.toml | sed -E 's/^version = "([^"]*)".*/\1/')"
+          [[ "$FLOOR" =~ $semver ]] || { echo "::error::Cargo.toml's version '$FLOOR' is not x.y.z"; exit 1; }
+          BASE="$(printf '%s\n%s\n' "${LAST:-0.0.0}" "$FLOOR" | sort -V | tail -n1)"
+          IFS=. read -r MA MI PA <<<"$BASE"
+          case "$BUMP" in
+            major) MA=$((10#$MA + 1)); MI=0; PA=0 ;;
+            minor) MI=$((10#$MI + 1)); PA=0 ;;
+            patch) PA=$((10#$PA + 1)) ;;
+            *) echo "::error::unknown bump '$BUMP'"; exit 1 ;;
+          esac
+          NEXT="$((10#$MA)).$((10#$MI)).$((10#$PA))"
+          echo "last published: ${LAST:-none}, floor: $FLOOR -> next: $NEXT"
+
+          # A tag that already exists would turn into a release the moment its
+          # draft is published, whatever commit it points at. Only Publish
+          # creates a `v*` tag, so an existing one is an anomaly to look at.
+          if git rev-parse -q --verify "refs/tags/v$NEXT" >/dev/null; then
+            echo "::error::tag v$NEXT already exists without a published release; investigate it before releasing."
+            exit 1
+          fi
+
+          {
+            echo "version=$NEXT"
+            echo "last=$LAST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Assemble release notes
+        env:
+          LAST: ${{ steps.version.outputs.last }}
+        run: |
+          set -euo pipefail
+          mkdir -p notes
+          if [[ -n "$LAST" ]] && git rev-parse -q --verify "refs/tags/v$LAST" >/dev/null; then
+            git log "v$LAST..$GITHUB_SHA" --pretty=format:'- %s' > notes/NOTES.md
+          fi
+          [[ -s notes/NOTES.md ]] || printf 'First tracked release.\n' > notes/NOTES.md
+          wc -l notes/NOTES.md
+
+      # The notes are public from the moment the draft is published. #126 scans
+      # the commit messages and PR titles they are made of; this scans the notes
+      # themselves (#140), before any draft exists, in a job that cannot write.
+      # The scanner is built from this run's own checkout, with no cache (see the
+      # header). A hit prints the line and kind, never the token: this log is
+      # public. So the notes are printed only after the scan passes.
+      - name: Install Rust for the notes scan
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: ${{ env.PINNED_RUST_VERSION }}
+
+      # Built in a step of its own, so no build script runs where the key is. The
+      # key is required: a release runs on `main`, which always gets secrets.
+      - name: Build the notes scanner
+        run: cargo build --locked --quiet --example privacy_scan
+
+      # The binary, not `cargo run`: a cargo command here would re-run build.rs,
+      # which watches `ui/dist`, absent in this job, beside the key.
+      - name: Scan the release notes (matches are never printed)
+        env:
+          FABER_PRIVACY_KEY: ${{ secrets.FABER_PRIVACY_KEY }}
+          FABER_PRIVACY_KEY_REQUIRED: "true"
+        run: target/debug/examples/privacy_scan notes/NOTES.md
+
+      - name: Show the release notes
+        run: cat notes/NOTES.md
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notes
+          path: notes/
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: build · ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      # A partial matrix must never become a release. `draft` needs this whole
+      # job, so one failed target already blocks it; fail-fast just stops the
+      # others wasting runner minutes once that is decided.
+      fail-fast: true
+      matrix:
+        include:
+          # The only leg; the header says why. Every step below runs on it: the
+          # daemon, and the macOS-only menu-bar app, VM launcher and guest agent
+          # (ADR-0026), all stamped with the daemon's version.
+          - target: aarch64-apple-darwin
+            os: macos-26
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: ${{ env.PINNED_RUST_VERSION }}
+          targets: ${{ matrix.target }}
+
+      # Into this checkout only; nothing is committed. Every manifest that
+      # records the version is stamped, and both lockfiles with it, because
+      # `--locked` refuses a lockfile that disagrees with its manifest. Each
+      # edit must change exactly one line, or the run stops here.
+      - name: Stamp the version
+        shell: bash
+        run: |
+          set -euo pipefail
+          stamp() { # file perl-substitution
+            perl -0pi -e "$2" "$1"
+            local changed; changed="$(git diff --numstat -- "$1" | cut -f1,2)"
+            [[ "$changed" == "1"$'\t'"1" ]] \
+              || { echo "::error::stamping $1 changed '${changed:-nothing}' (+/-), expected exactly one line"; exit 1; }
+            echo "stamped $1"
+          }
+          stamp Cargo.toml                      's/^version = "[^"]*"/version = "$ENV{VERSION}"/m'
+          stamp Cargo.lock                      's/(\nname = "faber"\nversion = ")[^"]*"/$1$ENV{VERSION}"/'
+          stamp desktop/src-tauri/Cargo.toml    's/^version = "[^"]*"/version = "$ENV{VERSION}"/m'
+          stamp desktop/src-tauri/Cargo.lock    's/(\nname = "faber-menubar"\nversion = ")[^"]*"/$1$ENV{VERSION}"/'
+          stamp desktop/src-tauri/tauri.conf.json 's/^(  "version": ")[^"]*"/$1$ENV{VERSION}"/m'
+          git diff --stat
+
+      # Every leg: the daemon embeds the dashboard (ADR-0042 § 7), and the
+      # menu-bar app bundle needs Node for the Tauri CLI as well.
+      #
+      # No cache, deliberately (see the header). setup-node turns caching on by
+      # itself when package.json names a package manager, so it is refused
+      # explicitly rather than by omission.
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.PINNED_NODE_VERSION }}
+          package-manager-cache: false
+
+      # The setup actions take their inputs at their word. This asks the tools
+      # themselves, so a toolchain that is not the pinned one stops the build
+      # here, and the log records what built the release. Xcode and Swift come
+      # with the runner image, which is pinned to a macOS version but not to an
+      # Xcode: they are recorded, not checked.
+      - name: Check and record the toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUSTC="$(rustc --version)"
+          NODE="$(node --version)"
+          echo "$RUSTC"
+          cargo --version
+          echo "node $NODE"
+          echo "npm $(npm --version)"
+          xcodebuild -version
+          swift --version
+          [[ "$RUSTC" == "rustc $PINNED_RUST_VERSION "* ]] \
+            || { echo "::error::rustc is '$RUSTC', not the pinned $PINNED_RUST_VERSION"; exit 1; }
+          [[ "$NODE" == "v$PINNED_NODE_VERSION" ]] \
+            || { echo "::error::node is '$NODE', not the pinned $PINNED_NODE_VERSION"; exit 1; }
+
+      # `npm ci` installs exactly ui/package-lock.json. The daemon build below
+      # embeds ui/dist/dashboard, and FABER_REQUIRE_UI makes build.rs fail
+      # rather than ship the "UI not built" page.
+      - name: Build the UI
+        run: ( cd ui && npm ci && npm run build )
+
+      - name: Build the daemon
+        env:
+          FABER_REQUIRE_UI: "1"
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # Every runner in this matrix is native to the target it builds, so the
+      # binary can be executed here. That is the only thing standing between a
+      # stale or mis-stamped build and an auto-updating fleet installing it. If
+      # a cross-compiled target is ever added it cannot run this step, and that
+      # gap should be argued for explicitly rather than discovered.
+      #
+      # Exact, not a substring: `faber <version>+g<sha>`, the version equal to
+      # the stamped one and the build suffix a prefix of the built commit. That
+      # is the same binding a follower checks (ADR-0031, What a follower
+      # verifies, step 3).
+      - name: Check the binary reports exactly this version and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/faber"
+          test -x "$BIN" || { echo "::error::no binary at $BIN"; exit 1; }
+          BUILT="$("$BIN" --version)"
+          echo "built: '$BUILT'  want: 'faber $VERSION+g<prefix of $GITHUB_SHA>'"
+          [[ "$BUILT" =~ ^faber\ ([0-9]+\.[0-9]+\.[0-9]+)\+g([0-9a-f]{7,40})$ ]] \
+            || { echo "::error::'$BUILT' is not 'faber <x.y.z>+g<sha>'"; exit 1; }
+          [[ "${BASH_REMATCH[1]}" == "$VERSION" ]] \
+            || { echo "::error::binary reports ${BASH_REMATCH[1]}, not $VERSION"; exit 1; }
+          [[ "$GITHUB_SHA" == "${BASH_REMATCH[2]}"* ]] \
+            || { echo "::error::binary was built from ${BASH_REMATCH[2]}, not $GITHUB_SHA"; exit 1; }
+          echo "version and commit match"
+
+      # The verification policy is compiled in (ADR-0031), and a follower trusts
+      # exactly what it names. So the binary is asked what it enforces, rather
+      # than the build command read (a feature turned on any other way, a default
+      # or a dependency, is caught too), and held to this run: the release policy
+      # and not the sandbox one, this repository's numeric ID and not the
+      # placeholder 0 or another's, and this workflow at this ref as the signer.
+      # scripts/check-release-policy.sh says which, and its cases are tested.
+      - name: Check the binary enforces this repository's release verification policy
+        shell: bash
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          "target/${{ matrix.target }}/release/faber" provenance-policy | scripts/check-release-policy.sh
+
+      - name: Stage the daemon under the name followers match on
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/faber" "dist/faber-${{ matrix.target }}"
+          chmod 0755 "dist/faber-${{ matrix.target }}"
+
+      # ADR-0026: the VM launcher ships beside the daemon on macOS and is bound
+      # to the same build. The stamp is the exact `<x.y.z>+g<sha>` the daemon just
+      # reported, so a follower can compare the two byte for byte. build.sh signs
+      # it and fails unless the entitlement is exactly the virtualization one.
+      - name: Build, check and stage the VM launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          DAEMON="$("target/${{ matrix.target }}/release/faber" --version)"
+          STAMP="${DAEMON#faber }"
+          [[ "$STAMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+g[0-9a-f]{7,40}$ ]] \
+            || { echo "::error::daemon stamp '$STAMP' is not <x.y.z>+g<sha>"; exit 1; }
+          FABER_VERSION="$STAMP" FABER_VM_OUT="$RUNNER_TEMP/faber-vm" launcher/build.sh
+          BIN="$RUNNER_TEMP/faber-vm/faber-vm"
+          test -x "$BIN" || { echo "::error::no launcher at $BIN"; exit 1; }
+          BUILT="$("$BIN" --version)"
+          echo "built: '$BUILT'  want: 'faber-vm $VERSION+g<prefix of $GITHUB_SHA>'"
+          [[ "$BUILT" =~ ^faber-vm\ ([0-9]+\.[0-9]+\.[0-9]+)\+g([0-9a-f]{7,40})$ ]] \
+            || { echo "::error::'$BUILT' is not 'faber-vm <x.y.z>+g<sha>'"; exit 1; }
+          [[ "${BASH_REMATCH[1]}" == "$VERSION" ]] \
+            || { echo "::error::launcher reports ${BASH_REMATCH[1]}, not $VERSION"; exit 1; }
+          [[ "$GITHUB_SHA" == "${BASH_REMATCH[2]}"* ]] \
+            || { echo "::error::launcher was built from ${BASH_REMATCH[2]}, not $GITHUB_SHA"; exit 1; }
+          cp "$BIN" "dist/faber-launcher-${{ matrix.target }}"
+          chmod 0755 "dist/faber-launcher-${{ matrix.target }}"
+          echo "launcher version and commit match"
+
+      # ADR-0049: faber-golden-prep, the operator's window-and-installer tool for
+      # building a golden image, ships beside the launcher and is never faber-vm.
+      # It rides the launcher's leg (same Swift toolchain), is stamped with the same
+      # `<x.y.z>+g<sha>`, and build.sh --compile-only signs it and fails unless the
+      # entitlement is exactly the virtualization one.
+      - name: Build, check and stage faber-golden-prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          DAEMON="$("target/${{ matrix.target }}/release/faber" --version)"
+          STAMP="${DAEMON#faber }"
+          [[ "$STAMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+g[0-9a-f]{7,40}$ ]] \
+            || { echo "::error::daemon stamp '$STAMP' is not <x.y.z>+g<sha>"; exit 1; }
+          FABER_VERSION="$STAMP" FABER_VM_OUT="$RUNNER_TEMP/faber-golden-prep" launcher/golden/build.sh --compile-only
+          BIN="$RUNNER_TEMP/faber-golden-prep/faber-golden-prep"
+          test -x "$BIN" || { echo "::error::no faber-golden-prep at $BIN"; exit 1; }
+          BUILT="$("$BIN" --version)"
+          echo "built: '$BUILT'  want: 'faber-golden-prep $VERSION+g<prefix of $GITHUB_SHA>'"
+          [[ "$BUILT" =~ ^faber-golden-prep\ ([0-9]+\.[0-9]+\.[0-9]+)\+g([0-9a-f]{7,40})$ ]] \
+            || { echo "::error::'$BUILT' is not 'faber-golden-prep <x.y.z>+g<sha>'"; exit 1; }
+          [[ "${BASH_REMATCH[1]}" == "$VERSION" ]] \
+            || { echo "::error::faber-golden-prep reports ${BASH_REMATCH[1]}, not $VERSION"; exit 1; }
+          [[ "$GITHUB_SHA" == "${BASH_REMATCH[2]}"* ]] \
+            || { echo "::error::faber-golden-prep was built from ${BASH_REMATCH[2]}, not $GITHUB_SHA"; exit 1; }
+          cp "$BIN" "dist/faber-golden-prep-${{ matrix.target }}"
+          chmod 0755 "dist/faber-golden-prep-${{ matrix.target }}"
+          echo "faber-golden-prep version and commit match"
+
+      # ADR-0026: the guest agent goes onto each per-version tools disk, and
+      # the tools disk is built from the installed, verified release (ADR-0031),
+      # so it is bound to the same build as the daemon, exactly like the
+      # launcher. build.sh --agent signs it with no entitlements and fails if it
+      # carries any. Its `--version` line is `faber-agent <x.y.z>+g<sha>
+      # protocol=<n>`; the protocol number is the agent's own handshake and is
+      # the one field not bound to the commit (faber_release::
+      # check_reported_agent_version is the follower's identical check).
+      - name: Build, check and stage the guest agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          DAEMON="$("target/${{ matrix.target }}/release/faber" --version)"
+          STAMP="${DAEMON#faber }"
+          [[ "$STAMP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+g[0-9a-f]{7,40}$ ]] \
+            || { echo "::error::daemon stamp '$STAMP' is not <x.y.z>+g<sha>"; exit 1; }
+          FABER_VERSION="$STAMP" FABER_VM_OUT="$RUNNER_TEMP/faber-agent" launcher/build.sh --agent
+          BIN="$RUNNER_TEMP/faber-agent/faber-agent"
+          test -x "$BIN" || { echo "::error::no agent at $BIN"; exit 1; }
+          BUILT="$("$BIN" --version)"
+          echo "built: '$BUILT'  want: 'faber-agent $VERSION+g<prefix of $GITHUB_SHA> protocol=<n>'"
+          [[ "$BUILT" =~ ^faber-agent\ ([0-9]+\.[0-9]+\.[0-9]+)\+g([0-9a-f]{7,40})\ protocol=[0-9]+$ ]] \
+            || { echo "::error::'$BUILT' is not 'faber-agent <x.y.z>+g<sha> protocol=<n>'"; exit 1; }
+          [[ "${BASH_REMATCH[1]}" == "$VERSION" ]] \
+            || { echo "::error::agent reports ${BASH_REMATCH[1]}, not $VERSION"; exit 1; }
+          [[ "$GITHUB_SHA" == "${BASH_REMATCH[2]}"* ]] \
+            || { echo "::error::agent was built from ${BASH_REMATCH[2]}, not $GITHUB_SHA"; exit 1; }
+          cp "$BIN" "dist/faber-agent-${{ matrix.target }}"
+          chmod 0755 "dist/faber-agent-${{ matrix.target }}"
+          echo "agent version and commit match"
+
+      - name: Build and stage the menu-bar app
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `npm ci` installs exactly desktop/package-lock.json; the trailing
+          # `-- --locked` reaches the app's own `cargo build`.
+          ( cd desktop && npm ci && npm run tauri -- build -- --locked )
+          PARENT="desktop/src-tauri/target/release/bundle/macos"
+          test -d "$PARENT/faber.app" || { echo "::error::no app bundle at $PARENT/faber.app"; exit 1; }
+          APP_VERSION="$(plutil -extract CFBundleShortVersionString raw "$PARENT/faber.app/Contents/Info.plist")"
+          [[ "$APP_VERSION" == "$VERSION" ]] \
+            || { echo "::error::app bundle reports $APP_VERSION, not $VERSION"; exit 1; }
+          echo "app bundle version matches $VERSION"
+          # Setup installs the app only when its FaberBuild stamp is the
+          # binary's whole version (ADR-0034, amended 2026-10-31).
+          APP_BUILD="$(plutil -extract FaberBuild raw "$PARENT/faber.app/Contents/Info.plist")"
+          [[ "$APP_BUILD" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+g([0-9a-f]{7,40})$ ]] \
+            || { echo "::error::app bundle's FaberBuild '$APP_BUILD' is not '<x.y.z>+g<sha>'"; exit 1; }
+          [[ "${BASH_REMATCH[1]}" == "$VERSION" && "$GITHUB_SHA" == "${BASH_REMATCH[2]}"* ]] \
+            || { echo "::error::app bundle's FaberBuild is $APP_BUILD, not $VERSION+g<prefix of $GITHUB_SHA>"; exit 1; }
+          echo "app bundle build stamp matches"
+          # Tarred from the bundle's *parent* so the archive contains
+          # `faber.app/...` rather than the bundle's contents at the archive
+          # root — that is what lets a follower extract straight into a
+          # directory and get an openable bundle instead of loose files.
+          tar -czf "dist/faber-app-${{ matrix.target }}.tar.gz" -C "$PARENT" faber.app
+
+      # The app verifies releases by the same crate as the daemon, with its own
+      # copy of the policy compiled in, so it gets the same check: a `sandbox-policy`
+      # turned on in its manifest, or a policy naming another repository, would
+      # leave every installed app refusing every update. The app prints its
+      # policy when started with `--provenance-policy`, before any window opens.
+      # Nothing is uploaded until the end of this job, so a refusal here keeps the
+      # tarball above out of the release.
+      - name: Check the menu-bar app enforces this repository's release verification policy
+        shell: bash
+        env:
+          REPOSITORY_ID: ${{ github.repository_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          APP="desktop/src-tauri/target/release/bundle/macos/faber.app"
+          EXE="$APP/Contents/MacOS/$(plutil -extract CFBundleExecutable raw "$APP/Contents/Info.plist")"
+          test -x "$EXE" || { echo "::error::no app executable at $EXE"; exit 1; }
+          "$EXE" --provenance-policy | scripts/check-release-policy.sh
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: attest
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # Sigstore keyless signing, via this workflow run's OIDC identity
+      attestations: write # persist the attestation against SHA256SUMS's digest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: staged
+          pattern: dist-*
+          merge-multiple: true
+
+      # Bare filenames, no directory component: a follower matches SHA256SUMS
+      # entries against bare asset names (src/update.rs::parse_sha256sums).
+      - name: Checksum every asset
+        working-directory: staged
+        run: |
+          set -euo pipefail
+          ls -la
+          sha256sum faber-* > SHA256SUMS
+          cat SHA256SUMS
+          mkdir -p ../attested
+          cp SHA256SUMS ../attested/
+
+      # The one signature a release carries (ADR-0031). Its subject is
+      # SHA256SUMS, which in turn binds every asset. No `continue-on-error`:
+      # an unsigned release is one no follower will install, so failing here
+      # is the right outcome. (A private repository cannot persist
+      # attestations at all, which is why this workflow is only ever run in
+      # the public one.)
+      - name: Attest SHA256SUMS
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: attested/SHA256SUMS
+
+      # Shipped as a release asset so verifying a release needs only the
+      # release, never GitHub's attestations API.
+      - name: Stage the bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -s "$BUNDLE" || { echo "::error::no attestation bundle at '$BUNDLE'"; exit 1; }
+          cp "$BUNDLE" attested/SHA256SUMS.sigstore.json
+          ls -la attested
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: attested
+          path: attested/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that can write to the repository. It runs the preinstalled gh
+  # CLI and nothing else: no checkout, no action, no code fetched at run time.
+  draft:
+    name: draft
+    needs: [plan, attest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # delete older drafts, create this one
+      actions: read # download this run's artifacts
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      # Again, in the one job that deletes: `needs` makes it unreachable from
+      # another ref today, and this keeps that true if the graph ever changes.
+      - name: Refuse any ref but main
+        run: |
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] \
+            || { echo "::error::Release runs only on refs/heads/main, not $GITHUB_REF."; exit 1; }
+
+      - name: Download this run's assets, bundle and notes
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --dir downloaded
+          mkdir -p staged
+          find downloaded/dist-* -type f -exec mv -n {} staged/ \;
+          mv -n downloaded/attested/SHA256SUMS downloaded/attested/SHA256SUMS.sigstore.json staged/
+          mv downloaded/notes/NOTES.md NOTES.md
+          ls -la staged
+
+      # What is uploaded must be exactly what was attested: every asset listed
+      # in SHA256SUMS, matching it, and nothing else.
+      - name: Check the assets against the attested SHA256SUMS
+        working-directory: staged
+        run: |
+          set -euo pipefail
+          sha256sum --strict -c SHA256SUMS
+          diff <(awk '{print $2}' SHA256SUMS | sort) \
+               <(ls | grep -vxF -e SHA256SUMS -e SHA256SUMS.sigstore.json | sort)
+
+      - name: Delete older drafts, so only one candidate exists
+        run: |
+          set -euo pipefail
+          for id in $(gh api "repos/$GH_REPO/releases" --paginate --jq '.[] | select(.draft) | .id'); do
+            echo "deleting draft $id"
+            gh api -X DELETE "repos/$GH_REPO/releases/$id"
+          done
+
+      # A DRAFT whose tag targets the built commit and does not exist yet.
+      # Publishing it creates the tag; that is the owner's click (ADR-0031).
+      - name: Create the draft
+        run: |
+          set -euo pipefail
+          # Checked again here, not only in `plan`: a tag created during the
+          # build would otherwise get this draft attached to it, and a token
+          # can publish a draft whose tag already exists (ADR-0031, What the
+          # spikes found). So no draft is ever created against an existing tag.
+          # Only a 404 counts as absent; any other failure stops the run too.
+          if probe="$(gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" 2>&1)"; then
+            echo "::error::tag v$VERSION already exists; refusing to create a draft against it. Investigate the tag."
+            exit 1
+          elif ! grep -q 'HTTP 404' <<<"$probe"; then
+            echo "::error::could not tell whether tag v$VERSION exists: $probe"
+            exit 1
+          fi
+          gh release create "v$VERSION" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "faber v$VERSION" \
+            --notes-file NOTES.md \
+            staged/*
+          if gh api "repos/$GH_REPO/git/ref/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "::error::tag v$VERSION exists; a draft must not create its tag"
+            exit 1
+          fi
+          echo "drafted v$VERSION at $GITHUB_SHA; review it under Releases, then Publish."
