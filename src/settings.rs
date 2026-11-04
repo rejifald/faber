@@ -1646,6 +1646,9 @@ mod tests {
         assert_eq!((n.label, n.value), ("Turn off", "false"));
         let mut on = cfg();
         on.registry_auth.enabled = true;
+        // dind denied: `cfg()`'s granted dind would trip the Linux dind wall in
+        // `validate()` (ADR-0025 §8), which this test is not about.
+        on.profiles[0].dind = Some(false);
         let mut off = on.clone();
         off.registry_auth.enabled = serde_json::from_str(n.value).unwrap();
         assert!(crate::control::trust_widening(&on, &off).is_empty());
