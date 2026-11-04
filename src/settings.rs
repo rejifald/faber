@@ -831,19 +831,18 @@ const REGISTRY_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         held: true,
-        hint: Some("The registry as keyed in a docker config.json. Held with the section."),
+        hint: Some("The registry as keyed in a docker config.json."),
         ..f("registry_auth.server", "Server", "text")
     },
     FieldSpec {
         held: true,
         optional: true,
-        hint: Some("Held with the section."),
         ..f("registry_auth.username", "Username", "text")
     },
     FieldSpec {
         held: true,
         hint: Some(
-            "Name of the environment variable that would hold the secret; must start with FABER_REGISTRY_. Held with the section.",
+            "Name of the environment variable that would hold the secret; must start with FABER_REGISTRY_.",
         ),
         ..f("registry_auth.password_env", "Password variable", "text")
     },

@@ -79,9 +79,9 @@ export const fields = {
   vmCpus: f('linux_vm.cpus', 'Linux VM vCPUs', 'int', { optional: true, min: 1, hint: 'Blank = 4' }),
   vmMemory: f('linux_vm.memory_mib', 'Linux VM memory', 'int', { optional: true, unit: 'MiB', min: 1024, hint: 'Blank = 8192' }),
   registryEnabled: f('registry_auth.enabled', 'Enabled', 'bool', { held: true, narrow: { label: 'Turn off', value: 'false' }, hint: "Held: a credential mounted into a job can be read by the job's code." }),
-  registryServer: f('registry_auth.server', 'Server', 'text', { held: true, hint: 'The registry as keyed in a docker config.json. Held with the section.' }),
-  registryUser: f('registry_auth.username', 'Username', 'text', { held: true, optional: true, hint: 'Held with the section.' }),
-  registryPassword: f('registry_auth.password_env', 'Password variable', 'text', { held: true, hint: 'Held with the section.' }),
+  registryServer: f('registry_auth.server', 'Server', 'text', { held: true, hint: 'The registry as keyed in a docker config.json.' }),
+  registryUser: f('registry_auth.username', 'Username', 'text', { held: true, optional: true }),
+  registryPassword: f('registry_auth.password_env', 'Password variable', 'text', { held: true, hint: 'Name of the environment variable that would hold the secret; must start with FABER_REGISTRY_.' }),
   checkInterval: f('update.poll_interval_secs', 'Check interval', 'int', { unit: 's', min: 60, live: true }),
 };
 

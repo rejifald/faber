@@ -37,7 +37,7 @@ export function Command({ children }: CommandProps) {
 }
 
 export interface TrustRowProps {
-  /** The `sudo` field. */
+  /** The `sudo` or `held` field. */
   field: FieldSpec;
   /** The value as saved. */
   value: unknown;
@@ -52,12 +52,13 @@ export interface TrustRowProps {
 }
 
 /**
- * A `sudo` field the form may not edit freely: its value, the one-click narrowing when it would
- * narrow, and otherwise the command that changes it, to copy. The command wraps, never truncates.
+ * A `sudo` or `held` field the form may not edit freely: its value, the one-click narrowing when it
+ * would narrow, and otherwise the command that changes it, to copy (none for a held field, whose
+ * section validation refuses on). The command wraps, never truncates.
  *
- * @useWhen a `sudo` scalar, or a list or map without `narrows`, inside a FieldRow. For a trust list
- * the form may narrow in place, use ListField or MapField.
- * @states at rest, narrowing offered, narrowing pending, command copied
+ * @useWhen a `sudo` or `held` scalar, or a list or map without `narrows`, inside a FieldRow. For a
+ * trust list the form may narrow in place, use ListField or MapField.
+ * @states at rest, narrowing offered, narrowing pending, command copied, held (no command)
  */
 export function TrustRow({ field, value, profile, pending, onNarrow, onUndo }: TrustRowProps) {
   const [copied, setCopied] = useState(false);

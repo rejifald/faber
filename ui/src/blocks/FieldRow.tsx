@@ -141,8 +141,8 @@ function control(p: FieldRowProps): ReactNode {
 
 /**
  * One field of the Settings form: its label and hint, a `live` or `restart` tag (or `changed`), and
- * the control its kind calls for. A list goes to ListField, a map to MapField, and a `sudo` field
- * that may not narrow in place to TrustRow. A changed field draws its control with the accent
+ * the control its kind calls for. A list goes to ListField, a map to MapField, and a `sudo` or
+ * `held` field that may not narrow in place to TrustRow. A changed field draws its control with the accent
  * border; an invalid one shows its message under the control.
  *
  * @useWhen every field of a SectionSpec or a profile, rendered from its FieldSpec. Never one
