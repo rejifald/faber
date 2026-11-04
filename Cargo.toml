@@ -22,11 +22,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 # Only to tell `[mirror.lfs]` with no `[mirror]` of its own (an implicit parent
 # table, which `toml` cannot report) from one under a written `[mirror]`. The
 # version `toml` already builds.
-toml_edit = { version = "0.22", default-features = false, features = ["parse"] }
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 # SHA-256 over a downloaded release asset, before faber will execute it. The
 # privacy gate's HMAC (`src/privacy.rs`) drives its raw compression function,
 # which `compress` exports.
@@ -39,7 +39,7 @@ anstyle = "1"
 anstream = "1"
 thiserror = "2"
 anyhow = "1"
-axum = "0.7"
+axum = "0.8"
 # The control socket (ADR-0028): axum 0.7's own `serve` takes only a TCP
 # listener, so the Unix-socket listener drives hyper directly. Both are the
 # versions axum already pulls in.

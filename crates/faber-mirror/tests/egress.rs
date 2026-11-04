@@ -52,7 +52,7 @@ async fn serve() -> Server {
         hits: Arc::new(AtomicUsize::new(0)),
     };
     let app = Router::new()
-        .route("/hop/:n", get(hop))
+        .route("/hop/{n}", get(hop))
         .route("/off", get(off))
         .with_state(s.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

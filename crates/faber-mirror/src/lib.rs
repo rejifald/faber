@@ -409,10 +409,13 @@ pub struct Peer {
     pub local: Option<SocketAddr>,
 }
 
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_>> for Peer {
-    fn connect_info(target: axum::serve::IncomingStream<'_>) -> Self {
+impl
+    axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::TcpListener>>
+    for Peer
+{
+    fn connect_info(target: axum::serve::IncomingStream<'_, tokio::net::TcpListener>) -> Self {
         Self {
-            local: target.local_addr().ok(),
+            local: target.io().local_addr().ok(),
         }
     }
 }

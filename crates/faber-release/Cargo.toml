@@ -39,7 +39,7 @@ sandbox-policy = []
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
 # Tampering with a saved bundle's DSSE fields in the provenance tests.
-base64 = "0.22"
+base64 = "0.23"
 
 [lints.clippy]
 all = "warn"

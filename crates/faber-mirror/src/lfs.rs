@@ -468,11 +468,11 @@ impl<U: Upstream> crate::Adapter for Adapter<U> {
     fn routes(&self) -> Router {
         Router::new()
             .route(
-                "/:token/:owner/:repo/info/lfs/objects/batch",
+                "/{token}/{owner}/{repo}/info/lfs/objects/batch",
                 post(batch::<U>),
             )
             .route(
-                "/:token/:owner/:repo/info/lfs/objects/:oid",
+                "/{token}/{owner}/{repo}/info/lfs/objects/{oid}",
                 get(object::<U>),
             )
             .with_state(self.0.clone())

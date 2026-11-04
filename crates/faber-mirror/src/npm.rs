@@ -48,6 +48,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::ExtensionRejection;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -661,7 +662,7 @@ impl<U: Upstream> crate::Adapter for Adapter<U> {
     fn routes(&self) -> Router {
         Router::new()
             .route("/", any(handle::<U>))
-            .route("/*rest", any(handle::<U>))
+            .route("/{*rest}", any(handle::<U>))
             .with_state(self.0.clone())
     }
 }
@@ -695,7 +696,9 @@ impl Asker {
 
 async fn handle<U: Upstream>(
     State(npm): State<Arc<Npm<U>>>,
-    peer: Option<ConnectInfo<Peer>>,
+    // axum 0.8 gives `ConnectInfo` no `Option` form; its rejection is the
+    // "none" case: a router served without connect info sees no peer.
+    peer: Result<ConnectInfo<Peer>, ExtensionRejection>,
     req: Request,
 ) -> Response {
     if npm.control.npm().is_none() {
@@ -703,6 +706,7 @@ async fn handle<U: Upstream>(
     }
     let asker = Asker {
         grant: peer
+            .ok()
             .and_then(|ConnectInfo(p)| p.local)
             .and_then(|a| npm.control.by_addr(a.ip())),
     };
