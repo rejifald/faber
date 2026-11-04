@@ -110,10 +110,10 @@ fn routes(web: Web) -> Router {
         .iter()
         .fold(Router::new(), |r, view| r.route(view, get(shell)));
     views
-        .route("/assets/*name", get(bundle_asset))
+        .route("/assets/{*name}", get(bundle_asset))
         .route("/api/state", get(state))
         .route("/api/jobs", get(jobs))
-        .route("/api/runs/:runner", get(run))
+        .route("/api/runs/{runner}", get(run))
         .route("/api/settings", get(get_settings).post(save_settings_route))
         .route("/api/settings/key", post(save_settings_key))
         .route(
@@ -1189,7 +1189,7 @@ fn unknown_keys_in(root: &toml::Value, text: &str) -> Vec<(String, Option<usize>
         return Vec::new();
     }
     // Parsed once for every key it places, not once per key.
-    let doc = toml_edit::ImDocument::parse(text).ok();
+    let doc = toml_edit::Document::parse(text).ok();
     out.into_iter()
         .map(|path| {
             let at = doc.as_ref().and_then(|d| key_offset(d, &path));
@@ -1344,7 +1344,7 @@ fn dotted(path: &[Seg]) -> String {
 }
 
 /// Where the last key of `path` is written in `doc`, as a byte offset.
-fn key_offset(doc: &toml_edit::ImDocument<&str>, path: &[Seg]) -> Option<usize> {
+fn key_offset(doc: &toml_edit::Document<&str>, path: &[Seg]) -> Option<usize> {
     use toml_edit::{Item, Table, TableLike, Value};
     enum Cur<'a> {
         Item(&'a Item),
