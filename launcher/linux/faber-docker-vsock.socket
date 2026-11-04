@@ -1,0 +1,9 @@
+[Unit]
+Description=faber's Docker socket on vsock port 2375
+
+[Socket]
+ListenStream=vsock::2375
+Accept=no
+
+[Install]
+WantedBy=sockets.target

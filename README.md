@@ -83,9 +83,9 @@ user accounts (not yours), starts when the Mac starts, and doesn't need you logg
 faber auth link
 ```
 
-This opens GitHub's page for creating an access token, with the right permissions
-already filled in. Pick the repositories this Mac should run jobs for, create the
-token, then hand it to faber:
+This prints a link to GitHub's page for creating an access token, with the right
+permissions already filled in. Open it, pick the repositories this Mac should run jobs
+for, create the token, then hand it to faber:
 
 ```bash
 sudo faber auth set
@@ -193,7 +193,8 @@ is registered for that one job only. When the job ends, all of it is deleted. Th
 containers live inside faber's Linux VM, so jobs never run directly on your Mac. By
 default they can reach the internet but not your home network or the Mac itself. If a
 job genuinely needs a machine on your network, you can open exactly one address and
-port for it with `sudo faber grant add`.
+port with `sudo faber grant add`. Every Linux job on this Mac can then reach it, not
+only the job that needed it ([docs/operating.md](docs/operating.md#vm-jobs-and-the-lan)).
 
 ### macOS jobs in their own VM · In progress
 
@@ -306,8 +307,11 @@ A Mac will be able to follow new faber releases on its own. It checks that each
 release really came from this project before downloading it, waits a day before
 installing, swaps only when no job is running, and rolls back a version that won't
 start. The switch exists (`[update] enabled = true`), but no signed release has been
-published yet, so for now you update by pulling the source and re-running the
-installer.
+published yet, so for now you update by hand, from source. The installer, run again,
+pulls the latest source and rebuilds the daemon.
+[docs/manual-update.md](docs/manual-update.md) is the full procedure: it also builds
+the VM launcher and guest agent from the same commit, and `sudo faber setup` lets
+running jobs finish before it swaps the daemon.
 
 ## Safety
 
@@ -388,11 +392,18 @@ images you built, because they may be your only copy.
 
 ## Going deeper
 
-More detailed guides are on their way into this repository: the full configuration
-reference, the git mirror and download mirror guides, how faber decides which jobs it
-will run, and the design decisions behind each feature. Until they arrive, the
-dashboard's Settings page edits every setting and checks your input, and
-`faber check-config` tells you whether your file is valid.
+- [docs/operating.md](docs/operating.md): the operator's guide. Which jobs faber will
+  run and the settings that change that, the runner image and what to do when GitHub
+  retires its runner, network access for jobs, configuring and updating a Mac, and
+  reading the logs when something goes wrong.
+- [docs/mirrors.md](docs/mirrors.md): the download mirror, a local cache that answers
+  Git LFS and npm downloads, and how to turn it on.
+- [docs/git-mirror.md](docs/git-mirror.md): the git mirror, a copy of each repo's
+  history on your Mac, and the workflow step that lets checkout use it.
+- [docs/autolimiter.md](docs/autolimiter.md): how faber decides how many jobs fit at
+  once, from memory, CPU and disk, and why a job waits.
+- [docs/adrs/](docs/adrs/): the design decisions, one record each, with the reasons and
+  the options turned down.
 
 ## License
 

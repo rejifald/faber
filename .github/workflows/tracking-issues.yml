@@ -1,0 +1,42 @@
+name: Tracking issues
+
+# A tracking issue (label `tracking`) lists its work as a task list and stays
+# open until every box is ticked. A PR that finishes one item says `Part of #N`,
+# but a stray closing keyword in another PR, or a manual close, would end the
+# record early. This reopens such an issue when it closes with a box still
+# unticked. Removing the label first is the deliberate way to close one anyway.
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  keep-open:
+    name: tracking · keep open
+    if: contains(github.event.issue.labels.*.name, 'tracking')
+    # Hosted, like privacy-text's issue legs: faber's gate does not admit issue
+    # events (`[gate] allowed_events`). Nothing is checked out and no repository
+    # code runs, so the job needs only the issue write it uses.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      # The body comes from the event payload file, read with jq. It is never
+      # interpolated into the shell, so it cannot inject commands.
+      - name: Reopen while a box is unticked
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.issue.number }}
+        run: |
+          unticked=$(jq -r '.issue.body // ""' "$GITHUB_EVENT_PATH" | grep -c -E '^[[:space:]]*[-*+] \[ \]' || true)
+          if [ "$unticked" -eq 0 ]; then
+            echo "Every box is ticked; the close stands."
+            exit 0
+          fi
+          gh issue reopen "$NUMBER" --repo "$GITHUB_REPOSITORY"
+          gh issue comment "$NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Reopened: $unticked box(es) are still unticked. A tracking issue closes once every box is ticked, by the PR that completes the item or by an owner decision linked beside it."

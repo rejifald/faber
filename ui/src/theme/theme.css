@@ -1,0 +1,180 @@
+/* faber's Tailwind theme (ADR-0042 § 3): the only steps a class name can reach.
+
+   `--*: initial` clears every Tailwind default (palette, spacing, sizes, radii,
+   type, shadows, breakpoints), so `p-4`, `bg-red-500` or `text-lg` do not
+   exist. What remains is faber's:
+
+   - colours: the ADR-0037 roles. Their values live once, in
+     desktop/src/tokens.css, for light and dark, and that file is imported
+     below rather than copied, so the vanilla surfaces and this UI cannot drift
+     while both exist. `@theme inline` makes each utility read the role's
+     variable, so the system's light or dark choice reaches every class;
+   - spacing, radius and type: the ADR-0038 scales;
+   - the control ladder: ADR-0039 § 1's heights and icon sizes, used by the
+     kit only (ui/src/kit/ladder.ts);
+   - fonts: the ADR-0040 stacks (fonts.css declares the faces).
+
+   A missing step is a change to the ADR that owns the scale, never a local
+   value: arbitrary values (`p-[7px]`) are rejected by ESLint everywhere outside
+   this directory. */
+
+@import "tailwindcss";
+@import "../../../desktop/src/tokens.css";
+@import "./fonts.css";
+
+/* Each entry builds from its own directory, which Tailwind would otherwise take
+   as the only place class names live. */
+@source "../";
+
+@theme {
+  --*: initial;
+
+  /* ADR-0038 § 1: spacing (margin, padding, gap). 0 and px stay legal. */
+  --spacing-0: 0px;
+  --spacing-3xs: 2px;
+  --spacing-2xs: 4px;
+  --spacing-xs: 6px;
+  --spacing-sm: 8px;
+  --spacing-md: 10px;
+  --spacing-lg: 12px;
+  --spacing-xl: 16px;
+  --spacing-2xl: 20px;
+  --spacing-3xl: 24px;
+  --spacing-4xl: 32px;
+
+  /* ADR-0039 § 1: control heights and icon sizes. Sizes, not spacing: only the
+     kit's ladder reads them (`min-h-control-md`, `size-icon-md`). A height is a
+     minimum, and both it and the icon are in `em` of the step's label (amended
+     2026-10-18): 20 px at the 11 px caption is 20em / 11. So a control and its
+     icon grow together with enlarged text, a square stays as tall as a labelled
+     control of its step, and at 100 % every value is the table's px. */
+  --spacing-control-sm: calc(20em / 11);
+  --spacing-control-md: calc(26em / 12);
+  --spacing-control-lg: calc(32em / 13);
+  --spacing-icon-sm: calc(12em / 11);
+  --spacing-icon-md: calc(14em / 12);
+  --spacing-icon-lg: calc(16em / 13);
+
+  /* Layout sizes. ADR-0038 § 6 leaves widths and heights raw until a ladder
+     decides them, and a class cannot carry a raw value, so each is named here
+     with its one use. Not spacing: `w-popover` exists, `p-popover` does not. */
+  --width-popover: 308px;      /* the tray popover's one-column card: POPOVER_W − 2 × POPOVER_SIDE in desktop/src-tauri/src/lib.rs */
+  --width-popover-wide: 620px; /* the two-column card while job groups show (popover.md § Two columns): POPOVER_W_WIDE − 2 × POPOVER_SIDE */
+  --width-gauge-col: 240px;    /* the two-column card's gauge column (popover/anatomy.md § 6) */
+  --height-gauge: 6px;         /* a gauge bar's track (popover/anatomy.md § 5, GaugeBar) */
+  --height-bar: 12px;     /* the Limits strip's engine-memory bar (settings/anatomy.md § 5, MemoryBar) */
+  --width-switch-sm: calc(21em / 11); /* Switch's track, 1.75x its step's icon height (kit/Switch.tsx), one per ladder step */
+  --width-switch-md: calc(24em / 12);
+  --width-switch-lg: calc(27em / 13);
+  --width-age: 30px;      /* the popover's right-aligned age column (popover/anatomy.md § 5) */
+  --width-nav: 180px;     /* the Settings view's section sidebar (settings/anatomy.md § 5, SettingsNav) */
+  --width-label: 200px;   /* the label column of a two-column field row (settings/anatomy.md § 5, FieldRow) */
+  --width-field: 120px;   /* a scalar field's control column: input, select or switch (FieldRow) */
+  --width-sidebar: 216px; /* the dashboard shell's sidebar (dashboard/anatomy.md § 6, DashboardNav) */
+  --width-rail: 288px;    /* the dashboard Overview's right rail (dashboard/anatomy.md § 6) */
+  --width-facets: 190px;  /* Activity's facet column (dashboard/screens.md § 6, FacetList) */
+  --width-detail: 400px;  /* Memory's class detail beside the table (dashboard/screens.md § 6) */
+  --height-rail: 22px;    /* the dashboard budget rail's track (dashboard/anatomy.md § 5, BudgetRail) */
+  --width-spark: 52px;    /* a stat tile's sparkline (dashboard/anatomy.md § 5, Sparkline) */
+  --height-spark: 20px;
+  --width-ticks: 14px;    /* a class's sample strip, four ticks (dashboard/screens.md § 5, SampleBars) */
+  --height-ticks: 10px;
+  --breakpoint-wide: 1280px;  /* below it a dashboard view's right column drops under its left one (dashboard/screens.md § 6); `wide:` applies from it up */
+  --breakpoint-narrow: 640px; /* below it the Settings sidebar becomes a Select (settings/anatomy.md § 6); `narrow:` applies from it up */
+
+  /* ADR-0038 § 2: radius, one step per role. */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-full: 999px;
+
+  /* ADR-0038 § 3: type, with an 11 px floor and no half pixels. */
+  --text-caption: 11px;
+  --text-small: 12px;
+  --text-body: 13px;
+  --text-title: 15px;
+  --text-display: 20px;
+
+  --leading-code: 20px; /* the raw editor's line height, shared by its gutter, tints and text (settings/anatomy.md § 5, RawEditor) */
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+
+  /* ADR-0040 § 6: the two stacks, generic fallbacks only. */
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --default-font-family: var(--font-sans);
+  --default-mono-font-family: var(--font-mono);
+
+  /* The one transition the kit uses: colour changes on hover and press. */
+  --default-transition-duration: 120ms;
+  --default-transition-timing-function: ease-out;
+
+  /* A loading control's spinner (`animate-spin`). */
+  --animate-spin: spin 1s linear infinite;
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  /* A running status dot's ring (`motion-safe:animate-pulse-ring`, kit/StatusDot.tsx): grows from
+     the dot to its box and fades out. */
+  --animate-pulse-ring: pulse-ring 1.4s ease-out infinite;
+  @keyframes pulse-ring {
+    from {
+      transform: scale(0.5);
+      opacity: 0.5;
+    }
+    to {
+      transform: scale(1);
+      opacity: 0;
+    }
+  }
+}
+
+@theme inline {
+  /* ADR-0037: the colour roles, by reference. A new role is added to both
+     theme blocks of tokens.css and then named here. */
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-elevate: var(--elevate);
+  --color-border: var(--border);
+  --color-border-soft: var(--border-soft);
+  --color-border-control: var(--border-control);
+  --color-fg: var(--fg);
+  --color-fg-strong: var(--fg-strong);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-text: var(--accent-text);
+  --color-accent-soft: var(--accent-soft);
+  --color-green: var(--green);
+  --color-green-soft: var(--green-soft);
+  --color-red: var(--red);
+  --color-red-soft: var(--red-soft);
+  --color-amber: var(--amber);
+  --color-amber-soft: var(--amber-soft);
+  --color-row-hover: var(--row-hover);
+  --color-row-press: var(--row-press);
+  --color-transparent: transparent;
+  --color-current: currentColor;
+
+  /* `shadow-raised` is a card on the page, `shadow-floating` the popover over
+     the desktop. Not `--shadow-float`: that is the token's own name. */
+  --shadow-raised: var(--shadow);
+  --shadow-floating: var(--shadow-float);
+}
+
+@layer base {
+  html {
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-size: var(--text-body);
+  }
+}

@@ -1,0 +1,41 @@
+name: Orphan tags
+
+# ADR-0031: a workflow token can publish a draft whose tag already exists, so a
+# v* tag with no published release is the one state that turns into an unclicked
+# release. Fail loudly on it.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  release:
+    types: [published, unpublished, deleted, created, edited]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  orphan-tags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # gh and jq come with the runner image.
+      - name: List v* tags and releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" \
+            | jq -s 'add // [] | map(.ref | sub("^refs/tags/"; ""))' > tags.json
+          gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 \
+            --json tagName,isDraft > releases.json
+
+      - name: Fail on any v* tag without a published release
+        run: |
+          if ! scripts/orphan-tags.sh tags.json releases.json; then
+            echo "::error::v* tag(s) above have no published release. Investigate before anything publishes them."
+            exit 1
+          fi

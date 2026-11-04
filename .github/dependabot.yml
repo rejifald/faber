@@ -1,0 +1,141 @@
+# Keeps the SHA-pinned actions current (#141). Every `uses:` is pinned to a full
+# commit SHA with its tag as a comment; Dependabot bumps both together.
+#
+# Two groups, so a change to the release workflow's pins is never buried:
+#
+#   release-workflow  every action .github/workflows/release.yml uses. A pin
+#                     there is part of the release's chain of trust (ADR-0031),
+#                     so its PR title names the release workflow.
+#   other-actions     everything else.
+#
+# Most actions are shared with ci.yml, so most weeks this is one PR, titled
+# for the release workflow. tests/workflow_pins.rs fails if release.yml uses an
+# action this group does not list.
+#
+# A new version waits a week before Dependabot proposes it, so a compromised
+# release of an action has time to be noticed and pulled first.
+#
+# dtolnay/rust-toolchain is pinned to a commit of its `stable` branch, not a
+# tag, so Dependabot may move it to another branch's commit. Every step that
+# uses it passes `toolchain:` explicitly (`stable` in CI, the exact
+# PINNED_RUST_VERSION in release.yml), so any of its refs installs the same
+# toolchain. Those two versions, the Node one and the runner images in release.yml
+# are not actions or packages, so Dependabot cannot bump them: they move by a
+# reviewed PR (see release.yml).
+#
+# The two npm lockfiles (ADR-0042): ui/ (the React UI) and desktop/ (the Tauri
+# CLI). One grouped PR per directory a week, after the same seven-day wait, so
+# a compromised release has time to be pulled before it is proposed. Versions
+# stay exact pins (ui/.npmrc save-exact); Dependabot bumps the pin and the lock.
+#
+# The two Cargo lockfiles: the workspace at the root (the daemon, faber-release,
+# faber-mirror) and the menu-bar app's own in desktop/src-tauri. Same weekly,
+# grouped, seven-day rhythm. The sigstore crates decide what a follower will
+# install (faber-release pins each of them exactly, on purpose), so they are a
+# group, and a PR, of their own, never folded into a bump of anything else. A bump
+# of a faber-release dependency changes the app's lockfile too, which Dependabot
+# does not do from the root entry: refresh it with `cargo update -p <crate>` in
+# desktop/src-tauri, or `desktop · cargo check --locked` stays red.
+#
+# tests/workflow_pins.rs fails if a lockfile or a composite action under
+# .github/actions has no entry here.
+#
+# Dependabot never introduces a new action, only new pins of existing ones, so
+# the allow-list in infra/github/main.tf (`owner/name@*`) keeps matching.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # `/` is every workflow. A composite action is read from its own directory.
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      release-workflow:
+        patterns:
+          - "actions/attest-build-provenance"
+          - "actions/checkout"
+          - "actions/download-artifact"
+          - "actions/setup-node"
+          - "actions/upload-artifact"
+          - "dtolnay/rust-toolchain"
+      other-actions:
+        patterns:
+          - "*"
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      release-verification:
+        patterns:
+          - "sigstore-*"
+      cargo:
+        patterns:
+          - "*"
+  - package-ecosystem: cargo
+    directory: "/desktop/src-tauri"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: desktop
+      include: scope
+    groups:
+      menubar:
+        patterns:
+          - "*"
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ui
+      include: scope
+    # typescript-eslint supports TypeScript <6.1 (8.72.1), so a TypeScript 7
+    # bump fails the install (#415). Drop this once typescript-eslint's peer
+    # range admits 7.
+    ignore:
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      # @types/node tracks the UI's Node 22 runtime (engines >=22.12, node-version 22 in
+      # ci.yml and release.yml); a newer major types APIs Node 22 lacks. Drop this when
+      # the runtime moves.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+    groups:
+      ui:
+        patterns:
+          - "*"
+  - package-ecosystem: npm
+    directory: "/desktop"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: desktop
+      include: scope
+    groups:
+      desktop:
+        patterns:
+          - "*"

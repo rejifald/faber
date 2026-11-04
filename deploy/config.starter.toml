@@ -1,0 +1,52 @@
+# faber configuration. Full annotated schema: src/config.rs
+# Every key here is also editable from the dashboard's Settings page
+# (`faber dashboard`). faber reads this once at startup, so most changes
+# need a restart; the Settings page names the ones that do.
+#
+# `sudo faber setup` wrote this starting point because there was no config to
+# migrate. The daemon's account owns it; you can read it through the faber
+# group, and change it from the dashboard's Settings page.
+
+# Private repos carrying this GitHub topic are the ones faber watches. Tag a
+# repo to opt it in, untag to opt out. Public repos are never serviced.
+topic = "faber"
+
+poll_interval_secs = 20
+denied_actors = ["dependabot[bot]"]
+
+# Jobs run in a throwaway container of their own. On macOS, a host set up with
+# `sudo faber setup` runs them once faber has a Docker endpoint of its own
+# (ADR-0026); on Linux, faber's account uses the host's Docker Engine through
+# the docker group.
+#
+# `dind` decides whether they also get a Docker daemon. That daemon is
+# `--privileged` and unauthenticated on the job's network, so a job that can
+# reach it can mount the host disk: granting it is granting host root. Most
+# jobs never run `docker`; leave it `false` for those and add a second profile
+# with `dind = true` for the ones that build images.
+#
+# `image` must satisfy faber's JIT contract: an entrypoint that hands
+# RUNNER_JITCONFIG to run.sh through the environment, never a command-line
+# argument — /proc/<pid>/cmdline is world-readable on a native Linux dockerd
+# host. This repo ships one that does:
+#
+#     docker build -t faber-runner:local docker/runner
+#
+# A local tag is deliberate: nothing needs to be pushed to a registry. Extend
+# docker/runner/Dockerfile with whatever your jobs need and rebuild.
+#
+# A config needs at least one profile, and this is the one a new host can serve
+# without anything else to set up. Until the image above exists, a job routed
+# here parks with the reason shown, rather than failing, and starts once it is
+# built.
+#
+# macOS jobs run in a per-job macOS VM: add a profile with
+# `backend = "macos-vm"` and the golden image's name once one is built
+# (ADR-0026). `backend = "native"`, a runner on the host itself, is refused
+# (ADR-0052).
+[[profile]]
+name = "linux-docker"
+labels = ["faber", "docker"]
+backend = "docker"
+image = "faber-runner:local"
+dind = false

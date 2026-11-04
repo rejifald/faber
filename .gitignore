@@ -1,5 +1,18 @@
 /target
 .DS_Store
+*.log
+audit.jsonl
+overrides.json
+
+# Terraform: state stays on the owner's machine and is never committed.
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/*.tfvars
+infra/**/crash.log
+
+# Generated renders of the logo masters (design/mark/render-icons.sh writes the app icons)
+design/mark/build/
 
 # Agent worktrees: local only, never committed, and never swept by repo-wide tools.
 /.claude/worktrees/

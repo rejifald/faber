@@ -1,72 +1,372 @@
 name: CI
 
-# For now: formatting, lints and the tests of what this repository holds, above
-# all the tree gate (tests/privacy.rs), which checks every tracked file. The rest
-# of faber's CI arrives with its code.
-
+# Pull requests, pushes to main and manual dispatches.
+#
+# A pull request runs the Linux job. A push to main runs it again on what was
+# merged: a fork's or Dependabot's pull request gets no secrets, so its name
+# check skips, and the push is the first run whose key sees that change
+# (ADR-0058).
+#
+# The three macOS jobs run only on a dispatch (`gh workflow run ci.yml --ref
+# main`). release.yml's `plan` refuses unless a dispatched run at that exact
+# commit passed, macOS legs included. It is a separate run, not a job inside the
+# release, so the release run stays hosted-only and restores no cache
+# (ADR-0031).
 on:
+  # Every pull request, not just those targeting main. A stacked PR — one whose
+  # base is another feature branch — is exactly the change most worth checking,
+  # since it is the one nobody has run CI over yet; filtering on `branches:
+  # [main]` silently gave those zero checks and a green-looking "no checks
+  # reported".
+  pull_request:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
+# Newer pushes to the same branch/PR cancel superseded runs.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only, and nothing in this file needs more: no job pushes, comments or
+# publishes. Each checkout also drops the token once it has cloned
+# (`persist-credentials: false`), so a build script or a package script that a job
+# runs cannot read it back out of .git/config.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+# GitHub-hosted runners only (ADR-0031). faber never serves this repository: its
+# gate refuses public repositories (`RefuseReason::PublicRepo`, src/gate.rs), and
+# infra/github/README.md keeps self-hosted runners off it.
+
 jobs:
+  # Every Linux check is one job, each its own step, so the setup (a toolchain,
+  # the cargo cache, npm ci) is paid once. Add a check as a step here, not as a
+  # job: this job's name is a required check (infra/github/variables.tf).
+  #
+  # The suite is hermetic — the one test needing a real Docker daemon is
+  # `#[ignore]`d (tests/live_variant_build.rs) — so nothing here needs Docker.
   linux:
-    name: linux · fmt · clippy · test
+    name: linux · fmt · clippy · test · ui · infra
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    env:
+      # Incremental artifacts are never reused across CI runs, only cached.
+      CARGO_INCREMENTAL: "0"
+      # Full debuginfo is a large share of the lib test binary's codegen memory,
+      # enough to get rustc killed on a small runner; line tables keep file:line
+      # in panics and backtraces.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
+      # `tests/privacy.rs` asks git which files are published, so it needs the
+      # .git directory this leaves behind. The default shallow checkout is
+      # enough — the scan reads the index, not history.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install Rust
+      - name: Install Rust (stable, with rustfmt + clippy)
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
         with:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # No cache: package-lock.json pins every package, and npm's own cache is
+      # not worth a restored entry other workflows could have written.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: npm ci
+        working-directory: ui
+        run: npm ci
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+
+      # Every step above must succeed; every check below asks for this step's
+      # success instead of the default `success()`, so one failing check does not
+      # skip the rest, and a cancelled run stops at once. git-lfs comes with the
+      # runner image, and the mirror's end-to-end LFS test fails in CI without
+      # it, so a missing one fails here, as setup.
+      - name: Toolchains ready
+        id: ready
+        run: |
+          rustc --version
+          node --version
+          git lfs version
 
       - name: Format
-        run: cargo fmt --all --check
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: cargo fmt --all -- --check
 
-      # Each check below runs even when an earlier one failed, so one red step
-      # never hides another's verdict. Every cargo command that resolves
-      # dependencies passes `--locked`: CI builds exactly what Cargo.lock records,
-      # and a manifest that drifted from it fails here instead of being quietly
-      # re-resolved to whatever is newest today.
+      # `--locked` on every cargo command that resolves dependencies: CI builds
+      # exactly what Cargo.lock records, and a manifest that drifted from it fails
+      # here instead of being quietly re-resolved to whatever is newest today.
       - name: Clippy
-        if: ${{ !cancelled() }}
-        run: cargo clippy --locked --all-targets -- -D warnings
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # Every test binary, built without running one. "Privacy gate (names)"
+      # runs its binary straight from this build, with no cargo command: cargo
+      # would re-run build.rs there, because it watches `ui/dist`, which does not
+      # exist yet at this point. So nothing compiles, and no build script runs,
+      # where the key is (ADR-0058).
+      - name: Build the tests
+        id: build
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --workspace --no-run --message-format=json-render-diagnostics \
+            > "$RUNNER_TEMP/test-build.json"
+          jq -r 'select(.reason == "compiler-artifact" and .target.name == "privacy"
+                   and .target.kind == ["test"] and .profile.test) | .executable' \
+            "$RUNNER_TEMP/test-build.json" > "$RUNNER_TEMP/privacy-test"
+          test "$(wc -l < "$RUNNER_TEMP/privacy-test")" -eq 1
 
       # Both tree tests run only in "Privacy gate (names)" below, the one step the
       # key reaches: a path they print is masked only where the key is (ADR-0058),
       # and here a file name would reach the public log as it is.
       - name: Test
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: >-
-          cargo test --locked --verbose --
+          cargo test --locked --workspace --verbose --
           --skip tree_names_no_private_project
           --skip tree_carries_no_credentials_or_personal_paths
 
-      # Names are checked under the FABER_PRIVACY_KEY secret (ADR-0058). It is
-      # required on every run GitHub gives secrets to, so a missing secret fails
-      # here rather than skipping the check. A fork's or Dependabot's pull request
-      # gets no secrets: it skips, with a warning.
+      # The only step that holds the privacy key. The key is required on every
+      # run GitHub gives secrets to, so a missing secret fails here rather than
+      # skipping the check. A fork's or Dependabot's pull request gets no
+      # secrets: it skips, with a warning.
       - name: Privacy gate (names)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           FABER_PRIVACY_KEY: ${{ secrets.FABER_PRIVACY_KEY }}
           FABER_PRIVACY_KEY_REQUIRED: ${{ !github.event.pull_request || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
-        run: cargo test --locked --test privacy
+        run: |
+          "$(cat "$RUNNER_TEMP/privacy-test")"
+
+      # The React UI (ADR-0042): lint (tokens, arbitrary values, Base UI only in
+      # the kit), both entries building, the lint, kit, story and catalogue tests
+      # (the kit's focus-ring test reads the built CSS, so it runs after the
+      # build), the catalogue being current with a story for every entry, and the
+      # story browser building (ADR-0043).
+      - name: UI lint
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        working-directory: ui
+        run: npm run lint
+
+      - name: UI build
+        id: ui-build
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        working-directory: ui
+        run: npm run build
+
+      - name: Test the lint rules, the kit, the stories and the catalogue script
+        if: ${{ !cancelled() && steps.ui-build.outcome == 'success' }}
+        working-directory: ui
+        run: npm test
+
+      - name: Catalogue is current, every entry has a story
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        working-directory: ui
+        run: npm run catalog:check
+
+      - name: Story browser builds
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        working-directory: ui
+        run: npm run storybook:build
+
+      # The one Rust test that needs the bundle: the steps above build without
+      # ui/dist, so build.rs embeds nothing there, and only this proves the daemon
+      # embeds a real dashboard. FABER_REQUIRE_UI makes build.rs fail rather than
+      # quietly embed nothing, so it cannot pass by skipping.
+      - name: The daemon embeds the built dashboard
+        if: ${{ !cancelled() && steps.ui-build.outcome == 'success' }}
+        env:
+          FABER_REQUIRE_UI: "1"
+        run: cargo test --locked --lib ui_bundle
+
+      - name: orphan-tags detection test
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: scripts/test-orphan-tags.sh
+
+      # Validation only: no credentials, no backend, never plan or apply.
+      - name: terraform validate (infra/github)
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: |
+          terraform -chdir=infra/github fmt -check -recursive
+          terraform -chdir=infra/github init -backend=false
+          terraform -chdir=infra/github validate
+
+      # The release job's check that a built binary trusts this repository and
+      # workflow is shell it runs on a hosted macOS image, where it cannot be
+      # tried first. Its cases run here, and on the macOS job.
+      - name: release policy check test
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: scripts/test-check-release-policy.sh
+
+      # Dependency advisories, licenses and sources (deny.toml) over both Cargo
+      # lockfiles, and `npm audit` over both npm ones. A new advisory can turn a
+      # change that touched nothing red; that is the scan working, and what clears
+      # it is a dependency bump, or an `ignore` in deny.toml that says why.
+      #
+      # cargo-deny comes from its own GitHub release at a pinned version and
+      # digest, not from a third-party action: those are allow-listed in
+      # infra/github/main.tf and each is code this job would run. The Linux
+      # builds are static (musl), so they run on whatever the runner image is. To
+      # bump it, take the new release's two *-unknown-linux-musl.tar.gz.sha256
+      # files from its release page.
+      - name: Install cargo-deny
+        id: cargo-deny
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        env:
+          CARGO_DENY_VERSION: "0.20.2"
+          CARGO_DENY_SHA256_AARCH64: 995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d
+          CARGO_DENY_SHA256_X86_64: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            aarch64 | arm64) arch=aarch64; sha256="$CARGO_DENY_SHA256_AARCH64" ;;
+            x86_64)          arch=x86_64;  sha256="$CARGO_DENY_SHA256_X86_64" ;;
+            *) echo "::error::no cargo-deny is pinned for $(uname -m)"; exit 1 ;;
+          esac
+          name="cargo-deny-$CARGO_DENY_VERSION-$arch-unknown-linux-musl"
+          dir="$RUNNER_TEMP/cargo-deny"
+          mkdir -p "$dir"
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused --fail --silent --show-error --location \
+            --output "$dir/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/$name.tar.gz"
+          echo "$sha256  $dir/$name.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$dir/$name.tar.gz" -C "$dir" --strip-components=1
+          test -x "$dir/cargo-deny" || { echo "::error::no cargo-deny in $name.tar.gz"; exit 1; }
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/cargo-deny" --version
+
+      - name: cargo-deny (faber)
+        if: ${{ !cancelled() && steps.cargo-deny.outcome == 'success' }}
+        run: cargo deny --locked --config deny.toml --workspace check advisories licenses sources
+
+      # The menu-bar app is a macOS app with its own lockfile, so it is held to the
+      # one target it ships for: the Linux crates its toolkit pulls in are never built.
+      - name: cargo-deny (menu-bar app)
+        if: ${{ !cancelled() && steps.cargo-deny.outcome == 'success' }}
+        run: >-
+          cargo deny --locked --config deny.toml
+          --manifest-path desktop/src-tauri/Cargo.toml --target aarch64-apple-darwin
+          check advisories licenses sources
+
+      # What ships in the dashboard (its runtime packages) may have no advisory at
+      # all. Build tooling (eslint, vite, the Tauri CLI) fails only on high and
+      # critical: its moderate advisories today are denial of service in glob
+      # matchers (minimatch, glob) that a pinned dev dependency cannot act on.
+      - name: npm audit (ui)
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        working-directory: ui
+        run: |
+          npm audit --omit=dev
+          npm audit --audit-level=high
+
+      - name: npm audit (desktop)
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        working-directory: desktop
+        run: npm audit --audit-level=high
+
+  test-macos:
+    # macOS is the platform faber actually ships on (launchd, the app bundle).
+    # Each macOS job is minutes of real work, so the three stay separate and in
+    # parallel.
+    #
+    # The three macOS jobs run only on a manual dispatch, never on a pull request
+    # or a push (owner, 2026-11-01). release.yml requires that dispatch: its
+    # `plan` refuses unless these three passed (not skipped) at the commit being
+    # released. A macOS-only break can therefore merge; the release that would
+    # ship it stops on it instead. None of them is a required check, and their
+    # names are what the release gate looks up: rename one there too.
+    name: test · macos-latest
+    runs-on: macos-latest
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      # npm for the mirror's end-to-end npm test, which fails under CI without
+      # it (the Linux job has it from its own setup-node step).
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      # The privacy gate's tree tests run once, in the Linux job, with the key.
+      - name: Test
+        run: >-
+          cargo test --locked --workspace --verbose --
+          --skip tree_names_no_private_project
+          --skip tree_carries_no_credentials_or_personal_paths
+
+      # The release job runs this check on a hosted macOS image's bash; this runs
+      # its cases on the macOS shell CI has.
+      - name: release policy check test
+        run: scripts/test-check-release-policy.sh
+
+  desktop:
+    # The menu-bar app is its own package with its own lockfile, outside the
+    # workspace (it depends on `crates/faber-release` by path). This proves it
+    # still resolves and type-checks against that crate; the full Tauri build
+    # runs in release.yml. `tauri-build` needs only `../dist` to exist, which its
+    # tracked `.gitkeep` ensures; the frontend is assembled there before a real build.
+    name: desktop · cargo check
+    runs-on: macos-latest
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch' # see test-macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Check
+        run: cargo check --locked --manifest-path desktop/src-tauri/Cargo.toml
+
+  launcher:
+    # The VM launcher (ADR-0026) is Swift on Apple's Virtualization framework, with no
+    # package manager and no third-party code. It needs the macOS 26+ SDK for the
+    # per-VM vmnet network API, so it runs on the macOS 26 image. It builds and signs
+    # the launcher, runs its unit tests, and holds the real binary's configuration to
+    # the wall with `validate --wall-only`; --wall-only means nothing is booted.
+    # Booting a guest is the owner's builder-side check (launcher/README.md).
+    name: launcher · macos
+    runs-on: macos-26
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' # see test-macos
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: swiftc --version
+      - run: launcher/ci.sh

@@ -1,0 +1,10 @@
+[Unit]
+Description=faber's wall probe on vsock port 6101
+
+[Socket]
+ListenStream=vsock::6101
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target

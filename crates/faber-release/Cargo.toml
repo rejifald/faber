@@ -1,0 +1,45 @@
+[package]
+name = "faber-release"
+version = "0.3.12"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+description = "faber's release verification (ADR-0031): the attestation policy, the SHA256SUMS and version checks, shared by the daemon and the menu-bar app."
+repository = "https://github.com/rejifald/faber"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# SHA-256 over a downloaded release asset, before faber will execute it.
+sha2 = "0.10"
+tracing = "0.1"
+# The release verifier (ADR-0031, #119): a follower checks a release's GitHub
+# attestation in-process. Every crate of the family is pinned exactly, the
+# transitive ones included, so `cargo update` can never move the code that
+# decides what a follower installs. A version bump is a reviewed change, subject
+# to the owner's origin check for new dependencies (approved for 0.14.0 on
+# 2026-10-11, #119).
+sigstore-verify = { version = "=0.15.1", features = ["tuf"] }
+sigstore-trust-root = { version = "=0.15.1", features = ["tuf"] }
+sigstore-tuf = "=0.15.1"
+sigstore-types = "=0.15.1"
+sigstore-bundle = "=0.15.1"
+sigstore-crypto = "=0.15.1"
+sigstore-merkle = "=0.15.1"
+sigstore-rekor = "=0.15.1"
+sigstore-tsa = "=0.15.1"
+
+[features]
+# Swaps the compiled-in release-verification policy for the throwaway sandbox
+# repository's, so a follower built with it verifies the sandbox's releases
+# (#122). Never on by default, and `release.yml` refuses to publish a binary
+# built with it. There is no runtime override of the policy, by design.
+sandbox-policy = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+# Tampering with a saved bundle's DSSE fields in the provenance tests.
+base64 = "0.22"
+
+[lints.clippy]
+all = "warn"

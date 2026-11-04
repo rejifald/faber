@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The golden image's run-once provisioner (ADR-0049). arm.sh installs this as
+    /Library/LaunchDaemons/io.github.rejifald.faber.golden-provision.plist   root:wheel 0644
+  and launchd runs provision-wrapper.sh as root at the next boot, which is the walled build's.
+  No KeepAlive: it runs once per boot. provision.sh removes it, and the wrapper, when it is done.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>io.github.rejifald.faber.golden-provision</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>/Library/Application Support/faber-guest/provision-wrapper.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>UserName</key>
+	<string>root</string>
+	<key>StandardOutPath</key>
+	<string>/private/var/log/faber-golden-provision.log</string>
+	<key>StandardErrorPath</key>
+	<string>/private/var/log/faber-golden-provision.log</string>
+</dict>
+</plist>

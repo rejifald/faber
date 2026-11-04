@@ -1,0 +1,68 @@
+# cargo-deny's rules. .github/workflows/ci.yml runs them over both Cargo lockfiles,
+# the workspace's and the menu-bar app's:
+#
+#   cargo deny --locked --config deny.toml --workspace check advisories licenses sources
+#   cargo deny --locked --config deny.toml --manifest-path desktop/src-tauri/Cargo.toml \
+#     --target aarch64-apple-darwin check advisories licenses sources
+#
+# `bans` is not run: nothing here forbids a crate or a duplicate yet. Add it to
+# ci.yml together with its first rule.
+
+[graph]
+# The platforms faber's own crates are built for: CI builds and tests Linux and
+# macOS, and the release ships macOS. A crate only a Windows build would pull in
+# is not ours to vet. The app narrows this to macOS on the command line, as that
+# is the one platform it ships for.
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+# A yanked version is one its author withdrew, usually for a defect or a
+# vulnerability. A build that follows a lockfile should not ship one.
+yanked = "deny"
+# An unmaintained or unsound crate fails the check when faber depends on it
+# directly. A transitive one is not ours to replace; every vulnerability advisory
+# still fails wherever it sits.
+unmaintained = "workspace"
+unsound = "workspace"
+# A real advisory that does not apply goes here, with the reason it does not:
+#   { id = "RUSTSEC-0000-0000", reason = "..." },
+ignore = []
+
+[licenses]
+# Permissive licenses only. A crate that needs another one is a decision to take,
+# in `exceptions` below with the crate named, never a line added here to make the
+# check pass.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+# The two lockfiles are checked with this one file, so every run leaves some
+# entries here and below unused: that is not worth a warning.
+unused-allowed-license = "allow"
+unused-license-exception = "allow"
+# The one license outside the list: MPL-2.0 is copyleft per file, and these crates
+# are used unmodified as libraries, from the menu-bar app's webview stack and a
+# directories helper.
+exceptions = [
+  { crate = "cssparser", allow = ["MPL-2.0"] },
+  { crate = "cssparser-macros", allow = ["MPL-2.0"] },
+  { crate = "dtoa-short", allow = ["MPL-2.0"] },
+  { crate = "option-ext", allow = ["MPL-2.0"] },
+  { crate = "selectors", allow = ["MPL-2.0"] },
+]
+
+[sources]
+# crates.io and nothing else: no git dependency, no second registry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

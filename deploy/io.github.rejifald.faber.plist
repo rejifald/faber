@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  faber LaunchDaemon (ADR-0025): a job in launchd's system domain, started at
+  boot with nobody logged in, running as faber's own role account rather than
+  as any person's. `sudo faber setup` renders the placeholders below from the
+  SYSTEM layout (src/platform/layout.rs), writes the result to
+  /Library/LaunchDaemons as root:wheel 0644, and bootstraps it into `system`.
+  Nothing else installs this file.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.rejifald.faber</string>
+
+    <!-- The role account and its primary group. Never a person's account:
+         job code must never run as the operator or as faber (ADR-0025). -->
+    <key>UserName</key>
+    <string>{{USER}}</string>
+    <key>GroupName</key>
+    <string>{{GROUP}}</string>
+
+    <!-- The daemon's own copy of faber, which the self-updater replaces by
+         same-directory rename (ADR-0006). `run` is the daemon + dashboard. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{FABER_BIN}}</string>
+        <string>run</string>
+    </array>
+
+    <!-- Start at boot and keep it alive. If faber ever exits (a crash, or the
+         self-updater handing over to a new binary) launchd starts it again. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- HOME is the state directory, so the process environment and the SYSTEM
+         layout agree on it. PATH holds nothing an operator can write: no
+         Homebrew prefix and no /usr/local/bin, where a tool can be a link into
+         an operator-owned app bundle (ADR-0025's root invariant). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}</string>
+
+    <!-- 23 is octal 027: the operator reads config, logs and the audit trail
+         through the operator group, which their directories have and every
+         file in them takes, and can write none of them. -->
+    <key>Umask</key>
+    <integer>23</integer>
+
+    <!-- launchd may open these as root. So their directory is root's (the
+         operator group, 0750, which the role account is in), and setup
+         creates both files first, as the role account's: it can write them,
+         and cannot swap either for a symlink. -->
+    <key>StandardOutPath</key>
+    <string>{{LOG_DIR}}/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{LOG_DIR}}/stderr.log</string>
+
+    <!-- On stop, give faber time to drain an in-flight CI job before launchd
+         escalates SIGTERM to SIGKILL. A runner killed mid-job orphans on
+         GitHub until it ages out. -->
+    <key>ExitTimeOut</key>
+    <integer>600</integer>
+
+    <!-- A CI provisioner deserves normal scheduling, not background throttling. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+</dict>
+</plist>
