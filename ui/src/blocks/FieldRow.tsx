@@ -99,7 +99,7 @@ function Ceiling({ field, value, onChange }: Pick<FieldRowProps, 'field' | 'valu
 
 function control(p: FieldRowProps): ReactNode {
   const { field, value, loaded, defaults, onChange, profile } = p;
-  if (field.sudo && !field.narrows) {
+  if ((field.sudo || field.held) && !field.narrows) {
     const changed = !same(value, loaded);
     return (
       <TrustRow
@@ -153,10 +153,10 @@ export function FieldRow(props: FieldRowProps) {
   const { field, value, loaded, error, layout = 'inline', tagged = true } = props;
   const id = useId();
   const changed = !same(value, loaded);
-  const wide = field.kind === 'csv' || field.kind === 'lines' || field.kind === 'map' || (field.sudo !== undefined && !field.narrows);
+  const wide = field.kind === 'csv' || field.kind === 'lines' || field.kind === 'map' || ((field.sudo !== undefined || field.held === true) && !field.narrows);
   const scalar = !wide;
-  // A `sudo` field draws no tag: its pending row (Removed, Unsaved) already says it changed (Trust.png).
-  const tag = field.sudo ? null : changed ? (
+  // A `sudo` or held field draws no tag: its pending row (Removed, Unsaved) already says it changed (Trust.png).
+  const tag = field.sudo || field.held ? null : changed ? (
     <span className="text-caption text-accent-text">changed</span>
   ) : tagged ? (
     <span className={`text-caption ${field.live ? 'text-green' : 'text-amber'}`}>{field.live ? 'live' : 'restart'}</span>

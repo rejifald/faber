@@ -736,8 +736,7 @@ fn container_name(what: &str) -> String {
 
 /// faber's token as a git-credential file, alive for one refresh.
 ///
-/// The same delivery as the registry credential ([`docker::REGISTRY_CONFIG_MOUNT`]):
-/// a `0600` file in a `0700` directory, in a named volume of its own
+/// A `0600` file in a `0700` directory, in a named volume of its own
 /// ([`CredentialVolume`]) that a short-lived container of the refresh image fills
 /// from its stdin, mounted read-only, never an argument, a variable or a host
 /// file (ADR-0026: faber's Docker shares no host folder). The volume's name, never

@@ -145,13 +145,12 @@
 //! # profile gets a daemon, as before, warned at boot. The cut sets it true.
 //! # dind_requires_label = true
 //!
-//! # Optional registry credentials for the images a *job* pulls inside dind. Off by
-//! # default, in which case every such pull is anonymous — metered by Docker Hub
-//! # against a quota keyed to this host's public IP, and so shared with whatever
-//! # else sits behind that address. There is deliberately no `password` key: the
-//! # secret is read from the environment (a launchd `EnvironmentVariables` entry)
-//! # or from the operator's own ~/.docker/config.json, never from this file, which
-//! # the settings page rewrites and the dashboard serves.
+//! # Registry credentials for the images a *job* pulls. HELD: a credential mounted
+//! # into a job can be read by the job's code, so faber mounts none, and
+//! # `check-config` refuses `enabled = true`. A daemon booting with it on warns and
+//! # pulls anonymously. The section returns when faber pulls images for the job.
+//! # Every such pull is anonymous meanwhile — metered by Docker Hub against a quota
+//! # keyed to this host's public IP. There is deliberately no `password` key.
 //! [registry_auth]
 //! enabled = false
 //! server = "https://index.docker.io/v1/"
@@ -966,9 +965,10 @@ pub struct FileConfig {
     /// every config file that predates this section keeps parsing.
     #[serde(default)]
     pub host: HostPolicy,
-    /// Optional registry credentials for the images a job pulls inside dind.
-    /// Absent = disabled, which is byte-for-byte faber's historical behavior:
-    /// anonymous pulls against an IP-keyed quota. See [`RegistryAuth`].
+    /// Registry credentials for the images a job pulls. Held: parsed, refused on
+    /// by [`Self::validate`], warned of at boot ([`registry_auth_held_warning`]),
+    /// and never carried into a profile. Absent = disabled, faber's historical
+    /// behavior: anonymous pulls against an IP-keyed quota. See [`RegistryAuth`].
     #[serde(default)]
     pub registry_auth: RegistryAuth,
     /// Fleet autoupdate (ADR-0006). Absent = disabled: faber replaces its own
@@ -3315,6 +3315,26 @@ fn plural_s(n: usize) -> &'static str {
     }
 }
 
+/// Why `[registry_auth] enabled = true` is refused, and what a booting daemon
+/// says instead of acting on it. One sentence for both, so the save, the
+/// `check-config` line and the boot log cannot drift apart.
+pub const REGISTRY_AUTH_HELD: &str =
+    "registry_auth is held: a credential mounted into a job can be read by the job's code, \
+     so faber mounts none and pulls anonymously; it returns when faber pulls images on the \
+     job's behalf. Set registry_auth.enabled = false or remove the section.";
+
+/// The boot warning for `[registry_auth] enabled = true`. `None` when it is off.
+///
+/// [`FileConfig::validate`] refuses the switch, so a config that carries it came
+/// from a hand edit or an earlier release. Such a daemon still boots (AGENTS.md:
+/// never refuse a config the release did not write), resolves no credential,
+/// fills and mounts no volume and sets no `DOCKER_CONFIG`, and says so at every
+/// boot. The section is never carried into a profile, so this is the whole of
+/// what a held section does.
+pub fn registry_auth_held_warning(auth: &RegistryAuth) -> Option<String> {
+    auth.enabled.then(|| REGISTRY_AUTH_HELD.to_string())
+}
+
 /// The boot warning, and `faber check-config`'s, for `[host] recreatable_projects`
 /// / `recreatable_volumes` when either is set. `None` when both are empty.
 ///
@@ -3813,23 +3833,6 @@ impl FileConfig {
         if self.retry.enabled && self.retry.lookback_secs == 0 {
             errs.push("retry.lookback_secs must be greater than 0 while retry is enabled".into());
         }
-        // Only what the settings page must not be able to *write*. The daemon is
-        // separately fail-open on all of this at launch time: a hand-edited config
-        // that trips either check still starts, warns, and pulls anonymously —
-        // a credential misconfiguration must never be able to stop CI.
-        let r = &self.registry_auth;
-        if r.enabled && r.server.trim().is_empty() {
-            errs.push(
-                "registry_auth.server must not be empty while registry auth is enabled".into(),
-            );
-        }
-        if r.enabled && r.password_env.trim().is_empty() && r.username.trim().is_empty() {
-            errs.push(
-                "registry_auth needs a password_env (or a username, to read ~/.docker/config.json) \
-                 while registry auth is enabled"
-                    .into(),
-            );
-        }
         // A `versions` string mixing range operators and exact versions has no
         // sane interpretation (ADR-0010 §4) — refused here rather than guessed
         // at by `needs_allow`, which can only fail the whole entry closed.
@@ -3872,10 +3875,17 @@ impl FileConfig {
     /// any host OS, including this crate's own macOS CI leg.
     fn validate_with_facts(&self, facts: WallFacts) -> Vec<String> {
         let mut errs = self.validate_structural();
+        // Policy, not structure: `[registry_auth]` is held, and a daemon that
+        // boots with it on runs, mounts nothing and warns
+        // ([`registry_auth_held_warning`]). Refused here, where a human is
+        // looking, so neither `check-config` nor a settings save can turn it on.
+        if self.registry_auth.enabled {
+            errs.push(REGISTRY_AUTH_HELD.to_string());
+        }
         // Policy, not structure: the updater's gate must not hold a release back
-        // over it (AGENTS.md); the boot warns and `resolve_credential` refuses.
-        // Whatever the switch says: flipping it on later must not be the first
-        // time the name is looked at (issue #191).
+        // over it (AGENTS.md). Whatever the switch says: turning it on once the
+        // section returns must not be the first time the name is looked at
+        // (issue #191).
         if let Some(problem) = crate::docker::password_env_problem(&self.registry_auth.password_env)
         {
             errs.push(problem);
@@ -4344,13 +4354,11 @@ impl FileConfig {
                         if let Some(secs) = self.runner_timeout_secs {
                             cfg.runner_timeout = Duration::from_secs(secs);
                         }
-                        // Top-level, not per-profile, like `runner_timeout_secs`:
-                        // the credential belongs to the machine's registry account,
-                        // not to one routing profile, and every Docker profile pulls
-                        // through the same anonymous quota without it.
-                        cfg.registry_auth = self.registry_auth.clone();
-                        // Host-level like `registry_auth` above: the address
-                        // space belongs to the machine, not to a routing profile.
+                        // `[registry_auth]` is held and deliberately not carried:
+                        // nothing a job reaches holds it (see [`RegistryAuth`]).
+                        //
+                        // Host-level, not per-profile: the address space belongs
+                        // to the machine, not to a routing profile.
                         cfg.network_pool = network_pool;
                         Backend::Docker(cfg)
                     }
@@ -5627,32 +5635,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_auth_is_off_unless_configured_and_carries_no_secret() {
-        // The default every existing config file gets: disabled, so the Docker
-        // backend behaves exactly as it did before the key existed.
-        let cfg: FileConfig = toml::from_str(
-            r#"
-            [[profile]]
-            name = "linux-docker"
-            labels = ["faber", "docker"]
-            backend = "docker"
-            image = "ghcr.io/owner/my-runner:latest"
-        "#,
-        )
-        .unwrap();
-        match &cfg.into_profiles("2.330.0").unwrap()[0].backend {
-            Backend::Docker(d) => assert!(!d.registry_auth.enabled),
-            _ => panic!("expected docker backend"),
-        }
-
-        // Configured, it reaches every docker profile — it is the machine's
-        // registry account, not one route's.
-        let cfg: FileConfig = toml::from_str(
-            r#"
-            [registry_auth]
-            enabled = true
-            username = "someone"
-            password_env = "FABER_REGISTRY_MY_SECRET"
+    fn registry_auth_is_held_and_carries_no_secret() {
+        let toml_with = |section: &str| -> FileConfig {
+            toml::from_str(&format!(
+                r#"
+            {section}
 
             [[profile]]
             name = "linux-docker"
@@ -5660,19 +5647,47 @@ mod tests {
             backend = "docker"
             image = "ghcr.io/owner/my-runner:latest"
             dind = false
-        "#,
-        )
-        .unwrap();
-        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
+        "#
+            ))
+            .unwrap()
+        };
+        // Absent and switched off both validate: a held section that is off is
+        // just a section, and every existing config file keeps saving.
+        for section in [
+            "",
+            "[registry_auth]\nenabled = false\nusername = \"someone\"",
+        ] {
+            let cfg = toml_with(section);
+            assert!(cfg.validate().is_empty(), "{section}: {:?}", cfg.validate());
+            assert_eq!(registry_auth_held_warning(&cfg.registry_auth), None);
+        }
+
+        // Switched on, it is refused where a human is looking — but not by the
+        // structural gate an unattended update consults (AGENTS.md) — and a
+        // daemon that boots with it anyway resolves its profiles, carries none
+        // of the section into them, and warns.
+        let cfg = toml_with(
+            "[registry_auth]\nenabled = true\nusername = \"someone\"\n\
+             password_env = \"FABER_REGISTRY_MY_SECRET\"",
+        );
+        let errs = cfg.validate();
+        assert_eq!(
+            errs,
+            [REGISTRY_AUTH_HELD.to_string()],
+            "one sentence, no noise"
+        );
+        assert!(
+            errs[0].contains("can be read by the job's code"),
+            "{errs:?}"
+        );
+        assert!(cfg.validate_structural().is_empty());
+        let warning = registry_auth_held_warning(&cfg.registry_auth).expect("warns at boot");
+        assert!(warning.contains("held"), "{warning}");
         match &cfg.into_profiles("2.330.0").unwrap()[0].backend {
             Backend::Docker(d) => {
-                assert!(d.registry_auth.enabled);
-                assert_eq!(d.registry_auth.username, "someone");
-                assert_eq!(d.registry_auth.password_env, "FABER_REGISTRY_MY_SECRET");
-                assert_eq!(
-                    d.registry_auth.server,
-                    crate::docker::DEFAULT_REGISTRY_SERVER
-                );
+                let shown = format!("{d:?}");
+                assert!(!shown.contains("FABER_REGISTRY_MY_SECRET"), "{shown}");
+                assert!(!shown.contains("registry"), "{shown}");
             }
             _ => panic!("expected docker backend"),
         }
@@ -5884,7 +5899,7 @@ mod tests {
         let ours = |c: &FileConfig| {
             c.validate()
                 .into_iter()
-                .filter(|e| e.contains("registry_auth"))
+                .filter(|e| e.contains("registry_auth") && e != REGISTRY_AUTH_HELD)
                 .collect::<Vec<_>>()
         };
         assert!(ours(&cfg).is_empty(), "{:?}", ours(&cfg));

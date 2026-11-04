@@ -122,6 +122,12 @@ pub struct FieldSpec {
     /// name, and a `<…>` word for the value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sudo: Option<&'static str>,
+    /// Read-only with no command at all: a held section (`[registry_auth]`) whose
+    /// widening validation refuses outright, so there is no `sudo` command a UI
+    /// could honestly offer. The value shows; [`FieldSpec::narrow`], when set, is
+    /// still offered, since turning a held switch off is always accepted.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
     /// The one narrowing a UI offers on that read-only field without `sudo`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub narrow: Option<Narrow>,
@@ -290,6 +296,7 @@ const fn f(key: &'static str, label: &'static str, kind: &'static str) -> FieldS
         optional: false,
         unstated_saves: None,
         sudo: None,
+        held: false,
         narrow: None,
         narrows: None,
         item: None,
@@ -809,30 +816,34 @@ const RETRY_FIELDS: &[FieldSpec] = &[
     },
 ];
 
+/// `[registry_auth]` is held ([`crate::docker::RegistryAuth`]): every field is
+/// read-only and offers no `sudo` command, since validation refuses the section
+/// on. Only turning it off is offered, which a hand-edited config may need before
+/// any other save is accepted.
 const REGISTRY_FIELDS: &[FieldSpec] = &[
     FieldSpec {
-        sudo: Some("sudo faber config set registry_auth.enabled true"),
+        held: true,
         narrow: narrow("Turn off", "false"),
         hint: Some(
-            "Authenticate the images a job pulls. Off = anonymous, metered against this host's public IP.",
+            "Held: a credential mounted into a job can be read by the job's code. Returns when faber pulls images for the job; until then pulls are anonymous.",
         ),
         ..f("registry_auth.enabled", "Enabled", "bool")
     },
     FieldSpec {
-        sudo: Some("sudo faber config set registry_auth.server <server>"),
-        hint: Some("The registry as keyed in a docker config.json."),
+        held: true,
+        hint: Some("The registry as keyed in a docker config.json. Held with the section."),
         ..f("registry_auth.server", "Server", "text")
     },
     FieldSpec {
-        sudo: Some("sudo faber config set registry_auth.username <username>"),
+        held: true,
         optional: true,
-        hint: Some("Blank = take the credential from ~/.docker/config.json."),
+        hint: Some("Held with the section."),
         ..f("registry_auth.username", "Username", "text")
     },
     FieldSpec {
-        sudo: Some("sudo faber config set registry_auth.password_env <variable>"),
+        held: true,
         hint: Some(
-            "Name of the environment variable holding the secret; must start with FABER_REGISTRY_. The secret itself is never stored in the config.",
+            "Name of the environment variable that would hold the secret; must start with FABER_REGISTRY_. Held with the section.",
         ),
         ..f("registry_auth.password_env", "Password variable", "text")
     },
@@ -1054,7 +1065,7 @@ const SECTIONS: &[SectionSpec] = &[
     },
     SectionSpec {
         title: "Registry auth",
-        hint: Some("Credentials for the images a job pulls. The secret lives in an environment variable or ~/.docker/config.json — never in this file."),
+        hint: Some("Held. Credentials for the images a job pulls would be readable by the job's code, so faber mounts none and pulls anonymously. The section returns when faber pulls images for the job."),
         fields: REGISTRY_FIELDS,
     },
 ];
@@ -1604,6 +1615,41 @@ mod tests {
         assert!(!narrowed.profiles[0].cache_volume);
         assert!(narrowed.profiles[0].env.is_empty());
         assert!(crate::control::trust_widening(&c, &narrowed).is_empty());
+    }
+
+    /// `[registry_auth]` is held: every field is read-only and offers no `sudo`
+    /// command (validation would refuse what it turned on), and the one thing
+    /// offered, turning it off, is a value the daemon takes without `sudo`.
+    #[test]
+    fn registry_auth_fields_are_held_read_only_with_no_command() {
+        assert_eq!(REGISTRY_FIELDS.len(), 4);
+        for field in REGISTRY_FIELDS {
+            assert!(field.key.starts_with("registry_auth."), "{}", field.key);
+            assert!(field.held, "{} is not held", field.key);
+            assert_eq!(field.sudo, None, "{} offers a command", field.key);
+            assert!(field.narrows.is_none(), "{}", field.key);
+            let json = serde_json::to_value(field).unwrap();
+            assert_eq!(json["held"], Value::Bool(true), "{}", field.key);
+            assert!(json.get("sudo").is_none(), "{}", field.key);
+        }
+        // Everything else is unchanged: no other field is held.
+        for f in SECTIONS.iter().flat_map(|s| s.fields).chain(PROFILE_FIELDS) {
+            if !f.key.starts_with("registry_auth.") {
+                assert!(!f.held, "{} is held", f.key);
+                assert!(serde_json::to_value(f).unwrap().get("held").is_none());
+            }
+        }
+        let enabled = &REGISTRY_FIELDS[0];
+        assert_eq!(enabled.key, "registry_auth.enabled");
+        assert!(enabled.hint.unwrap().contains("Held"));
+        let n = enabled.narrow.as_ref().unwrap();
+        assert_eq!((n.label, n.value), ("Turn off", "false"));
+        let mut on = cfg();
+        on.registry_auth.enabled = true;
+        let mut off = on.clone();
+        off.registry_auth.enabled = serde_json::from_str(n.value).unwrap();
+        assert!(crate::control::trust_widening(&on, &off).is_empty());
+        assert!(off.validate().is_empty(), "{:?}", off.validate());
     }
 
     /// Every field with `narrows`, from the trust section and a profile.

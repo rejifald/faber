@@ -3339,8 +3339,8 @@ mod tests {
 
     /// Every key `trust_widening` can report, but routing, repo holds and
     /// `[needs]` (which has no settings field), is a settings field with a `sudo`
-    /// command shown when it is read-only: a new widening key without one fails
-    /// here.
+    /// command shown when it is read-only, or a held one: a new widening key
+    /// without either fails here.
     #[test]
     fn every_widening_key_is_a_field_with_a_sudo_command() {
         let mut old = base();
@@ -3389,7 +3389,12 @@ mod tests {
                     .find(|f| f.key == key),
             };
             let field = field.unwrap_or_else(|| panic!("{key} is no settings field"));
-            assert!(field.sudo.is_some(), "{key} has no sudo command");
+            // A held field (`[registry_auth]`) offers no command: validation
+            // refuses what it would turn on, so there is none to show.
+            assert!(
+                field.sudo.is_some() || field.held,
+                "{key} has no sudo command"
+            );
         }
     }
 

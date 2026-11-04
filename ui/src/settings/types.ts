@@ -44,6 +44,8 @@ export interface FieldSpec {
   unstated_saves?: number;
   /** The command that changes a read-only field; `<profile>` stands for the profile's name. */
   sudo?: string;
+  /** Read-only with no command: a held section validation refuses to turn on. Only `narrow` is offered. */
+  held?: boolean;
   narrow?: Narrow;
   /** For a `sudo` list or map: the edit the form may make. Absent: read-only. */
   narrows?: Narrows;

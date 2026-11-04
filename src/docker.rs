@@ -39,7 +39,7 @@
 //! as it has always been. See [`cache_volume_name`] and ADR-0005.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -173,38 +173,6 @@ pub const CACHE_MOUNT: &str = "/runner/_cache";
 /// did not mount a volume, this is absent, and the workflow can say so out loud.
 pub const CACHE_DIR_ENV: &str = "FABER_CACHE_DIR";
 
-/// Where faber mounts the per-job Docker **client** config carrying the optional
-/// registry credential, and the env var that points the job's `docker` at it.
-///
-/// THE MOUNT IS ON THE RUNNER, NOT ON DIND, and that is a measurement rather than
-/// a preference. Registry auth in Docker is client-side: the client reads a
-/// `config.json`, packs the credential into each API call's `X-Registry-Auth`
-/// header, and the daemon uses whatever that one request carried. It holds no
-/// credentials of its own. Verified on this host against a throwaway dind whose
-/// `/root/.docker/config.json` held a deliberately bogus credential:
-///
-/// | client issuing the pull | outcome |
-/// |---|---|
-/// | `docker exec <dind> docker pull` | `authentication required` — its own config |
-/// | same, with `DOCKER_CONFIG` at an empty dir | pulls anonymously |
-/// | sibling container, `DOCKER_HOST=tcp://dind:2375` | pulls anonymously |
-///
-/// The third row is faber's runner container exactly. So a credential installed
-/// *in* dind — by `docker login` inside it, a mounted config, or an env var —
-/// authenticates nothing a job does, while still being a secret sitting in a
-/// container. [`dind_run_args`] is therefore credential-free by design rather
-/// than by omission, and a test pins that it stays so.
-///
-/// `/faber` deliberately shadows nothing: unlike [`CACHE_MOUNT`] this is not a
-/// directory a runner image plausibly manages, and it is read-only, so it cannot
-/// collide with the image's own `~/.docker`.
-pub const REGISTRY_CONFIG_MOUNT: &str = "/faber/registry";
-
-/// The Docker CLI's own "look here for `config.json`" variable. Injected only
-/// when faber actually mounted one — an unset variable is what makes the
-/// unconfigured path byte-identical to faber's historical behavior.
-pub const DOCKER_CONFIG_ENV: &str = "DOCKER_CONFIG";
-
 /// Docker Hub's canonical key in a `config.json` — what `docker login` with no
 /// argument writes, so it is what an operator's existing file will be keyed by.
 pub const DEFAULT_REGISTRY_SERVER: &str = "https://index.docker.io/v1/";
@@ -213,11 +181,12 @@ pub const DEFAULT_REGISTRY_SERVER: &str = "https://index.docker.io/v1/";
 /// *name* is config; the *value* never is (see [`RegistryAuth`]).
 pub const DEFAULT_REGISTRY_PASSWORD_ENV: &str = "FABER_REGISTRY_PASSWORD";
 
-/// The namespace `password_env` must live in (issue #191). The variable's value
-/// is copied into a per-job `config.json` that job code can read, so letting
-/// config name *any* variable would let a settings save copy an unrelated secret
-/// from faber's own environment into every job. Variables under this prefix are
-/// faber's to define; nothing else in the daemon's environment is reachable.
+/// The namespace `password_env` must live in (issue #191). While registry auth
+/// ran, the variable's value was copied into a per-job `config.json` that job code
+/// could read, so letting config name *any* variable would have let a settings
+/// save copy an unrelated secret from faber's own environment into every job.
+/// [`RegistryAuth`] is held and reads no variable today; the name is still
+/// checked, so a held section cannot carry a name that would leak once it returns.
 pub const REGISTRY_ENV_PREFIX: &str = "FABER_REGISTRY_";
 
 /// Why `name` is not an acceptable `registry_auth.password_env`, or `None` when
@@ -243,7 +212,18 @@ pub fn password_env_problem(name: &str) -> Option<String> {
     })
 }
 
-/// Optional registry credentials for the images a **job** pulls (`[registry_auth]`).
+/// Registry credentials for the images a **job** pulls (`[registry_auth]`). HELD.
+///
+/// The section still parses, so a config that carries it boots, but faber acts on
+/// none of it: no credential is resolved, no volume is filled or mounted, and no
+/// `DOCKER_CONFIG` is set. The only way to authenticate a pull the job's own
+/// client makes is to hand that client the credential, and a credential mounted
+/// into a job can be read by the job's code; the one credential faber lets reach
+/// job code is the runner's own JIT config (ADR-0025). The section returns when
+/// faber pulls images for the job, so that no credential enters it.
+/// [`crate::config::FileConfig::validate`] refuses `enabled = true` where a human
+/// is looking; a daemon that boots with it warns
+/// ([`crate::config::registry_auth_held_warning`]) and pulls anonymously.
 ///
 /// Absent or `enabled = false` — the default — is faber's historical behavior
 /// exactly: every pull inside dind is anonymous, and Docker Hub meters those
@@ -253,15 +233,15 @@ pub fn password_env_problem(name: &str) -> Option<String> {
 /// is subject to a budget it can neither see nor influence; this makes supplying
 /// one possible, not mandatory.
 ///
-/// NOTE WHAT IS ABSENT: there is no `password` key. The secret is named here and
+/// NOTE WHAT IS ABSENT: there is no `password` key. The secret was named here and
 /// read from the environment or the operator's own `~/.docker/config.json` at
-/// launch — it is never a field, because `config.toml` is a file the settings page
+/// launch — never a field, because `config.toml` is a file the settings page
 /// rewrites, the dashboard serves, and an operator may check in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryAuth {
-    /// Master switch. Off by default: an unconfigured faber must behave exactly
-    /// as it did before this existed.
+    /// Master switch. Off by default, and refused on while the section is held:
+    /// a daemon that boots with it on warns and does nothing with it.
     #[serde(default)]
     pub enabled: bool,
     /// The registry to authenticate to, as keyed in a `config.json`.
@@ -418,19 +398,14 @@ pub struct DockerConfig {
     /// it to the job's network and export [`crate::mirror::ENV`]. Off by default,
     /// and inert without `[mirror]`.
     pub mirror: bool,
-    /// Optional registry credentials for the job's own image pulls. This is the
-    /// *policy* — which registry, which account, which environment variable holds
-    /// the secret — and deliberately never the secret itself, so a long-lived
-    /// struct that derives `Debug` and reaches the dashboard cannot carry one.
-    /// Disabled by default. See [`RegistryAuth`].
-    pub registry_auth: RegistryAuth,
     /// The block this host carves per-job network subnets from, when the
     /// operator has declared one ([`crate::config::HostPolicy::network_pool`]).
     ///
     /// Host-level rather than per-profile — every profile's networks come out of
-    /// the same address space — and carried here for the same reason
-    /// [`DockerConfig::registry_auth`] is: this struct is what reaches the
-    /// provisioning path, so a host-wide input has to ride along on it.
+    /// the same address space — and carried here because this struct is what
+    /// reaches the provisioning path, so a host-wide input has to ride along on it.
+    /// (`[registry_auth]` is host-level too, and deliberately absent: it is held,
+    /// so nothing that reaches a job carries it — see [`RegistryAuth`].)
     ///
     /// `None` leaves allocation to Docker's own pools, which is what every
     /// release before this one did.
@@ -443,7 +418,7 @@ pub struct DockerConfig {
 impl DockerConfig {
     /// A config for `image` with faber's defaults (an unstated dind grant,
     /// `docker:dind`, no extra env, the [`DEFAULT_RUNNER_TIMEOUT`] lifetime cap,
-    /// no cache volume, no registry credentials).
+    /// no cache volume).
     pub fn new(image: String) -> Self {
         Self {
             image,
@@ -454,7 +429,6 @@ impl DockerConfig {
             cache_volume: false,
             git_mirror: false,
             mirror: false,
-            registry_auth: RegistryAuth::default(),
             network_pool: None,
             services: crate::services::ServicePlan::default(),
         }
@@ -1239,8 +1213,6 @@ struct Names {
     /// dind's `/var/lib/docker` volume. Named so teardown (and the sweep) can
     /// remove it; anonymous, it would outlive `docker rm` and leak per job.
     vol: String,
-    /// The registry-credential volume ([`RegistryLogin`]), when one is made.
-    cred: String,
 }
 
 /// The claim id a runner's containers carry as `org.faber.id`
@@ -1260,7 +1232,6 @@ impl Names {
             dind: format!("faber-dind-{id}"),
             runner: format!("faber-runner-{id}"),
             vol: format!("faber-vol-{id}"),
-            cred: format!("faber-{KIND_REGISTRY_AUTH}-{id}"),
         }
     }
 }
@@ -1383,13 +1354,6 @@ pub async fn run_one(
 
     // From here a reclaim may find real state behind it, so every return below —
     // reclaim included — goes through `teardown`.
-    //
-    // The registry credential's guard lives out here rather than in
-    // `run_in_sandbox`: its volume is mounted by the runner, and a volume can only
-    // go once no container mounts it, so it is removed after `teardown` has
-    // removed the runner. On a path that never gets here (a panic, a dropped
-    // future) the guard's `Drop` tries, and the janitor reaps whatever that left.
-    let mut registry: Option<RegistryLogin> = None;
     let result = run_in_sandbox(
         &names,
         owner_repo,
@@ -1400,15 +1364,11 @@ pub async fn run_one(
         cfg,
         limits,
         claim,
-        &mut registry,
         cancel,
     )
     .await;
     let services = cfg.services.names();
     let mirror_incident = teardown(&names, cfg.dind.granted(), &services, owner_repo).await;
-    if let Some(login) = registry.take() {
-        login.remove().await;
-    }
     drop(mirror);
     // ADR-0046 §9: the outcome names the services this runner had.
     result.map(|mut report| {
@@ -2077,7 +2037,6 @@ async fn run_in_sandbox(
     cfg: &DockerConfig,
     limits: &Limits,
     claim: &ClaimMarks,
-    registry: &mut Option<RegistryLogin>,
     mut cancel: watch::Receiver<bool>,
 ) -> anyhow::Result<RunReport> {
     create_job_network(
@@ -2210,13 +2169,6 @@ async fn run_in_sandbox(
         );
     }
 
-    // Materialize the optional registry credential last, once the ramp is past
-    // every seam that could still abandon this job: a reclaimed claim must never
-    // leave a secret in a volume, however briefly. From here the caller's slot
-    // owns the guard, and [`run_one`] removes its volume after teardown.
-    *registry = RegistryLogin::prepare(&cfg.registry_auth, names, owner_repo, &cfg.image).await;
-    let registry = registry.as_ref();
-
     info!("docker runner {}: launching one JIT job", names.runner);
     // Sample both containers' memory and CPU while the job runs: memory (and
     // dind's own OOM tally, which only exists while the container does) as a
@@ -2243,7 +2195,6 @@ async fn run_in_sandbox(
             Mounts {
                 cache_vol,
                 git_mirror,
-                registry_vol: registry.map(|r| r.volume.name()),
                 service_env: &service_env,
                 mirror_env: &mirror.env,
                 mirror_secret_env: &mirror_secret_names,
@@ -4240,282 +4191,7 @@ pub(crate) async fn docker_stdout<S: AsRef<std::ffi::OsStr>>(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-// --- optional registry credentials -----------------------------------------
-
-/// A resolved registry credential, alive only for as long as it takes to write
-/// the per-job config file.
-///
-/// It implements **no** `Debug`, `Display` or `Serialize`, and that is the point:
-/// the compiler then rejects any `{:?}` or `{}` that would put it in a log line,
-/// which is a guarantee rather than a convention. Nothing here is `pub` either —
-/// the secret cannot leave this module.
-struct Credential {
-    username: String,
-    secret: String,
-}
-
-/// Resolve the credential `policy` names, or `None` to pull anonymously.
-///
-/// The environment first — faber runs under a service manager, where the
-/// service definition is where this secret lives today and there is no
-/// interactive session — then the account's own `~/.docker/config.json`, which
-/// is the zero-configuration path. faber's GitHub token was once resolved the
-/// same way; ADR-0027 moved it into a credential store, and registry
-/// credentials have not followed it yet (see
-/// [`crate::standby::registry_secret_warning`] for what that costs under SYSTEM).
-///
-/// A Docker *credential helper* is never consulted, because it is not headless. `docker-credential-osxkeychain` can raise a
-/// keychain prompt, and `docker-credential-desktop` answers only to a live Docker
-/// Desktop session, which a launchd daemon — quite possibly running as a separate
-/// service user — does not have. A provisioner that can block on a GUI prompt
-/// nobody is looking at is worse than one that pulls anonymously, so faber names
-/// the helper in a warning and leaves the choice to the operator.
-///
-/// Every failure below is a `None` and a warning, never an `Err`: a credential
-/// that is absent, malformed, or locked in a helper must degrade a job to the
-/// anonymous pull it would have done anyway, never fail it.
-fn resolve_credential(policy: &RegistryAuth) -> Option<Credential> {
-    if !policy.enabled {
-        return None;
-    }
-    let server = policy.server.trim();
-    if server.is_empty() {
-        warn!("registry auth: enabled but `server` is empty — pulling anonymously");
-        return None;
-    }
-
-    // 0. A name outside faber's namespace is refused (issue #191): registry auth
-    // is disabled, not the daemon. Blocks the docker-config fallback too, so the
-    // warning is the whole story.
-    if let Some(problem) = password_env_problem(&policy.password_env) {
-        warn!("registry auth DISABLED — pulling anonymously: {problem}");
-        return None;
-    }
-
-    // 1. The environment. Only the variable's *name* comes from config.
-    let var = policy.password_env.trim();
-    let from_env = if var.is_empty() {
-        warn!("registry auth: `password_env` is empty — no variable to read the secret from");
-        None
-    } else {
-        std::env::var(var).ok().filter(|s| !s.trim().is_empty())
-    };
-    if let Some(secret) = from_env {
-        let username = policy.username.trim();
-        if !username.is_empty() {
-            return Some(Credential {
-                username: username.to_string(),
-                secret: secret.trim().to_string(),
-            });
-        }
-        // A secret with nobody to present it as is unusable on its own; fall
-        // through rather than fabricate a username.
-        warn!(
-            "registry auth: ${var} is set but no `username` is configured — \
-             trying ~/.docker/config.json instead"
-        );
-    }
-
-    // 2. The operator's own docker config.
-    match docker_config_credential(server) {
-        Ok(cred) => Some(cred),
-        Err(why) => {
-            warn!("registry auth: {why} — pulling anonymously, as before");
-            None
-        }
-    }
-}
-
-/// The `config.json` the operator's own `docker` CLI reads, honouring
-/// `$DOCKER_CONFIG` the way that CLI does.
-fn host_docker_config_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os(DOCKER_CONFIG_ENV).filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir).join("config.json"));
-    }
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".docker/config.json"))
-}
-
-/// Read `server`'s credential out of the operator's own `config.json`. The `Err`
-/// carries the reason, which is exactly what the caller logs.
-fn docker_config_credential(server: &str) -> Result<Credential, String> {
-    let path = host_docker_config_path().ok_or("no $HOME to locate ~/.docker/config.json")?;
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    credential_from_config_json(&text, server)
-}
-
-/// Pull `server`'s entry out of a `config.json`'s text. Split out from the file
-/// read so the parsing — including the case below that this whole function exists
-/// to be honest about — is unit-testable without a home directory.
-///
-/// THE `credsStore` CASE IS THE INTERESTING ONE. A machine that is genuinely
-/// logged in to Docker Hub through Docker Desktop has `"auths": {}` and
-/// `"credsStore": "desktop"`: the credential lives in the keychain, not the file
-/// (`auths` is empty). A reader that only consulted `auths` would report a flat
-/// "no credential found" for a machine whose operator is certain they are logged
-/// in, and they would be right. So the helper is named in the error, together
-/// with the thing to do about it, instead of the truth being rounded to silence.
-fn credential_from_config_json(text: &str, server: &str) -> Result<Credential, String> {
-    let root: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("parsing the docker config: {e}"))?;
-    let entry = root.get("auths").and_then(|a| a.get(server));
-
-    // The canonical shape `docker login` writes: base64("user:password").
-    if let Some(auth) = entry
-        .and_then(|e| e.get("auth"))
-        .and_then(|a| a.as_str())
-        .filter(|a| !a.is_empty())
-    {
-        let decoded = b64_decode(auth).ok_or("the docker config's `auth` is not valid base64")?;
-        let decoded =
-            String::from_utf8(decoded).map_err(|_| "the docker config's `auth` is not UTF-8")?;
-        let (username, secret) = decoded
-            .split_once(':')
-            .ok_or("the docker config's `auth` is not `username:password`")?;
-        if username.is_empty() || secret.is_empty() {
-            return Err("the docker config's `auth` has an empty half".into());
-        }
-        return Ok(Credential {
-            username: username.to_string(),
-            secret: secret.to_string(),
-        });
-    }
-
-    // The rarer inline shape, which the Docker CLI also accepts.
-    let field = |k: &str| {
-        entry
-            .and_then(|e| e.get(k))
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.is_empty())
-    };
-    if let (Some(username), Some(secret)) = (field("username"), field("password")) {
-        return Ok(Credential {
-            username: username.to_string(),
-            secret: secret.to_string(),
-        });
-    }
-
-    // Nothing inline. Say *why*, because the commonest reason is not "absent".
-    let helper = root
-        .get("credHelpers")
-        .and_then(|h| h.get(server))
-        .and_then(|h| h.as_str())
-        .or_else(|| root.get("credsStore").and_then(|s| s.as_str()))
-        .filter(|s| !s.is_empty());
-    match helper {
-        Some(helper) => Err(format!(
-            "the docker config keeps {server}'s credential in the `{helper}` helper, \
-             not in the file, and faber does not invoke helpers (they can prompt, and \
-             a launchd daemon has no session to prompt into) — put the secret in the \
-             environment variable named by `password_env` instead"
-        )),
-        None => Err(format!("the docker config has no credential for {server}")),
-    }
-}
-
-/// A per-job `DOCKER_CONFIG` directory, mounted read-only into the runner
-/// container so the job's own `docker pull` authenticates rather than drawing on
-/// the anonymous, IP-keyed quota (see [`RegistryAuth`]).
-///
-/// WHY A MOUNTED FILE, of the three ways to deliver a credential to a container:
-///
-/// * **An `-e` on the container** would put the secret in `docker run`'s argv,
-///   which every user on this host can read through `ps`, and then in
-///   `docker inspect` for the container's whole life. Ruled out on the argv alone.
-/// * **`docker login` inside the container after start** keeps the secret on a
-///   pipe, which is the better exposure — but faber launches the runner
-///   detached and its entrypoint starts claiming work immediately, so there is
-///   no seam to exec into ahead of the first pull; and it would require faber to
-///   assume the image ships a `docker` CLI, which the JIT contract deliberately
-///   does not (see the module doc).
-/// * **A mounted config** keeps the secret out of every argv and out of the
-///   container's environment, and confines it to one `0600` file, in a `0700`
-///   directory, for the length of one job.
-///
-/// WHERE THE FILE LIVES: in a per-job named volume ([`CredentialVolume`]), never a
-/// host directory. faber's Docker runs in a Linux VM that shares no host folder
-/// (ADR-0026), so a host path on `-v` would mount an empty directory the daemon
-/// conjured inside the VM and the job would silently pull anonymously. The volume
-/// is filled by a short-lived container that reads the file from its stdin, so the
-/// secret never touches the host's disk at all: it goes from faber's memory down
-/// one pipe into the VM's Docker storage, which only the VM's root can read.
-///
-/// What no mechanism can avoid: the client performing the pull must be able to
-/// read the credential, so the job's own steps can read it too. That is inherent
-/// to authenticating a pull the *job* initiates, and is the reason this is opt-in
-/// per deployment rather than on by default.
-struct RegistryLogin {
-    /// The volume holding `config.json`. Only ever its *name* is passed around or
-    /// logged; the secret is the file's content.
-    volume: CredentialVolume,
-}
-
-impl RegistryLogin {
-    /// Materialize the credential for this job, or `None` — no credential
-    /// configured, none resolvable, or the volume could not be made. `None` is the
-    /// fail-open path: the caller mounts nothing and the job pulls exactly as it
-    /// does today.
-    ///
-    /// The fill runs `image`, the runner image itself, so nothing new is pulled,
-    /// and hands the file to that image's own user: the runner reads it as that
-    /// user, and a root-owned `0600` file would be unreadable to it.
-    async fn prepare(
-        policy: &RegistryAuth,
-        names: &Names,
-        owner_repo: &str,
-        image: &str,
-    ) -> Option<Self> {
-        let cred = resolve_credential(policy)?;
-        let owner = match image_user(image).await {
-            Ok(user) => user,
-            Err(e) => {
-                warn!("registry auth: {e} — pulling anonymously, as before");
-                return None;
-            }
-        };
-        let labels = marks(KIND_REGISTRY_AUTH, owner_repo, &names.id);
-        let container = format!("faber-{KIND_REGISTRY_AUTH}-fill-{}", names.id);
-        let fill = CredentialFill {
-            volume: &names.cred,
-            labels: &labels,
-            container: &container,
-            image,
-            dir: REGISTRY_CONFIG_MOUNT,
-            file: "config.json",
-            owner: Some(&owner),
-        };
-        let body = registry_config_json(policy.server.trim(), &cred);
-        match CredentialVolume::fill(&fill, body.as_bytes()).await {
-            Ok(volume) => {
-                // The volume's name, never the content, and no hint of which
-                // account: a log line is the one artifact of a job that outlives
-                // every other.
-                debug!("registry auth: mounting a credential for {}", names.runner);
-                Some(Self { volume })
-            }
-            Err(e) => {
-                warn!("registry auth: {e} — pulling anonymously, as before");
-                None
-            }
-        }
-    }
-
-    /// Remove the volume. Called by [`run_one`] after teardown has removed the
-    /// runner, the one container that mounts it.
-    async fn remove(self) {
-        self.volume.remove().await;
-    }
-}
-
-/// The `config.json` a [`RegistryLogin`] writes: `server`'s entry, base64
-/// `user:secret` as `docker login` writes it. Split out so its shape is testable
-/// without a daemon in the loop.
-fn registry_config_json(server: &str, cred: &Credential) -> String {
-    serde_json::json!({
-        "auths": { server: { "auth": b64_encode(format!("{}:{}", cred.username, cred.secret).as_bytes()) } }
-    })
-    .to_string()
-}
+// --- credential volumes ----------------------------------------------------
 
 /// The script a credential fill runs as `sh -c`, with the mount directory, the
 /// file name and the owner (or an empty string) as `$1`..`$3`. A constant, so
@@ -4709,53 +4385,6 @@ impl Drop for CredentialVolume {
     }
 }
 
-/// Base64, hand-rolled because faber takes no dependency it can avoid and this is
-/// the whole of what a `config.json` credential needs — encode one `user:pass`,
-/// decode one back.
-const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-fn b64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = u32::from(chunk[0]);
-        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
-        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(B64_ALPHABET[((n >> 18) & 63) as usize] as char);
-        out.push(B64_ALPHABET[((n >> 12) & 63) as usize] as char);
-        out.push(match chunk.len() {
-            1 => '=',
-            _ => B64_ALPHABET[((n >> 6) & 63) as usize] as char,
-        });
-        out.push(match chunk.len() {
-            3 => B64_ALPHABET[(n & 63) as usize] as char,
-            _ => '=',
-        });
-    }
-    out
-}
-
-/// `None` on any character outside the alphabet — a corrupt `auth` field is a
-/// malformed credential, which the caller turns into a warning and an anonymous
-/// pull.
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for c in s.bytes() {
-        if c == b'=' || c.is_ascii_whitespace() {
-            continue;
-        }
-        let v = B64_ALPHABET.iter().position(|&x| x == c)? as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
 /// Label key stamped on every resource faber creates. Its presence is the
 /// authoritative answer to "is this mine?".
 pub(crate) const LABEL_OWNED: &str = "org.faber.owned";
@@ -4801,10 +4430,11 @@ pub(crate) const KIND_GIT_MIRROR_WORK: &str = "git-mirror-work";
 /// absent from [`crate::sweep`]'s reapable set, and only [`crate::mirror`]'s own
 /// janitor replaces the container.
 pub(crate) const KIND_MIRROR: &str = "mirror";
-/// The per-job volume holding a runner's registry credential ([`RegistryLogin`]),
-/// and the short-lived container that fills it. A per-job kind: it dies with its
-/// claim, so it is in [`crate::sweep`]'s reapable set, which reaps a leftover once
-/// its `org.faber.id` is no longer in flight.
+/// The per-job volume that held a runner's registry credential, and the
+/// short-lived container that filled it. faber makes neither while
+/// `[registry_auth]` is held ([`RegistryAuth`]); the kind stays in
+/// [`crate::sweep`]'s reapable set so a volume an earlier release left is still
+/// reaped once its `org.faber.id` is no longer in flight.
 pub(crate) const KIND_REGISTRY_AUTH: &str = "registry-auth";
 /// The volume holding one git-mirror refresh's fetch credential (ADR-0035 §1). It
 /// carries no claim, so it is not in [`crate::sweep`]'s reapable set:
@@ -4959,8 +4589,8 @@ fn runner_marks(owner_repo: &str, id: &str, claim: &ClaimMarks) -> Vec<String> {
 // --- argv builders (pure, unit-tested) -------------------------------------
 
 /// The optional attachments a runner may get: the per-repo build-cache volume
-/// (ADR-0005), the repo's read-only git mirror (ADR-0035) and the per-job
-/// registry-credential volume ([`RegistryLogin`]).
+/// (ADR-0005) and the repo's read-only git mirror (ADR-0035). No registry
+/// credential: `[registry_auth]` is held ([`RegistryAuth`]).
 ///
 /// Every one is a named volume, never a host path: faber's Docker runs in a Linux
 /// VM that shares no host folder (ADR-0026), so a host path would mount an empty
@@ -4974,7 +4604,6 @@ fn runner_marks(owner_repo: &str, id: &str, claim: &ClaimMarks) -> Vec<String> {
 struct Mounts<'a> {
     cache_vol: Option<&'a str>,
     git_mirror: Option<&'a str>,
-    registry_vol: Option<&'a str>,
     /// The names of the variables the job's services hand the runner (ADR-0046
     /// §4): `DATABASE_URL`, `REDIS_URL`. Names only, like `RUNNER_JITCONFIG`;
     /// their values travel in the `docker` CLI child's own environment.
@@ -5184,20 +4813,6 @@ fn runner_run_args(
     for name in mounts.mirror_secret_env {
         args.push("-e".into());
         args.push((*name).to_string());
-    }
-    // The registry credential, when one was resolved. After `cfg.env` for the same
-    // reason as the cache mount: `DOCKER_CONFIG` must name the directory faber
-    // actually mounted, or the job authenticates against one that isn't there.
-    //
-    // Only the volume's *name* appears in this argv — the secret is the content
-    // of the file inside it, never an argument — which is what keeps this whole
-    // vector safe to log, to `ps`, and to assert on in tests. `:ro` because nothing
-    // in the job has any business rewriting the credential faber issued it.
-    if let Some(vol) = mounts.registry_vol {
-        args.push("-v".into());
-        args.push(format!("{vol}:{REGISTRY_CONFIG_MOUNT}:ro"));
-        args.push("-e".into());
-        args.push(format!("{DOCKER_CONFIG_ENV}={REGISTRY_CONFIG_MOUNT}"));
     }
     args.push(cfg.image.clone());
     args
@@ -7760,17 +7375,52 @@ mod tests {
     }
 
     #[test]
-    fn an_out_of_namespace_password_env_disables_registry_auth_and_leaks_nothing() {
-        // The variable exists and would otherwise be copied into every job.
-        std::env::set_var("PATH_LEAK_TEST_SECRET_191", "hunter2");
-        let policy = RegistryAuth {
-            enabled: true,
-            username: "someone".into(),
-            password_env: "PATH_LEAK_TEST_SECRET_191".into(),
-            ..RegistryAuth::default()
+    fn a_held_registry_auth_reaches_no_runner() {
+        // `[registry_auth]` is held (see [`RegistryAuth`]): a daemon that boots
+        // with it on must not hand the job a credential in any form. The resolved
+        // profile carries none of the section — not the switch, not the account,
+        // not the variable's name — and the runner's argv has no credential mount
+        // and no `DOCKER_CONFIG`.
+        let file: crate::config::FileConfig = toml::from_str(
+            r#"
+            [registry_auth]
+            enabled = true
+            username = "someone"
+            password_env = "FABER_REGISTRY_HELD_SECRET"
+
+            [[profile]]
+            name = "linux-docker"
+            labels = ["faber", "docker"]
+            backend = "docker"
+            image = "ghcr.io/owner/my-runner:latest"
+        "#,
+        )
+        .unwrap();
+        assert!(file.registry_auth.enabled, "the section still parses");
+        let profiles = file
+            .into_profiles("2.330.0")
+            .expect("a held section still boots");
+        let crate::backend::Backend::Docker(d) = &profiles[0].backend else {
+            panic!("expected docker backend");
         };
-        assert!(resolve_credential(&policy).is_none());
-        std::env::remove_var("PATH_LEAK_TEST_SECRET_191");
+        let shown = format!("{d:?}");
+        for held in ["registry", "someone", "FABER_REGISTRY_HELD_SECRET"] {
+            assert!(
+                !shown.contains(held),
+                "the profile carries {held:?}: {shown}"
+            );
+        }
+        let a = runner_run_args(
+            "faber-runner-1-1",
+            "faber-net-1-1",
+            Mounts::default(),
+            d,
+            &ResourceLimits::default(),
+            &[],
+        );
+        assert!(!a.iter().any(|s| s.contains("DOCKER_CONFIG")), "{a:?}");
+        assert!(!a.iter().any(|s| s.contains(KIND_REGISTRY_AUTH)), "{a:?}");
+        assert!(!a.iter().any(|s| s == "-v"), "nothing is mounted: {a:?}");
     }
 
     #[test]
@@ -7924,8 +7574,7 @@ mod tests {
         );
 
         // Every `-e`-pushing branch of runner_run_args at once: dind granted
-        // (DOCKER_HOST), a custom profile env, the cache mount, and a registry
-        // credential mount.
+        // (DOCKER_HOST), a custom profile env and the cache mount.
         let mut c = cfg();
         c.env.insert("EXTRA".to_string(), "value".to_string());
         assert_shape(
@@ -7934,7 +7583,6 @@ mod tests {
                 "n",
                 Mounts {
                     cache_vol: Some("faber-cache-owner-repo"),
-                    registry_vol: Some("faber-registry-auth-1-1"),
                     ..Default::default()
                 },
                 &c,
@@ -8354,121 +8002,24 @@ mod tests {
         }
     }
 
-    // --- optional registry credentials -------------------------------------
+    // --- credential volumes ------------------------------------------------
 
     /// A placeholder, never a credential. Distinctive enough that a substring
     /// search for it cannot match anything else the argv legitimately contains.
     const FAKE_SECRET: &str = "PLACEHOLDER-NOT-A-CREDENTIAL-7f3a1c";
 
-    fn fake_cred() -> Credential {
-        Credential {
-            username: "someone".to_string(),
-            secret: FAKE_SECRET.to_string(),
-        }
-    }
-
-    /// Unwrap the *reason* a credential didn't resolve. Hand-written because
-    /// `Result::unwrap_err` requires `T: Debug` and [`Credential`] deliberately
-    /// implements none — the compile error that costs this helper is the same one
-    /// that stops a stray `{:?}` putting a secret in a log line.
-    fn reason(r: Result<Credential, String>) -> String {
-        match r {
-            Err(e) => e,
-            Ok(_) => panic!("expected no credential to resolve"),
-        }
-    }
-
-    /// The fill a [`RegistryLogin`] runs, for the tests below.
-    fn registry_fill<'a>(labels: &'a [String]) -> CredentialFill<'a> {
+    /// A credential fill, for the tests below: the shape [`crate::git_mirror`]
+    /// and [`crate::mirror`] use, with a placeholder volume.
+    fn test_fill<'a>(labels: &'a [String]) -> CredentialFill<'a> {
         CredentialFill {
-            volume: "faber-registry-auth-1-1",
+            volume: "faber-git-auth-1-1",
             labels,
-            container: "faber-registry-auth-fill-1-1",
+            container: "faber-git-auth-fill-1-1",
             image: "ghcr.io/owner/my-runner:latest",
-            dir: REGISTRY_CONFIG_MOUNT,
-            file: "config.json",
+            dir: "/faber/credential",
+            file: "credentials",
             owner: Some("runner"),
         }
-    }
-
-    #[test]
-    fn no_launch_argv_ever_carries_the_registry_secret() {
-        // The requirement this feature is judged on. A credential that reaches a
-        // `docker` argv is world-readable through `ps` for the life of the call,
-        // and lands in every log line and test failure that renders these vectors.
-        // Every builder is checked, and both forms are checked — the raw secret
-        // and the base64 that actually goes in the file — because a mount that
-        // passed the credential by value would slip past a search for one of them.
-        let body = registry_config_json(DEFAULT_REGISTRY_SERVER, &fake_cred());
-        let encoded = b64_encode(format!("someone:{FAKE_SECRET}").as_bytes());
-        // The config really does hold it — without this the assertions below
-        // could pass simply because nothing was ever going to be written.
-        assert!(
-            body.contains(&encoded),
-            "the mounted config must actually carry the credential"
-        );
-
-        let dind = dind_run_args(
-            "faber-dind-1",
-            "faber-net-1",
-            "faber-vol-1",
-            "docker:dind",
-            &ResourceLimits::default(),
-            &[],
-        );
-        let runner = runner_run_args(
-            "faber-runner-1",
-            "faber-net-1",
-            Mounts {
-                registry_vol: Some("faber-registry-auth-1-1"),
-                ..Default::default()
-            },
-            &cfg(),
-            &ResourceLimits::default(),
-            &[],
-        );
-        let labels = marks(KIND_REGISTRY_AUTH, "owner/demo", "1-1");
-        let fill = credential_fill_args(&registry_fill(&labels));
-        for (what, argv) in [
-            ("dind_run_args", &dind),
-            ("runner_run_args", &runner),
-            ("credential_fill_args", &fill),
-        ] {
-            let joined = argv.join(" ");
-            assert!(
-                !joined.contains(FAKE_SECRET),
-                "{what} leaked the secret verbatim"
-            );
-            assert!(
-                !joined.contains(&encoded),
-                "{what} leaked the encoded credential"
-            );
-            assert!(
-                !argv.iter().any(|s| s == "login"),
-                "{what} must never shell out to `docker login`"
-            );
-        }
-
-        // dind gets no credential at all — see [`REGISTRY_CONFIG_MOUNT`] for the
-        // measurement that says one there would authenticate nothing anyway.
-        assert!(
-            !dind.iter().any(|s| s.contains(REGISTRY_CONFIG_MOUNT)),
-            "the credential belongs to the runner's client, not to dind"
-        );
-        // The runner gets the volume, read-only, and the variable naming it.
-        let mount = format!("faber-registry-auth-1-1:{REGISTRY_CONFIG_MOUNT}:ro");
-        let env = format!("DOCKER_CONFIG={REGISTRY_CONFIG_MOUNT}");
-        assert!(runner.windows(2).any(|w| w[0] == "-v" && w[1] == mount));
-        assert!(runner.windows(2).any(|w| w[0] == "-e" && w[1] == env));
-        // Still a `docker run` flag, so it must precede the image.
-        let img = runner.iter().position(|s| s == &cfg().image).unwrap();
-        assert!(runner.iter().position(|s| s == "-v").unwrap() < img);
-        // The guard's volume is the one the claim's names reserve, under the kind
-        // the janitor reaps.
-        assert_eq!(
-            Names::for_runner("faber-1-1").cred,
-            format!("faber-{KIND_REGISTRY_AUTH}-1-1")
-        );
     }
 
     /// Every `-v` source in `argv`. A named volume is `[A-Za-z0-9][A-Za-z0-9_.-]*`;
@@ -8503,7 +8054,6 @@ mod tests {
             Mounts {
                 cache_vol: Some("faber-cache-owner-demo"),
                 git_mirror: Some("faber-git-owner-demo"),
-                registry_vol: Some("faber-registry-auth-1-1"),
                 ..Default::default()
             },
             &c,
@@ -8518,10 +8068,10 @@ mod tests {
             &ResourceLimits::default(),
             &[],
         );
-        let labels = marks(KIND_REGISTRY_AUTH, "owner/demo", "1-1");
-        let fill = credential_fill_args(&registry_fill(&labels));
+        let labels = marks(KIND_GIT_AUTH, "owner/demo", "1-1");
+        let fill = credential_fill_args(&test_fill(&labels));
         for (what, argv, n) in [
-            ("runner", &runner, 3),
+            ("runner", &runner, 2),
             ("dind", &dind, 1),
             ("fill", &fill, 1),
         ] {
@@ -8538,23 +8088,19 @@ mod tests {
         // The fill's child is built from a struct that cannot hold the secret, and
         // its whole argv and environment are checked anyway: the secret reaches
         // it only as the bytes `CredentialVolume::fill` writes to its stdin.
-        let labels = marks(KIND_REGISTRY_AUTH, "owner/demo", "1-1");
-        let f = registry_fill(&labels);
+        let labels = marks(KIND_GIT_AUTH, "owner/demo", "1-1");
+        let f = test_fill(&labels);
         let cmd = credential_fill_command(&f);
         let std = cmd.as_std();
-        let encoded = b64_encode(format!("someone:{FAKE_SECRET}").as_bytes());
         for arg in std.get_args() {
             let arg = arg.to_string_lossy();
-            assert!(!arg.contains(FAKE_SECRET) && !arg.contains(&encoded));
+            assert!(!arg.contains(FAKE_SECRET));
         }
         for (k, v) in std.get_envs() {
             let v = v
                 .map(|v| v.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            assert!(
-                !v.contains(FAKE_SECRET) && !v.contains(&encoded),
-                "{k:?} carries the secret"
-            );
+            assert!(!v.contains(FAKE_SECRET), "{k:?} carries the secret");
         }
 
         let a = credential_fill_args(&f);
@@ -8568,19 +8114,17 @@ mod tests {
         assert!(!a.iter().any(|s| s == "--rm"));
         assert!(a.windows(2).any(|w| w == ["--network", "none"]));
         assert!(a.windows(2).any(|w| w == ["--user", "0:0"]));
-        assert!(a.windows(2).any(|w| w
-            == [
-                "-v",
-                &format!("faber-registry-auth-1-1:{REGISTRY_CONFIG_MOUNT}")
-            ]));
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["-v", "faber-git-auth-1-1:/faber/credential"]));
         assert!(!a.iter().any(|s| s == "-e"), "no variable carries anything");
         // Labelled with the volume's own marks, so its provenance is a fact.
-        assert!(a.contains(&format!("{LABEL_KIND}={KIND_REGISTRY_AUTH}")));
+        assert!(a.contains(&format!("{LABEL_KIND}={KIND_GIT_AUTH}")));
         // The script is the constant; the path, file and owner follow it as data.
         let script = a.iter().position(|s| s == CREDENTIAL_FILL_SCRIPT).unwrap();
         assert_eq!(
             &a[script + 1..],
-            ["sh", REGISTRY_CONFIG_MOUNT, "config.json", "runner"]
+            ["sh", "/faber/credential", "credentials", "runner"]
         );
         // `0600` from creation in a `0700` directory, as the host file was.
         assert!(CREDENTIAL_FILL_SCRIPT.contains("umask 077"));
@@ -8600,93 +8144,9 @@ mod tests {
             &[],
         );
         assert!(!a.iter().any(|s| s.contains("DOCKER_CONFIG")));
-        assert!(!a.iter().any(|s| s.contains(REGISTRY_CONFIG_MOUNT)));
         assert!(!a.iter().any(|s| s == "-v"), "nothing is mounted");
         // And the policy is off unless an operator turns it on.
         assert!(!RegistryAuth::default().enabled);
-        assert!(resolve_credential(&RegistryAuth::default()).is_none());
-    }
-
-    #[test]
-    fn a_credsstore_config_is_reported_honestly_rather_than_as_absent() {
-        // The shape of a login through Docker Desktop: `auths` is empty and the
-        // credential is in the keychain. Saying "no credential found" here would
-        // be true of the file and false of the machine, and would send an operator
-        // hunting for the wrong problem.
-        let text = r#"{"auths":{},"credsStore":"desktop"}"#;
-        let err = reason(credential_from_config_json(text, DEFAULT_REGISTRY_SERVER));
-        assert!(err.contains("desktop"), "the helper must be named: {err}");
-        assert!(
-            err.contains("password_env"),
-            "and the way out has to be spelled out: {err}"
-        );
-
-        // A per-registry helper is named the same way.
-        let text = r#"{"auths":{},"credHelpers":{"ghcr.io":"osxkeychain"}}"#;
-        let err = reason(credential_from_config_json(text, "ghcr.io"));
-        assert!(err.contains("osxkeychain"), "{err}");
-
-        // Genuinely absent stays genuinely absent.
-        let err = reason(credential_from_config_json(r#"{"auths":{}}"#, "ghcr.io"));
-        assert!(err.contains("no credential"), "{err}");
-    }
-
-    #[test]
-    fn an_inline_docker_config_credential_is_read_both_ways() {
-        let encoded = b64_encode(b"someone:hunter2");
-        let text = format!(r#"{{"auths":{{"ghcr.io":{{"auth":"{encoded}"}}}}}}"#);
-        let c = credential_from_config_json(&text, "ghcr.io").unwrap();
-        assert_eq!(c.username, "someone");
-        assert_eq!(c.secret, "hunter2");
-
-        // The rarer un-encoded shape the Docker CLI also accepts.
-        let text = r#"{"auths":{"ghcr.io":{"username":"someone","password":"hunter2"}}}"#;
-        let c = credential_from_config_json(text, "ghcr.io").unwrap();
-        assert_eq!(c.secret, "hunter2");
-    }
-
-    #[test]
-    fn a_malformed_credential_degrades_instead_of_failing() {
-        // Every one of these is an `Err` the caller turns into a warning and an
-        // anonymous pull. None of them may become a hard failure: a broken
-        // credential config must not be able to take CI down.
-        for text in [
-            "not json at all",
-            r#"{"auths":{"ghcr.io":{"auth":"!!!not base64!!!"}}}"#,
-            // base64 of a string with no `:` separator
-            r#"{"auths":{"ghcr.io":{"auth":"bm8tY29sb24taGVyZQ=="}}}"#,
-            // base64 of ":password" — an empty username is unusable
-            r#"{"auths":{"ghcr.io":{"auth":"OnBhc3N3b3Jk"}}}"#,
-        ] {
-            assert!(
-                credential_from_config_json(text, "ghcr.io").is_err(),
-                "{text} must not resolve to a credential"
-            );
-        }
-    }
-
-    #[test]
-    fn base64_round_trips_the_shapes_a_credential_takes() {
-        for raw in [
-            "".as_bytes(),
-            "a".as_bytes(),
-            "ab".as_bytes(),
-            "abc".as_bytes(),
-            "someone:hunter2".as_bytes(),
-            // A password with the bytes that break a naive implementation.
-            "user:p+a/s=s\nword".as_bytes(),
-        ] {
-            let encoded = b64_encode(raw);
-            assert_eq!(encoded.len() % 4, 0, "{encoded} must be padded");
-            assert_eq!(b64_decode(&encoded).as_deref(), Some(raw), "{encoded}");
-        }
-        // Known vectors, so a self-consistent-but-wrong pair can't pass.
-        assert_eq!(b64_encode(b"someone:hunter2"), "c29tZW9uZTpodW50ZXIy");
-        assert_eq!(
-            b64_decode("c29tZW9uZTpodW50ZXIy").unwrap(),
-            b"someone:hunter2"
-        );
-        assert!(b64_decode("not base64 £").is_none());
     }
 
     /// A host with no declared pool must build exactly the argv it always did —
@@ -10184,7 +9644,6 @@ echo "LIVE_DONE $(since)"
                 services: cfg.services.mark(),
                 ..Default::default()
             };
-            let mut registry = None;
 
             let t0 = now_ms();
             let t = Instant::now();
@@ -10198,7 +9657,6 @@ echo "LIVE_DONE $(since)"
                 cfg,
                 &Limits::default(),
                 &claim,
-                &mut registry,
                 cancel,
             )
             .await;
