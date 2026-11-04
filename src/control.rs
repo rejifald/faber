@@ -285,6 +285,39 @@ pub fn sudo_command(w: &Widening, old: &FileConfig, new: &FileConfig) -> String 
             _ => APPLY.to_string(),
         };
     }
+    for field in ["git_mirror", "mirror", "backend"] {
+        let Some(name) = w
+            .key
+            .strip_prefix("profile.")
+            .and_then(|rest| rest.strip_suffix(field))
+            .and_then(|rest| rest.strip_suffix('.'))
+        else {
+            continue;
+        };
+        return match new.profiles.iter().find(|p| p.name == name) {
+            Some(p) if old.profiles.iter().any(|o| o.name == name) => set(
+                &w.key,
+                match field {
+                    "git_mirror" => {
+                        if p.git_mirror {
+                            "true"
+                        } else {
+                            "false"
+                        }
+                    }
+                    "mirror" => {
+                        if p.mirror {
+                            "true"
+                        } else {
+                            "false"
+                        }
+                    }
+                    _ => p.backend.as_str(),
+                },
+            ),
+            _ => APPLY.to_string(),
+        };
+    }
     for field in ["image", "dind_image"] {
         let Some(name) = w
             .key
@@ -327,6 +360,11 @@ pub fn sudo_command(w: &Widening, old: &FileConfig, new: &FileConfig) -> String 
             Some(v) => set(&w.key, &v.to_string()),
             None => unset(&w.key),
         },
+        "host.pull_unqualified_images" => match h.pull_unqualified_images {
+            Some(v) => set(&w.key, &v.to_string()),
+            None => unset(&w.key),
+        },
+        "autolimit.probe_image" => set(&w.key, &new.autolimit.probe_image),
         "update.repo" => set(&w.key, &u.repo),
         "update.pin" => match &u.pin {
             Some(pin) => set(&w.key, pin),
@@ -366,19 +404,25 @@ pub fn shell_quote(value: &str) -> String {
 /// (`[host] dind_requires_label` true -> false or unstated), `[gate]` and the actor lists widened,
 /// the update channel moved, pinned, hurried
 /// or switched on, and registry credentials switched on or repointed while on
-/// (addendum A), the images beside a Docker daemon changed (#220), any
+/// (addendum A), a Docker profile's runner image or backend changed and the
+/// dind image beside a Docker daemon changed (#220), any
 /// profile routing changed while a profile drops grants (#221), an operator
 /// recipe for runner-image variants put in force, and (#238) the `[needs]`
 /// ceiling raised, a profile's `env` gaining or changing an entry, and a
 /// profile's `cache_volume` turned on, and (ADR-0046) a `[services.*]` table
-/// added, its `image` changed, or an extension or Postgres major added. Empty
-/// means the change is routine.
+/// added, its `image`, `args`, `env` or `health_cmd` changed, a `job_env` name
+/// added or changed, or an extension or Postgres major added, and a mirror
+/// switched on (a profile's `git_mirror` or `mirror`, `[mirror]`, or its
+/// `lfs` or `npm` table added or changed), `[autolimit] probe_image` changed,
+/// and `[host] pull_unqualified_images` turned on. Empty means the change is
+/// routine.
 ///
 /// The test for each field (#238): does it widen what runs next to a
 /// privileged container, a Docker socket or a secret? The narrowing direction
 /// of each stays routine: a `[needs]` tool removed or an exact list that only
-/// loses versions, an `env` entry removed, `cache_volume` turned off, a
-/// `[services.*]` table removed or one losing extensions or versions.
+/// loses versions, an `env` or `job_env` entry removed, `cache_volume` or a
+/// mirror turned off, a `[services.*]` table removed or one losing extensions
+/// or versions, `pull_unqualified_images` set to `false`.
 ///
 /// Comparisons are exact: a respelled entry reads as one gone and one gained,
 /// which can only over-report.
@@ -419,38 +463,70 @@ pub fn trust_widening(old: &FileConfig, new: &FileConfig) -> Vec<Widening> {
         }
     }
 
-    // 1a. What runs beside a Docker daemon (#220): the runner image holds the
-    // daemon's socket and the dind image is the privileged container itself, so
-    // changing either on a profile that keeps (or gains) dind widens. A new
-    // profile is already reported as a grant above.
-    for p in new
-        .profiles
-        .iter()
-        .filter(|p| p.backend == BackendKind::Docker && p.dind.unwrap_or(true))
-    {
-        let Some(prev) = old
-            .profiles
-            .iter()
-            .find(|o| o.name == p.name && o.backend == BackendKind::Docker)
-        else {
-            continue;
-        };
-        for (field, before, after) in [
-            ("image", &prev.image, &p.image),
-            ("dind_image", &prev.dind_image, &p.dind_image),
-        ] {
-            if before != after {
-                let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "unset".into());
+    // 1a. What a job's code runs in. The runner image holds the job's runner
+    // configuration and the repository's secrets, and on a profile with a git
+    // mirror the refresh runs it as root beside faber's own credential, so a
+    // change to it widens on every Docker profile, with dind or without (#220).
+    // The dind image is the privileged container itself, so it widens while
+    // the profile keeps (or gains) dind; unread without it. A profile moved to
+    // or from the Docker backend widens too: the image now means something
+    // else. A new dind profile is already reported as a grant above; a new one
+    // without dind reports its image here.
+    for p in &new.profiles {
+        let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "unset".into());
+        let Some(prev) = old.profiles.iter().find(|o| o.name == p.name) else {
+            if p.backend == BackendKind::Docker && !p.dind.unwrap_or(true) {
                 out.push(widening(
-                    format!("profile.{}.{field}", p.name),
+                    format!("profile.{}.image", p.name),
                     format!(
-                        "profile {} {field} {} -> {}: it runs beside the job's Docker daemon",
+                        "new docker profile {} runs its jobs in image {}",
                         p.name,
-                        shown(before),
-                        shown(after)
+                        shown(&p.image)
                     ),
                 ));
             }
+            continue;
+        };
+        if prev.backend != p.backend {
+            if prev.backend == BackendKind::Docker || p.backend == BackendKind::Docker {
+                out.push(widening(
+                    format!("profile.{}.backend", p.name),
+                    format!(
+                        "profile {} backend {} -> {}: its jobs now run in image {}",
+                        p.name,
+                        prev.backend.as_str(),
+                        p.backend.as_str(),
+                        shown(&p.image)
+                    ),
+                ));
+            }
+            continue;
+        }
+        if p.backend != BackendKind::Docker {
+            continue;
+        }
+        if prev.image != p.image {
+            out.push(widening(
+                format!("profile.{}.image", p.name),
+                format!(
+                    "profile {} image {} -> {}: its jobs, their secrets and a git-mirror \
+                     refresh run in it",
+                    p.name,
+                    shown(&prev.image),
+                    shown(&p.image)
+                ),
+            ));
+        }
+        if p.dind.unwrap_or(true) && prev.dind_image != p.dind_image {
+            out.push(widening(
+                format!("profile.{}.dind_image", p.name),
+                format!(
+                    "profile {} dind_image {} -> {}: it runs beside the job's Docker daemon",
+                    p.name,
+                    shown(&prev.dind_image),
+                    shown(&p.dind_image)
+                ),
+            ));
         }
     }
 
@@ -779,9 +855,9 @@ pub fn trust_widening(old: &FileConfig, new: &FileConfig) -> Vec<Widening> {
     // Postgres major added widens; a table removed, an entry dropped or a
     // `memory_mib` or `idle_stop_secs` change does not. A per-job table's
     // `args`, `env` and `health_cmd` are the code that runs on those networks
-    // too (A4), so a change to any of them widens; `job_env` only sets what a
-    // job could set itself, so it is routine. An `env` value may be a
-    // credential: the sentence names the keys that changed, never a value.
+    // too (A4), so a change to any of them widens, and so does a `job_env`
+    // name added or changed. An `env` value may be a credential: the sentence
+    // names the keys that changed, never a value.
     for (name, after) in &new.services {
         let Some(before) = old.services.get(name) else {
             out.push(widening(
@@ -833,6 +909,26 @@ pub fn trust_widening(old: &FileConfig, new: &FileConfig) -> Vec<Widening> {
                 ),
             ));
         }
+        // What the runner gets acts around every step of the job, as a
+        // profile's `env` does (10): `LD_PRELOAD`, `BASH_ENV` or a proxy runs or
+        // routes the job's own code. An added or changed name widens; a removed
+        // one does not. Names only: a value may be a credential.
+        let exported: Vec<&str> = after
+            .job_env
+            .iter()
+            .filter(|(k, v)| before.job_env.get(*k) != Some(*v))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        if !exported.is_empty() {
+            out.push(widening(
+                format!("services.{name}.job_env"),
+                format!(
+                    "services.{name}.job_env adds or changes {}: the runner of every job that \
+                     declares faber.{name} gets it",
+                    exported.join(", ")
+                ),
+            ));
+        }
         if before.health_cmd != after.health_cmd {
             out.push(widening(
                 format!("services.{name}.health_cmd"),
@@ -871,6 +967,103 @@ pub fn trust_widening(old: &FileConfig, new: &FileConfig) -> Vec<Widening> {
                 ),
             ));
         }
+    }
+
+    // 13. The mirrors (ADR-0035, ADR-0047). A git-mirror refresh runs the
+    // profile's runner image with faber's own credential, and the pull-through
+    // mirror carries it to Git LFS, so switching either on widens: a profile's
+    // `git_mirror` or `mirror` false -> true (on a new profile too), `[mirror]`
+    // turned on, and `[mirror.lfs]` or `[mirror.npm]` added or changed while it
+    // is on. Compared as they take effect: a `[mirror.lfs]` with no `[mirror]`
+    // of its own leaves the mirror off, so writing `[mirror]` out turns it on.
+    // Switching any of them off, and `max_size_gib`, are routine.
+    for p in &new.profiles {
+        let prev = old.profiles.iter().find(|o| o.name == p.name);
+        for (field, now, before) in [
+            (
+                "git_mirror",
+                p.git_mirror,
+                prev.is_some_and(|o| o.git_mirror),
+            ),
+            ("mirror", p.mirror, prev.is_some_and(|o| o.mirror)),
+        ] {
+            if now && !before {
+                out.push(widening(
+                    format!("profile.{}.{field}", p.name),
+                    format!(
+                        "{} {} {field} {}: a mirror faber's own credential reaches serves its \
+                         jobs",
+                        if prev.is_some() {
+                            "profile"
+                        } else {
+                            "new profile"
+                        },
+                        p.name,
+                        if prev.is_some() {
+                            "false -> true"
+                        } else {
+                            "true"
+                        },
+                    ),
+                ));
+            }
+        }
+    }
+    if let Some(m1) = new.mirror_policy() {
+        match old.mirror_policy() {
+            None => out.push(widening(
+                "mirror",
+                "[mirror] turned on: the pull-through mirror serves jobs, and carries faber's \
+                 credential to Git LFS when [mirror.lfs] is set",
+            )),
+            Some(m0) => {
+                for (key, before, after) in [
+                    ("mirror.lfs", m0.lfs, m1.lfs),
+                    ("mirror.npm", m0.npm, m1.npm),
+                ] {
+                    if after.is_some() && after != before {
+                        out.push(widening(
+                            key,
+                            format!(
+                                "[{key}] added or changed: more of what jobs fetch goes through \
+                                 the mirror"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 14. The autolimiter's probe image: faber runs it on the Docker engine
+    // that holds every job, so any change widens.
+    if old.autolimit.probe_image != new.autolimit.probe_image {
+        out.push(widening(
+            "autolimit.probe_image",
+            format!(
+                "autolimit.probe_image {} -> {}: faber runs it on the engine that holds every job",
+                old.autolimit.probe_image, new.autolimit.probe_image
+            ),
+        ));
+    }
+
+    // 15. `[host] pull_unqualified_images` turned on (#156): a name without a
+    // registry host may then be pulled from whatever Docker Hub's namespace of
+    // that name holds. Only `false` refuses the pull, so false -> true or
+    // unstated widens; the other directions are routine.
+    if old.host.pull_unqualified_images == Some(false)
+        && new.host.pull_unqualified_images != Some(false)
+    {
+        out.push(widening(
+            "host.pull_unqualified_images",
+            format!(
+                "host.pull_unqualified_images false -> {}: an image name without a registry host \
+                 may be pulled from Docker Hub",
+                new.host
+                    .pull_unqualified_images
+                    .map_or("unstated".to_string(), |v| v.to_string())
+            ),
+        ));
     }
 
     out
@@ -2384,7 +2577,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_docker_profile_with_dind_widens_and_without_does_not() {
+    fn a_new_docker_profile_widens_by_its_grant_or_else_its_image() {
         let mut new = base();
         new.profiles.push(docker("heavy", None));
         // A new dind profile is also a routing change ahead of it.
@@ -2397,8 +2590,9 @@ mod tests {
             keys(&base(), &new),
             ["profile.heavy.dind", "profiles.routing"]
         );
+        // Without dind it still runs its jobs in an image of its own.
         new.profiles[1].dind = Some(false);
-        assert!(keys(&base(), &new).is_empty());
+        assert_eq!(keys(&base(), &new), ["profile.heavy.image"]);
     }
 
     fn routed() -> FileConfig {
@@ -2464,8 +2658,7 @@ mod tests {
     }
 
     /// #220: the runner image and the dind image run beside a Docker daemon,
-    /// so changing either widens while dind is effective, and is routine
-    /// without it.
+    /// so changing either widens while dind is effective.
     #[test]
     fn changing_an_image_beside_a_docker_daemon_widens() {
         let mut dind = base();
@@ -2489,12 +2682,12 @@ mod tests {
             ["profile.linux-docker.image"]
         );
 
-        // Without dind, the same changes are routine...
+        // Without dind the dind image is unread, so it alone is routine...
         let mut plain = base();
-        plain.profiles[0].image = Some("ghcr.io/owner/other-runner:latest".into());
         plain.profiles[0].dind_image = Some("docker:27-dind".into());
         assert!(keys(&base(), &plain).is_empty());
         // ...and so is one made while dind is being withdrawn.
+        plain.profiles[0].image = Some("ghcr.io/owner/other-runner:latest".into());
         assert!(keys(&image, &plain).is_empty());
         // Granting dind with a new image reports both.
         assert_eq!(
@@ -2564,10 +2757,25 @@ mod tests {
                 c.profiles.push(docker("last", Some(false)))
             }),
         ];
+        // A new Docker profile (a rename makes one) also reports its image,
+        // which `changing_a_runner_image_widens_on_every_docker_profile` covers;
+        // only routing is judged here.
+        let routing = |old: &FileConfig, new: &FileConfig| -> Vec<Widening> {
+            trust_widening(old, new)
+                .into_iter()
+                .filter(|w| {
+                    !(w.key.ends_with(".image")
+                        && !old
+                            .profiles
+                            .iter()
+                            .any(|o| format!("profile.{}.image", o.name) == w.key))
+                })
+                .collect()
+        };
         for (what, edit) in edits {
             let mut new = old.clone();
             edit(&mut new);
-            let found = trust_widening(&old, &new);
+            let found = routing(&old, &new);
             let found_keys: Vec<&str> = found.iter().map(|w| w.key.as_str()).collect();
             assert_eq!(found_keys, ["profiles.routing"], "{what}");
             assert!(found[0].sentence.contains("db drops grants"), "{what}");
@@ -2576,7 +2784,7 @@ mod tests {
             no_drops.profiles[0].drop_grants.clear();
             let mut new = no_drops.clone();
             edit(&mut new);
-            assert!(keys(&no_drops, &new).is_empty(), "{what} without drops");
+            assert!(routing(&no_drops, &new).is_empty(), "{what} without drops");
         }
 
         // Adding a drop, or another one, stays one routine call.
@@ -2589,7 +2797,7 @@ mod tests {
         // A routing change through `apply` is the command it needs.
         let mut renamed = old.clone();
         renamed.profiles[0].name = "db2".into();
-        let n = needs(&trust_widening(&old, &renamed), &old, &renamed);
+        let n = needs(&routing(&old, &renamed), &old, &renamed);
         assert_eq!(n[0].command, "sudo faber config apply <edited config.toml>");
     }
 
@@ -2707,10 +2915,11 @@ mod tests {
         assert_eq!(n[0].command, "sudo faber config apply <edited config.toml>");
     }
 
-    /// ADR-0046 A4: what a per-job table runs, with and under, widens; what it
-    /// hands the runner, or how much memory it may use, does not.
+    /// ADR-0046 A4: what a per-job table runs, with and under, widens, and so
+    /// does a name it adds to or changes in what it hands the runner; one it
+    /// stops handing over, or how much memory it may use, does not.
     #[test]
-    fn a_per_job_table_widens_by_what_it_runs_not_by_what_it_exports() {
+    fn a_per_job_table_widens_by_what_it_runs_and_what_it_exports() {
         const S3: &str = "[services.s3]\nimage = \"ghcr.io/owner/s3:1\"\nmemory_mib = 64\n\
                           args = [\"--port\", \":7070\"]\nenv = { KEY = \"firstvalue\", OTHER = \"x\" }\n\
                           job_env = { S3_ENDPOINT = \"http://s3:7070\" }\nhealth_cmd = \"true\"\n";
@@ -2722,7 +2931,7 @@ mod tests {
                 "ghcr.io/owner/s3:2",
                 "services.s3.image",
             ),
-            (":7070", ":7071", "services.s3.args"),
+            ("\":7070\"", "\":7071\"", "services.s3.args"),
             ("\"--port\", ", "", "services.s3.args"),
             (
                 "KEY = \"firstvalue\"",
@@ -2741,16 +2950,19 @@ mod tests {
                 "services.s3.health_cmd",
             ),
             ("health_cmd = \"true\"\n", "", "services.s3.health_cmd"),
+            // What the runner gets acts around the job's own steps.
+            ("http://s3:7070", "http://s3:9000", "services.s3.job_env"),
+            (
+                "job_env = { S3_ENDPOINT = \"http://s3:7070\" }",
+                "job_env = { OTHER_URL = \"u\" }",
+                "services.s3.job_env",
+            ),
         ] {
             let new = with_services(&S3.replace(from, to));
             assert_eq!(keys(&old, &new), [key], "{from} -> {to}");
         }
         for (from, to) in [
-            ("http://s3:7070", "http://s3:9000"),
-            (
-                "job_env = { S3_ENDPOINT = \"http://s3:7070\" }",
-                "job_env = { OTHER_URL = \"u\" }",
-            ),
+            ("job_env = { S3_ENDPOINT = \"http://s3:7070\" }\n", ""),
             ("memory_mib = 64", "memory_mib = 512"),
         ] {
             let new = with_services(&S3.replace(from, to));
@@ -2856,6 +3068,166 @@ mod tests {
         assert!(keys(&base(), &old).is_empty());
     }
 
+    /// The runner image holds the job, its secrets and a git-mirror refresh,
+    /// so changing it widens on a profile without dind too, and is one `config
+    /// set`. A macOS VM profile's image names a golden image in the store, which
+    /// only root fills: routine here.
+    #[test]
+    fn changing_a_runner_image_widens_on_every_docker_profile() {
+        let mut new = base();
+        new.profiles[0].image = Some("ghcr.io/owner/other-runner:latest".into());
+        assert_eq!(keys(&base(), &new), ["profile.linux-docker.image"]);
+        assert_eq!(keys(&new, &base()), ["profile.linux-docker.image"]);
+        let n = needs(&trust_widening(&base(), &new), &base(), &new);
+        assert_eq!(
+            n[0].command,
+            "sudo faber config set profile.linux-docker.image ghcr.io/owner/other-runner:latest"
+        );
+        let mut vm = base();
+        vm.profiles.push(macos_vm("mac"));
+        let mut golden = vm.clone();
+        golden.profiles[1].image = Some("golden-16".into());
+        assert!(keys(&vm, &golden).is_empty());
+    }
+
+    /// A profile moved to or from the Docker backend widens: its image now
+    /// means something else.
+    #[test]
+    fn moving_a_profile_to_or_from_docker_widens() {
+        let mut vm = base();
+        vm.profiles[0].backend = BackendKind::MacosVm;
+        assert_eq!(keys(&vm, &base()), ["profile.linux-docker.backend"]);
+        assert_eq!(keys(&base(), &vm), ["profile.linux-docker.backend"]);
+        let n = needs(&trust_widening(&vm, &base()), &vm, &base());
+        assert_eq!(
+            n[0].command,
+            "sudo faber config set profile.linux-docker.backend docker"
+        );
+    }
+
+    /// A profile's `git_mirror` or `mirror` switched on widens, on a new
+    /// profile too; switched off it does not.
+    #[test]
+    fn switching_a_profiles_mirror_on_widens_and_off_does_not() {
+        for field in ["git_mirror", "mirror"] {
+            let set = |c: &mut FileConfig, i: usize| {
+                if field == "git_mirror" {
+                    c.profiles[i].git_mirror = true;
+                } else {
+                    c.profiles[i].mirror = true;
+                }
+            };
+            let mut on = base();
+            set(&mut on, 0);
+            assert_eq!(
+                keys(&base(), &on),
+                [format!("profile.linux-docker.{field}")]
+            );
+            assert!(keys(&on, &base()).is_empty(), "{field} off");
+            let n = needs(&trust_widening(&base(), &on), &base(), &on);
+            assert_eq!(
+                n[0].command,
+                format!("sudo faber config set profile.linux-docker.{field} true")
+            );
+            let mut added = base();
+            added.profiles.push(docker("extra", Some(false)));
+            set(&mut added, 1);
+            assert_eq!(
+                keys(&base(), &added),
+                [
+                    "profile.extra.image".to_string(),
+                    format!("profile.extra.{field}")
+                ]
+            );
+        }
+    }
+
+    /// `[mirror]` turned on, and `[mirror.lfs]` or `[mirror.npm]` added or
+    /// changed while it is on, widen, judged as they take effect: a
+    /// `[mirror.lfs]` without `[mirror]` leaves the mirror off, so writing
+    /// `[mirror]` out turns it on. Off, a table dropped and the size are
+    /// routine.
+    #[test]
+    fn switching_the_mirror_on_widens_as_it_takes_effect() {
+        let with = |text: &str| {
+            let mut c = base();
+            c.mirror = FileConfig::load_from_str(text, "test").unwrap().mirror;
+            c
+        };
+        let on = with("[mirror]\n");
+        let lfs = with("[mirror]\n[mirror.lfs]\n");
+        let npm = with("[mirror]\n[mirror.npm]\n");
+        assert_eq!(keys(&base(), &on), ["mirror"]);
+        assert_eq!(keys(&on, &lfs), ["mirror.lfs"]);
+        assert_eq!(keys(&on, &npm), ["mirror.npm"]);
+        let lfs_off = with("[mirror]\n[mirror.lfs]\nfill = \"off\"\n");
+        assert_eq!(keys(&lfs_off, &lfs), ["mirror.lfs"]);
+        for (from, to) in [(&on, &base()), (&lfs, &on), (&npm, &on)] {
+            assert!(keys(from, to).is_empty());
+        }
+        assert!(keys(&on, &with("[mirror]\nmax_size_gib = 50\n")).is_empty());
+
+        let implicit = with("[mirror.lfs]\n");
+        assert!(keys(&base(), &implicit).is_empty(), "still off");
+        assert_eq!(keys(&implicit, &lfs), ["mirror"]);
+        // A save sends the config as JSON, and that keeps it off.
+        let posted: FileConfig =
+            serde_json::from_value(serde_json::to_value(&implicit).unwrap()).unwrap();
+        assert!(posted.mirror_policy().is_none());
+        assert!(keys(&implicit, &posted).is_empty());
+    }
+
+    /// faber runs the probe image on the engine that holds every job.
+    #[test]
+    fn changing_the_probe_image_widens() {
+        let mut new = base();
+        new.autolimit.probe_image = "ghcr.io/owner/probe:1".into();
+        assert_eq!(keys(&base(), &new), ["autolimit.probe_image"]);
+        let n = needs(&trust_widening(&base(), &new), &base(), &new);
+        assert_eq!(
+            n[0].command,
+            "sudo faber config set autolimit.probe_image ghcr.io/owner/probe:1"
+        );
+    }
+
+    /// `pull_unqualified_images` false -> true or unstated widens; stating it,
+    /// or turning it off, is routine.
+    #[test]
+    fn letting_faber_pull_unqualified_images_widens() {
+        let with = |v: Option<bool>| {
+            let mut c = base();
+            c.host.pull_unqualified_images = v;
+            c
+        };
+        let off = with(Some(false));
+        assert_eq!(
+            keys(&off, &with(Some(true))),
+            ["host.pull_unqualified_images"]
+        );
+        assert_eq!(keys(&off, &with(None)), ["host.pull_unqualified_images"]);
+        for (from, to) in [
+            (None, Some(true)),
+            (None, Some(false)),
+            (Some(true), Some(false)),
+        ] {
+            assert!(
+                keys(&with(from), &with(to)).is_empty(),
+                "{from:?} -> {to:?}"
+            );
+        }
+        let (on, unstated) = (with(Some(true)), with(None));
+        let n = needs(&trust_widening(&off, &on), &off, &on);
+        assert_eq!(
+            n[0].command,
+            "sudo faber config set host.pull_unqualified_images true"
+        );
+        let n = needs(&trust_widening(&off, &unstated), &off, &unstated);
+        assert_eq!(
+            n[0].command,
+            "sudo faber config unset host.pull_unqualified_images"
+        );
+    }
+
     fn macos_vm(name: &str) -> FileProfile {
         FileProfile {
             backend: BackendKind::MacosVm,
@@ -2907,19 +3279,26 @@ mod tests {
     }
 
     /// A new profile is judged against nothing: a non-empty `env` or
-    /// `cache_volume` on widens; one with neither does not.
+    /// `cache_volume` on widens, besides the image a new Docker profile
+    /// reports; a macOS VM profile with neither does not.
     #[test]
     fn a_new_profile_with_env_or_a_cache_volume_widens() {
         let mut plain = base();
         plain.profiles.push(docker("extra", Some(false)));
-        assert!(keys(&base(), &plain).is_empty());
+        assert_eq!(keys(&base(), &plain), ["profile.extra.image"]);
+        let mut bare_vm = base();
+        bare_vm.profiles.push(macos_vm("mac"));
+        assert!(keys(&base(), &bare_vm).is_empty());
 
         let mut with_env = plain.clone();
         with_env.profiles[1]
             .env
             .insert("ACTIONS_RUNNER_HOOK_JOB_STARTED".into(), "/hook.sh".into());
-        assert_eq!(keys(&base(), &with_env), ["profile.extra.env"]);
-        assert!(trust_widening(&base(), &with_env)[0]
+        assert_eq!(
+            keys(&base(), &with_env),
+            ["profile.extra.image", "profile.extra.env"]
+        );
+        assert!(trust_widening(&base(), &with_env)[1]
             .sentence
             .starts_with("new profile extra"));
 
@@ -2930,7 +3309,10 @@ mod tests {
 
         let mut cached = plain.clone();
         cached.profiles[1].cache_volume = true;
-        assert_eq!(keys(&base(), &cached), ["profile.extra.cache_volume"]);
+        assert_eq!(
+            keys(&base(), &cached),
+            ["profile.extra.image", "profile.extra.cache_volume"]
+        );
         // Not one `set` away: `config set profile.<name>.…` edits a profile
         // that exists.
         let n = needs(&trust_widening(&base(), &cached), &base(), &cached);
@@ -2981,7 +3363,11 @@ mod tests {
         new.profiles[0].dind = Some(true);
         assert_eq!(
             keys(&old, &new),
-            ["profile.linux-docker.dind", "profiles.routing"]
+            [
+                "profile.linux-docker.dind",
+                "profile.linux-docker.backend",
+                "profiles.routing"
+            ]
         );
     }
 

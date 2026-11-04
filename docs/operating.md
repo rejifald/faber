@@ -231,8 +231,11 @@ memory_mib = 256                     # added to each job's reservation
 - `faber check-config` refuses a table that breaks these rules, and warns when
   `[host] pull_unqualified_images = false` stops faber pulling a service image.
 - **Changing what may run widens trust**, so it takes `sudo`: adding a table, changing
-  its image, command, environment or health check, or adding an extension or a Postgres
-  major.
+  its image, command, environment or health check, adding or changing a `job_env`
+  entry, or adding an extension or a Postgres major.
+- **`job_env` tells a job where a service is**, not how to run: names that change how
+  the job's own programs load, start or connect (`LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`,
+  `NODE_OPTIONS`, `*_PROXY`) are refused.
 
 Postgres is one shared server per major, with a database and a role of its own for each
 job. The role may create databases, so test runners that make `test_<name>` keep
@@ -393,8 +396,8 @@ To act on it:
    ```
 
 3. **Point the profile at the new tag,** on the dashboard's Settings page or with
-   `faber config set profile.linux-docker.image faber-runner:$V`. On a profile that
-   grants dind this widens trust and takes `sudo`.
+   `sudo faber config set profile.linux-docker.image faber-runner:$V`. A profile's
+   image is what its jobs run in, so changing it widens trust and takes `sudo`.
 4. **Drain, then restart faber,** so the profile change applies and the new archive
    loads:
 
@@ -444,9 +447,12 @@ group setup puts you in (from your next login), but you change it through faber:
 
 The Settings page and `faber config` judge a change before they write it. A routine
 change, or one that narrows something, works as you. One that widens trust takes
-`sudo`: granting dind, widening `[gate]` or the actor lists, adding a service or
-changing its image, turning updates on, pinning them or shortening their wait, and
-taking an entry out of `drop_grants`, among others. The dashboard can't make such a
+`sudo`: granting dind, widening `[gate]` or the actor lists, changing a Docker
+profile's image or backend or adding one, adding a service or changing its image,
+switching a mirror on (`git_mirror`, a profile's `mirror`, `[mirror]` and its tables),
+changing `[autolimit] probe_image`, letting faber pull unqualified image names, turning
+updates on, pinning them or shortening their wait, and taking an entry out of
+`drop_grants`, among others. The dashboard can't make such a
 change: it refuses with the exact `sudo faber config …` command to run instead. Every
 widening, made or refused, leaves a `control` line in the audit log.
 

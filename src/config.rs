@@ -1240,7 +1240,13 @@ pub struct MirrorFile {
     /// `[mirror]`: TOML then
     /// makes the parent table implicitly, which would turn the mirror on by
     /// accident. Set by [`FileConfig::load_from_str`], refused by [`Self::errors`].
-    #[serde(skip)]
+    ///
+    /// Carried through JSON, as a settings save and `faber config set` send the
+    /// config, so that a save made over such a file is refused as the file is,
+    /// rather than writing `[mirror]` out and turning the mirror on. Written only
+    /// when true, which validation never lets reach a file; a file's own text,
+    /// not this key, decides it whenever one is read.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub implicit: bool,
 }
 
@@ -1908,6 +1914,17 @@ const SERVICE_RESERVED_ENV: [&str; 6] = [
     "PGDATABASE",
 ];
 const SERVICE_RESERVED_PREFIXES: [&str; 4] = ["RUNNER_", "GITHUB_", "ACTIONS_", "FABER_"];
+
+/// A `job_env` name that steers how the job's own programs start or connect
+/// rather than telling them where a service is: the dynamic loader's
+/// (`LD_*`, `DYLD_*`), a shell's start-up file (`BASH_ENV`, `ENV`), Node's
+/// flags (`NODE_OPTIONS`) and a proxy (`*_PROXY`).
+fn job_env_name_reserved(n: &str) -> bool {
+    n.starts_with("LD_")
+        || n.starts_with("DYLD_")
+        || n.ends_with("_PROXY")
+        || ["BASH_ENV", "ENV", "NODE_OPTIONS"].contains(&n)
+}
 
 /// `^[A-Z_][A-Z0-9_]*$`.
 fn service_env_name_ok(n: &str) -> bool {
@@ -3916,6 +3933,42 @@ impl FileConfig {
                  [services.{tool}] (ADR-0046) and remove it from [needs]"
             ));
         }
+        // Policy, not structure: the images faber hands to `docker` and the
+        // names a service exports to every job that declares it. A boot on such
+        // a file runs as before (an image that is no reference is never pulled
+        // or run, `pull_image`), but a save or a human-run `check-config`
+        // refuses it.
+        for p in self
+            .profiles
+            .iter()
+            .filter(|p| matches!(p.backend, BackendKind::Docker))
+        {
+            for (field, image) in [("image", &p.image), ("dind_image", &p.dind_image)] {
+                if let Some(image) = image.as_deref().filter(|i| !i.trim().is_empty()) {
+                    if !crate::untrusted::image_ref(image) {
+                        errs.push(format!(
+                            "profile '{}': {field} {image:?} is not an image reference",
+                            p.name
+                        ));
+                    }
+                }
+            }
+        }
+        let probe = &self.autolimit.probe_image;
+        if !probe.trim().is_empty() && !crate::untrusted::image_ref(probe) {
+            errs.push(format!(
+                "autolimit.probe_image {probe:?} is not an image reference"
+            ));
+        }
+        for (name, s) in &self.services {
+            for k in s.job_env.keys().filter(|k| job_env_name_reserved(k)) {
+                errs.push(format!(
+                    "services.{name}: job_env {k} changes how the job's own programs load or \
+                     connect (LD_*, DYLD_*, BASH_ENV, ENV, NODE_OPTIONS, *_PROXY), so a service \
+                     may not set it"
+                ));
+            }
+        }
         // Policy, not structure (ADR-0028, #238): an operator recipe only root
         // could have written. Refused here, where a human is looking; the boot
         // only warns, and each variant build from it is refused.
@@ -5076,6 +5129,119 @@ mod tests {
             Some(faber_mirror::Fill::Relaxed),
             "order does not matter"
         );
+    }
+
+    /// A settings save sends the config as JSON and writes what comes back:
+    /// a `[mirror.lfs]` without `[mirror]` must come back still refused, never
+    /// as an explicit `[mirror]` that turns the mirror on.
+    #[test]
+    fn an_implicit_mirror_survives_the_json_a_save_sends() {
+        let cfg = FileConfig::load_from_str("[mirror.lfs]\n", "test").unwrap();
+        let posted: FileConfig =
+            serde_json::from_value(serde_json::to_value(&cfg).unwrap()).unwrap();
+        assert!(posted.mirror.as_ref().unwrap().implicit);
+        assert!(posted.mirror_policy().is_none());
+        assert!(posted
+            .validate_structural()
+            .iter()
+            .any(|e| e.contains("need a [mirror] section")));
+        // An explicit one says nothing about it, so a file stays as it was.
+        let explicit = FileConfig::load_from_str("[mirror]\n[mirror.lfs]\n", "test").unwrap();
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert!(json["mirror"].get("implicit").is_none(), "{json}");
+        assert!(!explicit.to_toml().unwrap().contains("implicit"));
+        // The file's own text decides, whatever a key in it says.
+        let said = FileConfig::load_from_str("[mirror]\nimplicit = true\n", "test").unwrap();
+        assert!(said.mirror_policy().is_some());
+    }
+
+    /// The images faber hands to `docker` must be image references, refused
+    /// where a human is looking.
+    #[test]
+    fn profile_dind_and_probe_images_must_be_image_references() {
+        let base = |extra: &str| {
+            format!(
+                "[[profile]]\nname = \"d\"\nlabels = [\"faber\"]\nbackend = \"docker\"\n\
+                 dind = false\n{extra}\n"
+            )
+        };
+        let fine = FileConfig::load_from_str(
+            &base("image = \"ghcr.io/owner/my-runner:2\"\ndind_image = \"docker:27-dind\""),
+            "test",
+        )
+        .unwrap();
+        assert!(
+            !fine
+                .validate()
+                .iter()
+                .any(|e| e.contains("image reference")),
+            "{:?}",
+            fine.validate()
+        );
+        for (extra, field) in [
+            ("image = \"-v /:/host\"", "image"),
+            ("image = \"x\"\ndind_image = \"docker dind\"", "dind_image"),
+        ] {
+            let cfg = FileConfig::load_from_str(&base(extra), "test").unwrap();
+            assert!(
+                cfg.validate()
+                    .iter()
+                    .any(|e| e.contains(&format!("{field} "))
+                        && e.contains("not an image reference")),
+                "{extra}: {:?}",
+                cfg.validate()
+            );
+        }
+        let probe =
+            FileConfig::load_from_str("[autolimit]\nprobe_image = \"--privileged\"\n", "test")
+                .unwrap();
+        assert!(probe.validate().iter().any(
+            |e| e.starts_with("autolimit.probe_image") && e.contains("not an image reference")
+        ));
+    }
+
+    /// A service tells the job where it is; it may not change how the job's own
+    /// programs load, start or connect.
+    #[test]
+    fn a_service_may_not_export_loader_shell_or_proxy_variables() {
+        let t = |job_env: &str| {
+            FileConfig::load_from_str(
+                &format!(
+                    "[services.s3]\nimage = \"ghcr.io/owner/s3:1\"\nmemory_mib = 64\n\
+                     job_env = {{ {job_env} = \"x\" }}\n"
+                ),
+                "test",
+            )
+            .unwrap()
+            .validate()
+        };
+        for name in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "BASH_ENV",
+            "ENV",
+            "NODE_OPTIONS",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+        ] {
+            assert!(
+                t(name)
+                    .iter()
+                    .any(|e| e.contains(&format!("job_env {name} "))),
+                "{name}: {:?}",
+                t(name)
+            );
+        }
+        for name in ["S3_ENDPOINT", "ENVIRONMENT", "PROXY_URL"] {
+            assert!(
+                !t(name).iter().any(|e| e.contains("job_env")),
+                "{name}: {:?}",
+                t(name)
+            );
+        }
     }
 
     #[test]

@@ -662,6 +662,22 @@ mod tests {
         );
     }
 
+    /// `faber config set` edits the config through JSON: over a file whose
+    /// `[mirror.lfs]` has no `[mirror]`, the result is still refused as the file
+    /// is, rather than turning the mirror on.
+    #[test]
+    fn a_key_set_over_an_implicit_mirror_keeps_it_off() {
+        let old = FileConfig::load_from_str("[mirror.lfs]\n", "test").expect("parses");
+        let next = edit(&old, "poll_interval_secs", Some("30")).expect("edits");
+        assert!(next.mirror_policy().is_none());
+        assert!(crate::control::trust_widening(&old, &next).is_empty());
+        assert!(next
+            .validate_structural()
+            .iter()
+            .any(|e| e.contains("need a [mirror] section")));
+        assert!(apply_body(old).expect("serializes")["mirror"]["implicit"] == true);
+    }
+
     fn cfg() -> FileConfig {
         FileConfig {
             profiles: vec![FileProfile {
