@@ -27,3 +27,7 @@ export const NarrowingPending: Story = { args: { field: field('dind'), value: tr
 /** A long command wraps onto as many lines as it needs, never cut. */
 export const LongCommandWraps: Story = { args: { field: field('image'), value: 'ghcr.io/owner/demo-runner:2.329.0', profile: { name: 'a-profile-with-a-rather-long-name-for-wrapping' } } };
 export const Empty: Story = { args: { field: field('drop_grants'), value: [] } };
+/** A held section's field: its value, and no command, since validation refuses the section on. */
+export const Held: Story = { args: { field: fields.registryServer, value: 'ghcr.io', profile: undefined } };
+/** A held switch that is on: turning it off is still offered. */
+export const HeldNarrowingOffered: Story = { args: { field: fields.registryEnabled, value: true, profile: undefined } };

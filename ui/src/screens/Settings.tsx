@@ -505,7 +505,7 @@ export function Settings({ api: given = realApi, initial }: SettingsProps) {
               value={dig(draft, f.key)}
               loaded={dig(view.config, f.key)}
               defaults={view.defaults}
-              tagged={!f.sudo}
+              tagged={!f.sudo && !f.held}
               error={st.fieldErrors[f.key]}
               onChange={(v) => edit(f.key, v)}
             />

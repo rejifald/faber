@@ -39,10 +39,10 @@ export function asText(field: FieldSpec, v: unknown): string {
  * Reads one input back in the shape the config expects. `text` is what the input holds: a string,
  * a boolean for a required bool, and for a `ceiling` either `auto`, `off` or the number as text.
  * An empty optional field is null (unset); an empty required one falls back to faber's default.
- * A `sudo` field is never parsed back: it round-trips as loaded.
+ * A `sudo` or `held` field is never parsed back: it round-trips as loaded.
  */
 export function readValue(field: FieldSpec, text: string | boolean, loaded: unknown, defaults?: Config): unknown {
-  if (field.sudo) return loaded;
+  if (field.sudo || field.held) return loaded;
   const t = typeof text === 'string' ? text.trim() : text;
   switch (field.kind) {
     case 'bool':

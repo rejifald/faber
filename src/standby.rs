@@ -74,7 +74,6 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::docker::RegistryAuth;
 use crate::github::{Github, GithubError};
 use crate::platform::layout::{FABER_ACCOUNT, SETUP_RECORD};
 use crate::platform::{Layout, Resolution};
@@ -201,27 +200,6 @@ pub fn legacy_notice(layout: Layout, system_layout_exists: bool, user: &str) -> 
         kind: "legacy_layout".to_string(),
         text: format!("faber runs as {user}; run `sudo faber setup`"),
     })
-}
-
-/// The boot warning for `[registry_auth]` under SYSTEM.
-///
-/// The secret is read from the environment variable `password_env` names, and
-/// for a service that variable lives in the service definition. Under SYSTEM
-/// that is the LaunchDaemon plist or the systemd unit, which any account on the
-/// host can read. There is no safe home for the secret until ADR-0027's
-/// credential store. LEGACY is unchanged.
-pub fn registry_secret_warning(layout: Layout, auth: &RegistryAuth) -> Option<String> {
-    let var = auth.password_env.trim();
-    if layout != Layout::System || !auth.enabled || var.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "registry_auth reads its secret from ${var}, and under SYSTEM that variable would live \
-         in the service definition (the LaunchDaemon plist or the systemd unit), whose \
-         environment every account on this host can read. It has no safe home until \
-         ADR-0027's credential store: leave ${var} unset, and pulls use {FABER_ACCOUNT}'s own \
-         docker config, or stay anonymous."
-    ))
 }
 
 // --- what standby waits for -------------------------------------------------
@@ -1308,33 +1286,6 @@ mod tests {
         assert_eq!(legacy_notice(Layout::System, true, "owner"), None);
         // An OS with no SYSTEM layout has nowhere to move to.
         assert_eq!(legacy_notice(Layout::Legacy, false, "owner"), None);
-    }
-
-    #[test]
-    fn a_registry_secret_in_the_environment_warns_only_under_system() {
-        let enabled = RegistryAuth {
-            enabled: true,
-            username: "someone".into(),
-            ..RegistryAuth::default()
-        };
-        let warning = registry_secret_warning(Layout::System, &enabled).expect("warns");
-        assert!(warning.contains("$FABER_REGISTRY_PASSWORD"), "{warning}");
-        assert!(
-            warning.contains("every account on this host can read"),
-            "{warning}"
-        );
-        assert!(warning.contains("ADR-0027"), "{warning}");
-        assert_eq!(registry_secret_warning(Layout::Legacy, &enabled), None);
-        assert_eq!(
-            registry_secret_warning(Layout::System, &RegistryAuth::default()),
-            None,
-            "registry auth off reads no secret"
-        );
-        let unnamed = RegistryAuth {
-            password_env: "  ".into(),
-            ..enabled
-        };
-        assert_eq!(registry_secret_warning(Layout::System, &unnamed), None);
     }
 
     #[test]

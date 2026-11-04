@@ -285,7 +285,12 @@ is published. Consequences:
   ADR-0025's adversary; the owner chose refusal over a warning on existing hosts. The
   actor lists judging a pull request's author and a run's original actor ship with it.
   Both ship while hosts are updated by hand, and each refusal is recorded with its
-  reason. None is a precedent.
+  reason.
+  [ADR-0025](docs/adrs/0025-faber-runs-as-its-own-accounts.md#addendum-registry_auth-is-held)'s
+  addendum is a fourth: `[registry_auth] enabled = true` is refused by `validate()`, and a
+  daemon booting with it on warns, shows the `registry_auth_held` notice and pulls
+  anonymously, because a credential mounted into a job is readable by its code. The
+  section returns once faber pulls images on the job's behalf. None is a precedent.
 
 Drain before installing rather than letting the swap force-kill runners: a forced
 install has cost real jobs. Use `faber drain` (`POST /api/drain` on the control socket,

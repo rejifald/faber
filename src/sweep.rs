@@ -809,8 +809,9 @@ async fn sweep(orch: &Orchestrator) {
     let containers = candidates(&container_ps_args(), &legacy_container_ps_args()).await;
     let networks = candidates(&network_ls_args(), &legacy_network_ls_args()).await;
     let mut volumes = candidates(&volume_ls_args(), &legacy_volume_ls_args()).await;
-    // The registry-credential volumes (`docker::RegistryLogin`): labelled from
-    // their first moment, so there is no legacy listing to pair with. A separate
+    // The registry-credential volumes an earlier release made (none is made while
+    // `[registry_auth]` is held): labelled from their first moment, so there is
+    // no legacy listing to pair with. A separate
     // listing because repeated `label=` filters are ANDed (see
     // [`container_ps_args`]).
     volumes.extend(list(&credential_volume_ls_args()).await);
@@ -1180,9 +1181,10 @@ fn services_to_reap(
 /// dangling between jobs and would otherwise be reaped on the very next sweep.
 /// Anything added here must be a resource that dies with its job.
 ///
-/// [`KIND_REGISTRY_AUTH`] is here because it is per-job: the volume holding a
-/// runner's registry credential is removed after teardown, and one a crash left
-/// behind is reaped like the dind volume, once its claim is no longer in flight.
+/// [`KIND_REGISTRY_AUTH`] is here because it is per-job: the volume that held a
+/// runner's registry credential. None is made while `[registry_auth]` is held,
+/// but one an earlier release or a crash left behind is reaped like the dind
+/// volume, once its claim is no longer in flight.
 ///
 /// [`KIND_SERVICE`] is a per-job service container (ADR-0046 §3), torn down with
 /// its runner. [`crate::services::KIND_SERVICE_SERVER`] is deliberately absent:
@@ -1875,8 +1877,8 @@ mod tests {
 
     #[test]
     fn a_leftover_registry_credential_volume_is_reaped_and_a_live_one_kept() {
-        // The volume `docker::RegistryLogin` fills is removed after teardown; one a
-        // crash left behind has only the janitor. It is listed by its kind label
+        // No release makes this volume while `[registry_auth]` is held; one an
+        // earlier release or a crash left behind has only the janitor. It is listed by its kind label
         // and judged on its claim, like the dind volume.
         let args = credential_volume_ls_args();
         assert!(args.contains(&format!("label={LABEL_KIND}={KIND_REGISTRY_AUTH}")));

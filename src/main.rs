@@ -817,15 +817,15 @@ async fn cli() -> anyhow::Result<()> {
                     text,
                 });
             }
-            if let Some(problem) =
-                faber::docker::password_env_problem(&boot.registry_auth.password_env)
-            {
-                tracing::warn!("registry auth is DISABLED until this is fixed: {problem}");
-            }
-            if let Some(warning) =
-                faber::standby::registry_secret_warning(layout, &boot.registry_auth)
-            {
-                tracing::warn!("{warning}");
+            // `[registry_auth]` is held: validation refuses it on, and a daemon
+            // that boots with it on mounts nothing, so this warning and the
+            // banner are all it does. Warned, never refused (AGENTS.md).
+            if let Some(text) = faber::config::registry_auth_held_warning(&boot.registry_auth) {
+                tracing::warn!("{text}");
+                notices.push(faber::reconcile::Notice {
+                    kind: "registry_auth_held".to_string(),
+                    text,
+                });
             }
             // ADR-0028 (#238): warn, never refuse to boot. Each variant build
             // from this recipe is refused until it is moved under root.

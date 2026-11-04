@@ -349,6 +349,12 @@ Two layers keep untrusted work off your machine:
   dashboard is reachable from your Mac only.
 - **Its GitHub access is narrow.** faber's GitHub token reaches only the repos you
   picked, with only the permissions your features need.
+- **No credential of faber's reaches a job**, except the runner's own one-time
+  registration. Registry logins for the images a job pulls (`[registry_auth]`) are on
+  hold: a credential mounted into a job can be read by the job's code, so faber mounts
+  none and those pulls stay anonymous. The section returns when faber pulls images for
+  the job. Until then `faber check-config` refuses `enabled = true`, and a Mac that
+  still has it on warns at start and ignores it.
 
 ### The limits
 

@@ -55,7 +55,7 @@ How many stories show each entry. Counted per story file.
 | BudgetRail | Blocks | 4 |
 | ClassDetail | Blocks | 8 |
 | CodeBlock | Blocks | 2 |
-| Command | Blocks | 5 |
+| Command | Blocks | 7 |
 | CompactGroup | Blocks | 5 |
 | ConfirmRow | Blocks | 1 |
 | ControlTile | Blocks | 10 |
@@ -90,7 +90,7 @@ How many stories show each entry. Counted per story file.
 | SectionHeader | Blocks | 3 |
 | SettingsNav | Blocks | 6 |
 | StatTile | Blocks | 7 |
-| TrustRow | Blocks | 5 |
+| TrustRow | Blocks | 7 |
 | UpdateCard | Blocks | 5 |
 | ViewHeader | Blocks | 4 |
 | VmRow | Blocks | 10 |
@@ -850,7 +850,7 @@ A command in a code element that wraps onto as many lines as it needs, breaking 
 - **Use when:** a sudo command beside a setting the form may not change. For any other code use plain text.
 - **States:** default, long (wraps)
 - **Source:** `src/blocks/TrustRow.tsx`
-- **Stories:** 5
+- **Stories:** 7
 
 | Prop | Type | Description |
 | --- | --- | --- |
@@ -1004,7 +1004,7 @@ The term and value lines under an open popover row: the term muted on the left, 
 
 ### FieldRow
 
-One field of the Settings form: its label and hint, a `live` or `restart` tag (or `changed`), and the control its kind calls for. A list goes to ListField, a map to MapField, and a `sudo` field that may not narrow in place to TrustRow. A changed field draws its control with the accent border; an invalid one shows its message under the control.
+One field of the Settings form: its label and hint, a `live` or `restart` tag (or `changed`), and the control its kind calls for. A list goes to ListField, a map to MapField, and a `sudo` or `held` field that may not narrow in place to TrustRow. A changed field draws its control with the accent border; an invalid one shows its message under the control.
 
 - **Use when:** every field of a SectionSpec or a profile, rendered from its FieldSpec. Never one hard-coded per key.
 - **States:** default, changed, invalid, live, restart
@@ -1407,16 +1407,16 @@ One number that answers one question, with its trend and a one-line reading.
 
 ### TrustRow
 
-A `sudo` field the form may not edit freely: its value, the one-click narrowing when it would narrow, and otherwise the command that changes it, to copy. The command wraps, never truncates.
+A `sudo` or `held` field the form may not edit freely: its value, the one-click narrowing when it would narrow, and otherwise the command that changes it, to copy (none for a held field, whose section validation refuses on). The command wraps, never truncates.
 
-- **Use when:** a `sudo` scalar, or a list or map without `narrows`, inside a FieldRow. For a trust list the form may narrow in place, use ListField or MapField.
-- **States:** at rest, narrowing offered, narrowing pending, command copied
+- **Use when:** a `sudo` or `held` scalar, or a list or map without `narrows`, inside a FieldRow. For a trust list the form may narrow in place, use ListField or MapField.
+- **States:** at rest, narrowing offered, narrowing pending, command copied, held (no command)
 - **Source:** `src/blocks/TrustRow.tsx`
-- **Stories:** 5
+- **Stories:** 7
 
 | Prop | Type | Description |
 | --- | --- | --- |
-| `field` | `FieldSpec` | The `sudo` field. |
+| `field` | `FieldSpec` | The `sudo` or `held` field. |
 | `value` | `unknown` | The value as saved. |
 | `profile?` | `{ name: string } \| null` | The profile the field belongs to; its name fills `<profile>` in the command. |
 | `pending?` | `unknown` | The narrowed value, unsaved; shows the change with its Undo. `null` is a value, `undefined` is none. |

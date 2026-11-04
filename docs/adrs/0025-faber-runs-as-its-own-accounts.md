@@ -230,3 +230,19 @@ faber is signed; it does not replace the account split.
 **A visible job account with auto-login.** It would be needed for as long as
 Docker Desktop is the runtime, because Docker Desktop is a GUI application. It
 was rejected along with Docker Desktop itself (ADR-0026).
+
+## Addendum: `[registry_auth]` is held
+
+The invariant here is that only the JIT config reaches job code. A registry
+credential mounted into a job's container is readable by that job's code, so the
+`[registry_auth]` section is held until faber pulls images on the job's behalf.
+
+- `enabled = true` is refused by `validate()`, where a human is looking
+  (`faber check-config`, the settings save). It is a policy check, not
+  `validate_structural`, so the updater's gate does not hold a release back over it.
+- A daemon that boots with it on still runs: it warns, shows the
+  `registry_auth_held` notice, mounts no credential and pulls anonymously.
+- The section returns once faber pulls images on the job's behalf.
+
+This withdraws a capability a host could have relied on. It is a deliberate
+exception to AGENTS.md's rule against withdrawing one, recorded there.

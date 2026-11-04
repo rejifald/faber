@@ -36,6 +36,11 @@ test('dig and plant walk dotted keys', () => {
   assert.equal(draft.dig(o, 'a.x.c'), undefined);
 });
 
+test('readValue: a held field round-trips as loaded', () => {
+  assert.equal(draft.readValue(f('bool', { held: true }), false, true), true);
+  assert.equal(draft.readValue(f('text', { held: true }), 'changed', 'kept'), 'kept');
+});
+
 test('readValue: a sudo field round-trips as loaded', () => {
   assert.deepEqual(draft.readValue(f('lines', { sudo: 'sudo x' }), 'changed', ['kept']), ['kept']);
 });

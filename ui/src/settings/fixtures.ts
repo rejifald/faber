@@ -78,10 +78,10 @@ export const fields = {
   retryLookback: f('retry.lookback_secs', 'Lookback', 'int', { unit: 's', min: 60 }),
   vmCpus: f('linux_vm.cpus', 'Linux VM vCPUs', 'int', { optional: true, min: 1, hint: 'Blank = 4' }),
   vmMemory: f('linux_vm.memory_mib', 'Linux VM memory', 'int', { optional: true, unit: 'MiB', min: 1024, hint: 'Blank = 8192' }),
-  registryEnabled: f('registry_auth.enabled', 'Enabled', 'bool'),
-  registryServer: f('registry_auth.server', 'Server', 'text', { hint: 'The registry as keyed in a docker config.json.' }),
-  registryUser: f('registry_auth.username', 'Username', 'text', { optional: true, hint: 'Blank = take the credential from the docker config.json.' }),
-  registryPassword: f('registry_auth.password_env', 'Password variable', 'text', { optional: true, hint: 'The environment variable that holds the secret.' }),
+  registryEnabled: f('registry_auth.enabled', 'Enabled', 'bool', { held: true, narrow: { label: 'Turn off', value: 'false' }, hint: "Held: a credential mounted into a job can be read by the job's code." }),
+  registryServer: f('registry_auth.server', 'Server', 'text', { held: true, hint: 'The registry as keyed in a docker config.json.' }),
+  registryUser: f('registry_auth.username', 'Username', 'text', { held: true, optional: true }),
+  registryPassword: f('registry_auth.password_env', 'Password variable', 'text', { held: true, hint: 'Name of the environment variable that would hold the secret; must start with FABER_REGISTRY_.' }),
   checkInterval: f('update.poll_interval_secs', 'Check interval', 'int', { unit: 's', min: 60, live: true }),
 };
 
@@ -103,7 +103,7 @@ const sections: SectionSpec[] = [
   { title: 'Docker host', hint: "faber is the Docker manager on this box.", fields: [fields.reviveDocker, fields.diskFloor, fields.pullUnqualified] },
   { title: 'Linux VM', hint: 'On a set-up macOS host faber’s Docker runs in a Linux VM of its own. Applies on restart.', fields: [fields.vmCpus, fields.vmMemory] },
   { title: 'Updates', hint: 'Off by default.', fields: [fields.updatesEnabled, fields.checkInterval] },
-  { title: 'Registry auth', hint: 'Credentials for the images a job pulls. The secret lives in an environment variable, never in this file.', fields: [fields.registryEnabled, fields.registryServer, fields.registryUser, fields.registryPassword] },
+  { title: 'Registry auth', hint: "Held. Credentials for the images a job pulls would be readable by the job's code, so faber mounts none.", fields: [fields.registryEnabled, fields.registryServer, fields.registryUser, fields.registryPassword] },
 ];
 
 export const profileFields: FieldSpec[] = [

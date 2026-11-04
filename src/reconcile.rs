@@ -1720,7 +1720,7 @@ pub struct StateView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Notice {
     /// What it is about, stable across releases: `legacy_layout`,
-    /// `recipe_untrusted`. (`native_ignored` is gone since ADR-0052 made a
+    /// `recipe_untrusted`, `registry_auth_held`. (`native_ignored` is gone since ADR-0052 made a
     /// native profile a config error.)
     pub kind: String,
     /// The sentence to show, written by faber.

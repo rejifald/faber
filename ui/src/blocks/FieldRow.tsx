@@ -99,7 +99,7 @@ function Ceiling({ field, value, onChange }: Pick<FieldRowProps, 'field' | 'valu
 
 function control(p: FieldRowProps): ReactNode {
   const { field, value, loaded, defaults, onChange, profile } = p;
-  if (field.sudo && !field.narrows) {
+  if ((field.sudo || field.held) && !field.narrows) {
     const changed = !same(value, loaded);
     return (
       <TrustRow
@@ -141,8 +141,8 @@ function control(p: FieldRowProps): ReactNode {
 
 /**
  * One field of the Settings form: its label and hint, a `live` or `restart` tag (or `changed`), and
- * the control its kind calls for. A list goes to ListField, a map to MapField, and a `sudo` field
- * that may not narrow in place to TrustRow. A changed field draws its control with the accent
+ * the control its kind calls for. A list goes to ListField, a map to MapField, and a `sudo` or
+ * `held` field that may not narrow in place to TrustRow. A changed field draws its control with the accent
  * border; an invalid one shows its message under the control.
  *
  * @useWhen every field of a SectionSpec or a profile, rendered from its FieldSpec. Never one
@@ -153,10 +153,10 @@ export function FieldRow(props: FieldRowProps) {
   const { field, value, loaded, error, layout = 'inline', tagged = true } = props;
   const id = useId();
   const changed = !same(value, loaded);
-  const wide = field.kind === 'csv' || field.kind === 'lines' || field.kind === 'map' || (field.sudo !== undefined && !field.narrows);
+  const wide = field.kind === 'csv' || field.kind === 'lines' || field.kind === 'map' || ((field.sudo !== undefined || field.held === true) && !field.narrows);
   const scalar = !wide;
-  // A `sudo` field draws no tag: its pending row (Removed, Unsaved) already says it changed (Trust.png).
-  const tag = field.sudo ? null : changed ? (
+  // A `sudo` or held field draws no tag: its pending row (Removed, Unsaved) already says it changed (Trust.png).
+  const tag = field.sudo || field.held ? null : changed ? (
     <span className="text-caption text-accent-text">changed</span>
   ) : tagged ? (
     <span className={`text-caption ${field.live ? 'text-green' : 'text-amber'}`}>{field.live ? 'live' : 'restart'}</span>

@@ -475,13 +475,15 @@ takes `scripts/*.test.mjs`):
   after it; `bool` → `Switch`, or `Select` of the three labels when `optional`; `enum` →
   `Select` (with the blank unstated choice when `optional`); `ceiling` → `Select` Auto / Off /
   Number plus an `Input` when Number; `csv`/`lines` → `ListField`; `map` → `MapField`; a `sudo`
-  field without `narrows` → `TrustRow`.
+  or `held` field without `narrows` → `TrustRow`.
 - **Tests:** stories per kind and per state (default, changed, invalid, live, restart).
 
 ### TrustRow (block)
 
 - **What:** a `sudo` scalar or a list the form may not edit: its value, the command that changes
-  it, and the narrowing button when `narrowShown`.
+  it, and the narrowing button when `narrowShown`. A `held` field (`FieldSpec.held`: Registry
+  auth, whose section is held and refused on by validation) shows the same row with no command,
+  since none would be accepted; its narrowing (Turn off) still shows.
 - **Fidelity:** as drawn in `Profiles.png` (b) and `Trust.png` (Service public repos, On a gate
   bypass).
 - **Props:** `field`, `value`, `profile?`, `pending?` (the narrowed value, unsaved), `onNarrow`,
