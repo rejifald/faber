@@ -486,6 +486,8 @@ const AUTOLIMIT_FIELDS: &[FieldSpec] = &[
         ..f("autolimit.window", "Learning window", "int")
     },
     FieldSpec {
+        // faber runs it on the engine that holds every job.
+        sudo: Some("sudo faber config set autolimit.probe_image <image>"),
         hint: Some("Tiny image used for the live memory probe."),
         ..f("autolimit.probe_image", "Probe image", "text")
     },
@@ -673,6 +675,9 @@ const HOST_FIELDS: &[FieldSpec] = &[
         ..f("host.instance", "Instance name", "text")
     },
     FieldSpec {
+        // No -> yes or unstated widens and the daemon refuses it without
+        // sudo, but the field stays editable: a `sudo` field round-trips as
+        // loaded, and this one must state itself on the first save (#156).
         optional: true,
         unstated_saves: Some(1.0),
         options: &["not stated — pulls them, warned", "yes", "no"],
@@ -910,12 +915,15 @@ const PROFILE_FIELDS: &[FieldSpec] = &[
         ..f("labels", "Labels", "csv")
     },
     FieldSpec {
+        // Moving a profile to or from Docker changes what its image means.
+        sudo: Some("sudo faber config set profile.<profile>.backend <backend>"),
         options: &["docker", "macos-vm"],
         ..f("backend", "Backend", "enum")
     },
     FieldSpec {
-        // Widens only on a profile with Docker access (#220); read-only on
-        // every profile, as `labels` is.
+        // Widens on every docker profile (#220): the job, its secrets and a
+        // git-mirror refresh run in it. Read-only on every profile, as `labels`
+        // is.
         sudo: Some("sudo faber config set profile.<profile>.image <image>"),
         optional: true,
         hint: Some(
@@ -964,6 +972,9 @@ const PROFILE_FIELDS: &[FieldSpec] = &[
         ..f("cache_volume", "Cache volume", "bool")
     },
     FieldSpec {
+        // Turning it on widens: the refresh runs with faber's own credential.
+        sudo: Some("sudo faber config set profile.<profile>.git_mirror true"),
+        narrow: narrow("Turn off", "false"),
         hint: Some(
             "Docker only. Keep a git mirror of each watched repo that only faber writes, mounted \
              read-only into jobs. The workflow needs one step and `clean: false` (ADR-0035).",
@@ -971,6 +982,8 @@ const PROFILE_FIELDS: &[FieldSpec] = &[
         ..f("git_mirror", "Git mirror", "bool")
     },
     FieldSpec {
+        sudo: Some("sudo faber config set profile.<profile>.mirror true"),
+        narrow: narrow("Turn off", "false"),
         hint: Some(
             "Docker only. Point jobs at the pull-through mirror while it is healthy: it joins \
              the job's network as faber-mirror and the job gets $FABER_MIRROR. Needs a [mirror] \

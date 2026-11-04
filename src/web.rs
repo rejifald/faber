@@ -1850,11 +1850,9 @@ mod tests {
     fn test_web() -> (Web, crate::reconcile::tests::TempDir) {
         let (orch, tmp) = crate::reconcile::tests::test_orch();
         let config_path = tmp.path.join("config.toml");
-        let settings = Arc::new(SettingsStore::new(
-            config_path.clone(),
-            FileConfig::default(),
-            false,
-        ));
+        // Booted on a host's first profile, so a test's first save of
+        // [`valid`] is routine: a new Docker profile is a widening of its own.
+        let settings = Arc::new(SettingsStore::new(config_path.clone(), valid(), false));
         let (_updater, update) = crate::update::Updater::new(
             Arc::new(crate::github::Github::new("test-token".to_string()).unwrap()),
             orch.clone(),
@@ -3049,6 +3047,42 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         w.settings = Arc::new(SettingsStore::new(path.clone(), valid(), true));
         (w, tmp, path)
+    }
+
+    /// A form save over a file whose `[mirror.lfs]` has no `[mirror]` never
+    /// turns the mirror on: sent back as the form got it, it is refused as the
+    /// file is; with the mark dropped, it is a widening the operator is refused.
+    /// Nothing is written either way.
+    #[tokio::test]
+    async fn a_form_save_never_turns_an_implicit_mirror_on() {
+        let text = format!("{}\n[mirror.lfs]\n", text_of(&valid()));
+        let (w, _tmp, path) = raw_web(&text);
+        let mut next: FileConfig =
+            serde_json::from_value(serde_json::to_value(w.settings.current().config).unwrap())
+                .unwrap();
+        next.poll_interval_secs += 1;
+        let (status, Json(r)) = save_settings(
+            State(w.clone()),
+            Some(Extension(operator())),
+            Json(next.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{:?}", r.errors);
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| e.contains("need a [mirror] section")));
+
+        next.mirror.as_mut().unwrap().implicit = false;
+        let (status, Json(r)) =
+            save_settings(State(w.clone()), Some(Extension(operator())), Json(next)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(r.refused[0].key, "mirror");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "nothing written"
+        );
     }
 
     async fn raw_get(w: &Web) -> (StatusCode, serde_json::Value) {
