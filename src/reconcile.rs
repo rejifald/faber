@@ -379,6 +379,9 @@ pub struct Config {
     /// The per-host VM layout (`[linux_vm]`, `[macos_vm]`, ADR-0051). The
     /// default is the layout before the keys existed.
     pub vm_layout: crate::config::VmLayout,
+    /// How long faber searches for the job a runner took, and how long the
+    /// runner's hook waits for the verdict (ADR-0059 §2). From `[gate]`.
+    pub job_start: crate::config::JobStartDeadlines,
 }
 
 impl Config {
@@ -13894,6 +13897,7 @@ pub(crate) mod tests {
                 services: Default::default(),
                 mirror: None,
                 vm_layout: Default::default(),
+                job_start: Default::default(),
                 waste,
             },
             owner: "owner".to_string(),

@@ -678,6 +678,7 @@ async fn cli() -> anyhow::Result<()> {
                     let services = fc.services_policy();
                     let mirror = fc.mirror_policy();
                     let vm_layout = fc.vm_layout();
+                    let job_start = fc.gate.job_start_deadlines(fc.poll_interval_secs);
                     (
                         faber::reconcile::Config {
                             topic: fc.topic,
@@ -697,6 +698,7 @@ async fn cli() -> anyhow::Result<()> {
                             services,
                             mirror,
                             vm_layout,
+                            job_start,
                         },
                         sweep_secs,
                         boot,
@@ -748,6 +750,10 @@ async fn cli() -> anyhow::Result<()> {
                             mirror: None,
                             // No config file: today's VM layout.
                             vm_layout: Default::default(),
+                            // No config file: the default job-start deadlines,
+                            // raised to outlast this poll interval.
+                            job_start: faber::config::GatePolicy::default()
+                                .job_start_deadlines(interval),
                         },
                         faber::config::DEFAULT_SWEEP_SECS,
                         boot,
