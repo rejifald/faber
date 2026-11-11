@@ -333,7 +333,28 @@ run. faber registers a single-use runner with GitHub and starts the image with t
 registration in `RUNNER_JITCONFIG`. The entrypoint must hand it to the runner's `run.sh`
 through the environment, as `ACTIONS_RUNNER_INPUT_JITCONFIG`, and never as a
 `--jitconfig` argument: `ps` and `/proc` show a process's arguments to every account on
-a Linux host.
+a Linux host. That keeps it off the argv, and no more: the container's first process
+keeps it in its environment, where a job step can read it. By then it is spent, and
+nothing in faber treats it as a secret from the job.
+
+Every runner also waits, when a job starts, for faber's verdict on the job GitHub gave
+it ([ADR-0059](adrs/0059-the-gate-runs-again-when-a-job-starts.md)). faber mounts a
+job-started hook read-only and points `ACTIONS_RUNNER_HOOK_JOB_STARTED` at it, so the
+image must also:
+
+- run the GitHub Actions runner itself, which honours `ACTIONS_RUNNER_HOOK_JOB_STARTED`
+  and runs a `.js` hook on the Node it bundles. The hook needs nothing else from the
+  image, not even a shell.
+- have no `.env` file in the runner's directory that names
+  `ACTIONS_RUNNER_HOOK_JOB_STARTED`. The runner applies its `.env` over its
+  environment, so such an entry would replace faber's hook.
+- have `sh` and `wc`, which faber uses once per job, in a short-lived container of the
+  same image, to write the hook into its volume and check it is all there.
+
+A runner that ignores the hook runs jobs unguarded until faber notices: faber records a
+*hook fault* for a job it never saw a hook waiting for, and stops it under `enforce`.
+A profile's `env` cannot name `RUNNER_JITCONFIG` or `ACTIONS_RUNNER_HOOK_JOB_STARTED`:
+`faber check-config` refuses it, and a daemon booting with one leaves it out.
 
 The image in [`docker/runner`](../docker/runner) does exactly this. It is a starting
 point: add what your jobs need (a JDK, a browser set, Python) to its Dockerfile and
