@@ -36,6 +36,7 @@ pub mod github;
 pub mod host;
 pub mod image;
 pub mod instance;
+pub mod job_start;
 pub mod jobs_view;
 pub mod limiter;
 pub mod lock;
