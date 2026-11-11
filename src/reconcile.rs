@@ -379,6 +379,9 @@ pub struct Config {
     /// The per-host VM layout (`[linux_vm]`, `[macos_vm]`, ADR-0051). The
     /// default is the layout before the keys existed.
     pub vm_layout: crate::config::VmLayout,
+    /// How long faber searches for the job a runner took, and how long the
+    /// runner's hook waits for the verdict (ADR-0059 §2). From `[gate]`.
+    pub job_start: crate::config::JobStartDeadlines,
 }
 
 impl Config {
@@ -813,6 +816,22 @@ struct Metrics {
     /// Kept out of auto-retry; seeded from the audit log, bounded by
     /// [`BYPASS_WINDOW`].
     killed: HashMap<u64, u64>,
+    /// Jobs refused when they started (ADR-0059 §6) → when. Not bypasses, and
+    /// never auto-retried; seeded from the audit log, bounded by
+    /// [`BYPASS_WINDOW`].
+    refused_at_start: HashMap<u64, u64>,
+    /// Recent refusals at job start, newest last. Bounded by
+    /// [`BYPASS_RECENT_CAP`].
+    recent_refused_at_start: VecDeque<JobStartView>,
+    /// Every refusal at job start of the last week, `(when, repo)`, found job
+    /// or not: the per-repository count the dashboard and the boot warning
+    /// show (ADR-0059 §4). Seeded from the audit log.
+    refusals_at_start: VecDeque<(u64, String)>,
+    /// When each hook fault of the last week was recorded (ADR-0059 §2):
+    /// the source of the 7-day count. Seeded from the audit log.
+    hook_faults: VecDeque<u64>,
+    /// Recent hook faults, newest last. Bounded by [`BYPASS_RECENT_CAP`].
+    recent_hook_faults: VecDeque<JobStartView>,
 }
 
 /// The provision-throttle verdict for one job this cycle (bug-002).
@@ -1198,6 +1217,36 @@ impl Metrics {
         true
     }
 
+    /// Remember that `job_id` was refused when it started, at `now`
+    /// (ADR-0059 §6).
+    fn note_refused_at_start(&mut self, job_id: u64, now: u64) {
+        let window = BYPASS_WINDOW.as_millis() as u64;
+        self.refused_at_start
+            .retain(|_, ts| now.saturating_sub(*ts) <= window);
+        self.refused_at_start.insert(job_id, now);
+    }
+
+    /// Refusals at job start within [`BYPASS_WINDOW`] of `now`, per repository.
+    fn refusals_at_start_since(&self, now: u64) -> BTreeMap<String, usize> {
+        let window = BYPASS_WINDOW.as_millis() as u64;
+        let mut out = BTreeMap::new();
+        for (ts, repo) in &self.refusals_at_start {
+            if now.saturating_sub(*ts) <= window {
+                *out.entry(repo.clone()).or_insert(0) += 1;
+            }
+        }
+        out
+    }
+
+    /// Hook faults recorded within [`BYPASS_WINDOW`] of `now`.
+    fn hook_faults_since(&self, now: u64) -> usize {
+        let window = BYPASS_WINDOW.as_millis() as u64;
+        self.hook_faults
+            .iter()
+            .filter(|ts| now.saturating_sub(**ts) <= window)
+            .count()
+    }
+
     /// Remember that `job_id`'s runner was force-killed at `now`.
     fn note_killed(&mut self, job_id: u64, now: u64) {
         let window = BYPASS_WINDOW.as_millis() as u64;
@@ -1571,6 +1620,25 @@ pub struct BypassView {
     pub verdict: String,
 }
 
+/// A job the gate stopped when it started, or a hook fault (ADR-0059): the
+/// job, the runner it was handed, and the job that runner was minted for.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobStartView {
+    pub ts_ms: u64,
+    pub repo: String,
+    /// The run and job, when faber found them (0 when it did not).
+    pub run_id: u64,
+    pub job_id: u64,
+    pub job_name: String,
+    pub workflow: String,
+    pub runner: String,
+    pub minted_for: u64,
+    /// The reason word the hook printed, or what the fault was.
+    pub reason: String,
+    /// The gate's verdict label, when faber judged the job.
+    pub verdict: String,
+}
+
 /// A runner this host minted, remembered so bypass detection can tell its own
 /// runners from a peer's (ADR-0030). A peer's `faber-*` runner is the peer's to
 /// judge: by name it is indistinguishable, so only this record says "ours".
@@ -1631,6 +1699,16 @@ pub struct StateView {
     /// Trust-class bypasses in the last 7 days. With `gate.on_bypass` at `record`
     /// a non-zero count is the dashboard's "enforcement off" line.
     pub trust_bypasses_7d: usize,
+    /// Recent jobs refused when they started, newest first (ADR-0059 §6): not
+    /// bypasses, and recorded per repository.
+    pub refused_at_start: Vec<JobStartView>,
+    /// Recent hook faults, newest first (ADR-0059 §2): a job in progress with
+    /// no waiting hook.
+    pub hook_faults: Vec<JobStartView>,
+    /// Hook faults in the last 7 days.
+    pub hook_faults_7d: usize,
+    /// Jobs refused at start in the last 7 days, per repository (ADR-0059 §4).
+    pub refused_at_start_7d: BTreeMap<String, usize>,
     /// Repos whose minting is held (ADR-0030), each with its reason, who set it
     /// and since when. Cleared only by the operator.
     pub repo_holds: Vec<RepoHold>,
@@ -1826,6 +1904,18 @@ pub struct Orchestrator {
     /// Repos whose cache volume an enforced trust bypass condemned, still to be
     /// deleted once nothing mounts it (ADR-0030).
     cache_purges: std::sync::Mutex<BTreeSet<String>>,
+    /// Enforced trust bypasses whose runner faber failed to kill, by runner name,
+    /// tried again every cycle until the runner is gone (ADR-0059 §4). A runner
+    /// whose kill failed is still executing a job the gate refuses.
+    kill_retries: std::sync::Mutex<BTreeMap<String, BypassView>>,
+    /// The runners whose job faber judges when it starts (ADR-0059 §2), by
+    /// the name each registered with GitHub. Written at mint and adoption; a
+    /// watch leaves once its container is gone or its job was allowed.
+    job_starts: std::sync::Mutex<HashMap<String, crate::job_start::Watch>>,
+    /// Runners faber stopped at job start, or over a hook fault → when. What
+    /// ran on them taught the learner nothing (ADR-0059 §6). Bounded by
+    /// [`EXECUTED_TTL`].
+    stopped_runners: std::sync::Mutex<HashMap<String, u64>>,
     /// Which Docker profiles' own images are confirmed missing from this host
     /// (#63). Refreshed once a cycle by [`reconcile_profile_images`]; read by every
     /// claim about to mint, so the check costs one inspect per profile per cycle
@@ -2044,6 +2134,28 @@ impl Orchestrator {
         for (job_id, ts) in replayed_kills(&week) {
             metrics.killed.insert(job_id, ts);
         }
+        // ADR-0059: refusals at job start stay out of bypass detection and
+        // auto-retry across a restart, and hook faults stay counted and loud.
+        for e in week
+            .iter()
+            .filter(|e| e.kind == "fault" && e.result.as_deref() == Some("refused_at_start"))
+        {
+            if e.job_id != 0 {
+                metrics.refused_at_start.insert(e.job_id, e.ts_ms);
+            }
+            metrics
+                .refusals_at_start
+                .push_back((e.ts_ms, e.repo.clone()));
+        }
+        if let Some(msg) = refused_at_start_note(&metrics.refusals_at_start_since(now_ms())) {
+            warn!("{msg}");
+        }
+        for (_, ts) in replayed_scope(&week, "hook_fault") {
+            metrics.hook_faults.push_back(ts);
+        }
+        if let Some(msg) = hook_fault_warning(metrics.hook_faults_since(now_ms())) {
+            warn!("{msg}");
+        }
         metrics.restore_open_faults(&week);
         let on_bypass = cfg
             .profiles
@@ -2101,6 +2213,9 @@ impl Orchestrator {
             minted: std::sync::Mutex::new(HashMap::new()),
             repo_holds: std::sync::Mutex::new(repo_holds),
             cache_purges: std::sync::Mutex::new(cache_purges),
+            kill_retries: std::sync::Mutex::new(BTreeMap::new()),
+            job_starts: std::sync::Mutex::new(HashMap::new()),
+            stopped_runners: std::sync::Mutex::new(HashMap::new()),
             profile_images: std::sync::Mutex::new(ProfileImages::default()),
             retirements: std::sync::Mutex::new(Retirements::default()),
             verdicts_running: Arc::new(AtomicBool::new(false)),
@@ -2550,6 +2665,18 @@ impl Orchestrator {
             // this host — a kill of its containers, a hold on minting, a cache
             // deletion — and none of them writes to GitHub.
             self.note_minted(&a.registration(), a.job_id, profile_idx);
+            // ADR-0059 §2: a runner adopted after a restart gets its verdict. One
+            // started before the hook existed has none, and is left to detection.
+            if let Some(outcome) = a.hook {
+                self.watch_job_start(crate::job_start::Watch::new(
+                    &a.repo,
+                    &a.registration(),
+                    a.job_id,
+                    a.run_id,
+                    profile_idx,
+                    outcome,
+                ));
+            }
             spawn(self.clone(), a, minted, profile_idx, guard);
             adopted += 1;
         }
@@ -3451,6 +3578,15 @@ impl Orchestrator {
             dind_label_rule: self.cfg.host.dind_label_rule().as_str(),
             bypasses: metrics.recent_bypasses.iter().rev().cloned().collect(),
             trust_bypasses_7d: metrics.trust_bypasses_since(now),
+            refused_at_start: metrics
+                .recent_refused_at_start
+                .iter()
+                .rev()
+                .cloned()
+                .collect(),
+            hook_faults: metrics.recent_hook_faults.iter().rev().cloned().collect(),
+            hook_faults_7d: metrics.hook_faults_since(now),
+            refused_at_start_7d: metrics.refusals_at_start_since(now),
             repo_holds: self.repo_holds(),
             recent: metrics.recent.iter().rev().cloned().collect(),
             outcomes: metrics.recent_outcomes.iter().rev().cloned().collect(),
@@ -4559,6 +4695,11 @@ pub async fn run_loop(orch: Arc<Orchestrator>, once: bool) -> anyhow::Result<()>
         "faber watching"
     );
     orch.record_boundary().await;
+    // ADR-0059 §2: judge each runner's job when it starts, on its own cadence,
+    // so a job start waits seconds for its verdict rather than a poll interval.
+    if !once {
+        tokio::spawn(job_start_loop(orch.clone()));
+    }
     loop {
         let result = reconcile_once(&orch).await;
         orch.record_cycle_health(&result).await;
@@ -4580,6 +4721,27 @@ pub async fn run_loop(orch: Arc<Orchestrator>, once: bool) -> anyhow::Result<()>
             _ = tokio::time::sleep(orch.cfg.poll_interval) => {}
             _ = orch.wake.notified() => info!("manual reconcile triggered"),
         }
+    }
+}
+
+/// How often the job-start check looks at each runner it watches (ADR-0059 §2).
+const JOB_START_TICK: Duration = Duration::from_secs(2);
+
+/// The job-start check's loop (ADR-0059 §2): a pass over the watched runners
+/// every [`JOB_START_TICK`], for the life of the daemon. A no-op while no runner
+/// is watched; no runner is on a host with no Docker profile.
+async fn job_start_loop(orch: Arc<Orchestrator>) {
+    loop {
+        orch.job_start_pass().await;
+        {
+            let now = now_ms();
+            let ttl = EXECUTED_TTL.as_millis() as u64;
+            orch.stopped_runners
+                .lock()
+                .unwrap()
+                .retain(|_, ts| now.saturating_sub(*ts) <= ttl);
+        }
+        tokio::time::sleep(JOB_START_TICK).await;
     }
 }
 
@@ -4658,6 +4820,9 @@ async fn reconcile_once(orch: &Arc<Orchestrator>) -> Result<Vec<JoinHandle<()>>,
     // Reconcile the claim set against GitHub: release parked claims whose job has
     // finished, and reclaim admitted runners that have gone idle (see issue #1).
     reconcile_claims(orch, &live).await;
+    // Kill again the bypassed runners whose kill failed (ADR-0059 §4). A no-op
+    // unless one did.
+    orch.retry_bypass_kills().await;
     // Delete the cache volumes enforced trust bypasses condemned, once nothing
     // mounts them (ADR-0030). A no-op unless one did.
     purge_bypassed_caches(orch).await;
@@ -4963,6 +5128,10 @@ struct ProvisionIntent {
     /// Without this the runner would carry only its profile's labels and a job
     /// asking for a need could never land on it.
     job_labels: Vec<String>,
+    /// Whether the run's repository is private, as the run payload said: what
+    /// the runner's hook does at its deadline with no verdict is decided from
+    /// it, at mint (ADR-0059 §1).
+    private: bool,
 }
 
 // --- demand-based provisioning (ADR-0004) ------------------------------------
@@ -5479,6 +5648,7 @@ async fn process_run_jobs(
                 pr: run.pull_number(),
                 run_created_at: run.created_at.clone(),
                 attempt,
+                private: run.repository.private,
             });
         }
     }
@@ -5805,7 +5975,8 @@ fn spawn_adopted(
             .label_for(&a.class)
             .unwrap_or_else(|| job_label(&a.repo, None, a.class.rsplit("::").next().unwrap_or("")));
         let mut class = None;
-        if !report.timed_out && !report.reclaimed && !report.infra_error {
+        let stopped = orch.was_stopped_at_start(&a.registration());
+        if !report.timed_out && !report.reclaimed && !report.infra_error && !stopped {
             // Peaks stripped, OOM kept: `sample_for` then yields a censored sample
             // for an OOM and nothing at all otherwise, which is exactly "may widen,
             // never narrow" without the learner needing to know about adoption.
@@ -5884,6 +6055,7 @@ fn spawn_provision(
             pr,
             run_created_at,
             attempt,
+            private,
         } = intent;
         // Take our cancel receiver, admitted flag and shared cells from the claim
         // the reconcile cycle inserted. Absent ⇒ the claim was reconciled away
@@ -6360,6 +6532,15 @@ fn spawn_provision(
             // within one step rather than after the whole ramp.
             (name, parked) = admit_claim(job_id, &orch.instance, &admitted, &runner_name, &waiting);
             orch.record_mint(&repo, job_id, &name, profile_idx).await;
+            // ADR-0059: this runner's job is judged when it starts.
+            orch.watch_job_start(crate::job_start::Watch::new(
+                &repo,
+                &name,
+                job_id,
+                run_id,
+                profile_idx,
+                crate::job_start::DeadlineOutcome::at_mint(private, orch.on_bypass()),
+            ));
             // Re-read the cohort now that we're launching: a claim can park for a
             // long time under budget pressure, and the queued set moves on while it
             // waits. The reservation is already debited and stays as admitted; only
@@ -6405,6 +6586,12 @@ fn spawn_provision(
                 // ADR-0046 §10: which services this runner has, so an adopted
                 // claim can detach them and its outcome can name them.
                 services: services_of(&backend).mark(),
+                // ADR-0059 §1: the hook's outcome with no verdict by its
+                // deadline, decided now, from the repo's visibility and the mode.
+                hook: crate::job_start::HookPlan {
+                    outcome: crate::job_start::DeadlineOutcome::at_mint(private, orch.on_bypass()),
+                    deadline: orch.cfg.job_start.hook,
+                },
             };
             let mut ran = run_backend(
                 &backend,
@@ -6430,7 +6617,10 @@ fn spawn_provision(
             // representative job, so keep all three out of the learner — but still
             // record the outcome below for visibility.
             label = Some(human);
-            if !report.timed_out && !report.reclaimed && !report.infra_error {
+            // ADR-0059 §6: a runner faber stopped at job start ran no
+            // representative job either, so it teaches the learner nothing.
+            let stopped = orch.was_stopped_at_start(&name);
+            if !report.timed_out && !report.reclaimed && !report.infra_error && !stopped {
                 // Attribute to the job GitHub actually dispatched to this runner, not
                 // the one it was minted for — they differ routinely (see `ExecutedJob`).
                 // Unknown ⇒ don't guess: an unattributable sample would poison a class.
@@ -8197,6 +8387,13 @@ async fn reconcile_retries(orch: &Arc<Orchestrator>, repos: &[String]) {
                 if orch.was_force_killed(j.id).await {
                     continue;
                 }
+                // Nor a job refused when it started (ADR-0059 §4): its runner
+                // was stopped as a refusal, and a re-run would only be refused
+                // again — or judged as the job it then is, which the job-start
+                // check does on every attempt.
+                if orch.was_refused_at_start(j.id).await {
+                    continue;
+                }
                 // A job whose runner faber is *still running* has no local verdict
                 // yet — see [`runner_still_claimed`]. Defer rather than conclude:
                 // the dedup memory is permanent for this attempt, so a sweep landing
@@ -8915,6 +9112,28 @@ impl Orchestrator {
         }
         let on_bypass = self.on_bypass();
         for b in found {
+            // ADR-0059 §6: a job refused at start is not a bypass, if no step
+            // after the hook's started. One whose start is still being judged
+            // waits for that judgement rather than racing it.
+            match self.job_start_standing(&b, runs).await {
+                StartStanding::Undecided | StartStanding::RefusedAtStart => continue,
+                StartStanding::RanPastRefusal => {
+                    self.record_hook_fault_line(
+                        &b.repo,
+                        &b.runner,
+                        Some(b.job_id),
+                        Some(b.run_id),
+                        "bypass",
+                        format!(
+                            "job {} was refused at start on runner {}, and a step after the hook's \
+                             started anyway",
+                            b.job_id, b.runner
+                        ),
+                    )
+                    .await;
+                }
+                StartStanding::None => {}
+            }
             let trust_7d = {
                 let mut m = self.metrics.lock().await;
                 if !m.note_bypass(b.job_id, b.class, now) {
@@ -9020,8 +9239,435 @@ impl Orchestrator {
                     )
                     .await
                 }
-                Err(e) => warn!("gate bypass: killing runner {} failed: {e:#}", b.runner),
+                Err(e) => {
+                    // Not done: the runner may still be running the refused job.
+                    // Kept, and tried again next cycle until it is gone (#66).
+                    warn!(
+                        "gate bypass: killing runner {} failed: {e:#} — trying again next cycle",
+                        b.runner
+                    );
+                    self.kill_retries
+                        .lock()
+                        .unwrap()
+                        .insert(b.runner.clone(), b.clone());
+                }
             },
+        }
+    }
+
+    /// Where a found bypass stands with the job-start check (ADR-0059 §6).
+    async fn job_start_standing(
+        &self,
+        b: &BypassView,
+        runs: &[(WorkflowRun, Vec<Job>)],
+    ) -> StartStanding {
+        let deciding = self
+            .job_starts
+            .lock()
+            .unwrap()
+            .get(&b.runner)
+            .is_some_and(|w| !w.ended() && !w.stopping());
+        if deciding {
+            return StartStanding::Undecided;
+        }
+        if !self.was_refused_at_start(b.job_id).await {
+            return StartStanding::None;
+        }
+        let steps = runs
+            .iter()
+            .flat_map(|(_, jobs)| jobs)
+            .find(|j| j.id == b.job_id)
+            .and_then(|j| j.steps.as_deref());
+        if crate::job_start::ran_past_hook(steps) {
+            StartStanding::RanPastRefusal
+        } else {
+            StartStanding::RefusedAtStart
+        }
+    }
+
+    /// Whether `job_id` was refused when it started, within the last week.
+    async fn was_refused_at_start(&self, job_id: u64) -> bool {
+        self.metrics
+            .lock()
+            .await
+            .refused_at_start
+            .contains_key(&job_id)
+    }
+
+    /// Whether faber stopped `runner` at job start or over a hook fault.
+    fn was_stopped_at_start(&self, runner: &str) -> bool {
+        self.stopped_runners.lock().unwrap().contains_key(runner)
+    }
+
+    /// Start judging `w`'s runner's job when it starts (ADR-0059 §2).
+    fn watch_job_start(&self, w: crate::job_start::Watch) {
+        self.job_starts.lock().unwrap().insert(w.runner.clone(), w);
+    }
+
+    /// One pass over every runner whose job start faber is judging: read its
+    /// process table, decide, and do what was decided.
+    async fn job_start_pass(&self) {
+        // A watch lives no longer than its claim: a provision that failed before
+        // its container ran leaves nothing to judge. Read the claims first, so
+        // the two locks are never held together.
+        let live: HashSet<String> = self
+            .inflight
+            .lock()
+            .await
+            .values()
+            .filter(|c| c.containerized)
+            .filter_map(|c| c.runner_name.lock().unwrap().clone())
+            .collect();
+        let runners: Vec<String> = {
+            let mut watches = self.job_starts.lock().unwrap();
+            watches.retain(|runner, w| live.contains(runner) || w.stopping());
+            watches.keys().cloned().collect()
+        };
+        let on_bypass = self.on_bypass();
+        let deadlines = self.cfg.job_start;
+        for runner in runners {
+            let seen = crate::docker::job_start_seen(&runner).await;
+            let acts = {
+                let mut watches = self.job_starts.lock().unwrap();
+                let Some(w) = watches.get_mut(&runner) else {
+                    continue;
+                };
+                w.step(now_ms(), seen, &deadlines, on_bypass)
+            };
+            for act in acts {
+                self.job_start_act(&runner, act).await;
+            }
+            let mut watches = self.job_starts.lock().unwrap();
+            if watches.get(&runner).is_some_and(|w| w.ended()) {
+                watches.remove(&runner);
+            }
+        }
+    }
+
+    /// A snapshot of one watch, for the I/O an act needs without holding the
+    /// lock across it.
+    fn job_start_watch(&self, runner: &str) -> Option<crate::job_start::Watch> {
+        self.job_starts.lock().unwrap().get(runner).cloned()
+    }
+
+    /// Do one thing [`crate::job_start::Watch::step`] decided.
+    async fn job_start_act(&self, runner: &str, act: crate::job_start::Act) {
+        use crate::job_start::{Act, StartDecision};
+        let Some(w) = self.job_start_watch(runner) else {
+            return;
+        };
+        match act {
+            Act::Search => match self.judge_started_job(&w).await {
+                Ok(Some(judged)) => {
+                    info!(
+                        "{}: runner {} took job {} ({}); at start the gate says {}",
+                        w.repo, w.runner, judged.job_id, judged.job_name, judged.verdict
+                    );
+                    if let Some(w) = self.job_starts.lock().unwrap().get_mut(runner) {
+                        w.judge(judged);
+                    }
+                }
+                Ok(None) => debug!("{}: runner {}'s job not found yet", w.repo, w.runner),
+                Err(e) => debug!("{}: looking for runner {}'s job: {e}", w.repo, w.runner),
+            },
+            Act::Deliver(d) => {
+                if let Err(e) = crate::docker::deliver_verdict(runner, d.archive()).await {
+                    warn!(
+                        "{}: delivering the verdict to runner {runner}: {e:#}",
+                        w.repo
+                    );
+                    // A refusal is enforced by the kill that follows it. An allow
+                    // that did not land is tried again while the hook waits.
+                    if d.decision == StartDecision::Allow {
+                        if let Some(w) = self.job_starts.lock().unwrap().get_mut(runner) {
+                            w.redeliver();
+                        }
+                    }
+                }
+            }
+            Act::Kill => match crate::docker::force_kill_runner(runner).await {
+                Ok(()) => {
+                    if let Some(w) = self.job_starts.lock().unwrap().get_mut(runner) {
+                        w.killed();
+                    }
+                }
+                Err(e) => warn!(
+                    "{}: stopping runner {runner} at job start: {e:#} — trying again",
+                    w.repo
+                ),
+            },
+            Act::RefusedAtStart(reason) => self.record_refused_at_start(&w, reason).await,
+            Act::Unverified => {
+                let job = w
+                    .judged()
+                    .map_or("its job".to_string(), |j| format!("job {}", j.job_id));
+                warn!(
+                    "{}: no verdict for runner {} by the search deadline — {job} runs \
+                     unverified at the hook's deadline (ADR-0059 §5)",
+                    w.repo, w.runner
+                );
+                self.record_fault(
+                    &w.repo,
+                    "job_start",
+                    "unverified",
+                    Some(format!(
+                        "runner {} (minted for job {}): no verdict by the deadline; the job runs \
+                         unverified on a private repository under record",
+                        w.runner, w.minted_for
+                    )),
+                )
+                .await;
+            }
+            Act::HookFault { stop, why } => {
+                let judged = w.judged().cloned();
+                if stop {
+                    self.stopped_runners
+                        .lock()
+                        .unwrap()
+                        .insert(w.runner.clone(), now_ms());
+                    if let Some(j) = &judged {
+                        self.metrics.lock().await.note_killed(j.job_id, now_ms());
+                    }
+                }
+                let view = self.job_start_view(&w, why);
+                self.metrics.lock().await.recent_hook_faults.push_back(view);
+                self.record_hook_fault_line(
+                    &w.repo,
+                    &w.runner,
+                    judged.as_ref().map(|j| j.job_id),
+                    judged.as_ref().map(|j| j.run_id),
+                    if stop { "stopped" } else { "recorded" },
+                    format!(
+                        "runner {} (minted for job {}): {why}{}",
+                        w.runner,
+                        w.minted_for,
+                        if stop { "; faber stopped it" } else { "" }
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Find the job GitHub gave `w`'s runner, by its `runner_name`, and judge it
+    /// (ADR-0059 §2): first among the jobs of the run it was minted for, then
+    /// among the repository's in-progress and queued runs, every listing read
+    /// to its last page. `Ok(None)` while it is not found, or while GitHub
+    /// defers saying whose code it runs.
+    async fn judge_started_job(
+        &self,
+        w: &crate::job_start::Watch,
+    ) -> Result<Option<crate::job_start::Judged>, GithubError> {
+        let Some((run, job)) = self.find_started_job(w).await? else {
+            return Ok(None);
+        };
+        let code = match authorship::without_reads(&run) {
+            Some(code) => code,
+            None => match authorship::codes_of(&*self.gh, [&run])
+                .await
+                .remove(&run.id)
+            {
+                Some(Ok(code)) => code,
+                Some(Err(Deferred(why))) => {
+                    debug!("{}: run {} deferred: {why}", w.repo, run.id);
+                    return Ok(None);
+                }
+                None => return Ok(None),
+            },
+        };
+        let Some(profile) = self.cfg.profiles.get(w.profile_idx) else {
+            return Ok(None);
+        };
+        let verdict = gate::trust_verdict(&job_context(&run, &job, code), &profile.policy);
+        Ok(Some(crate::job_start::Judged {
+            job_id: job.id,
+            run_id: run.id,
+            run_attempt: run.run_attempt,
+            job_name: job.name.clone(),
+            workflow: run.name.clone().unwrap_or_default(),
+            verdict: verdict_str(&verdict),
+            decision: crate::job_start::start_decision(&verdict, self.on_bypass()),
+        }))
+    }
+
+    /// The run and job whose `runner_name` is `w`'s runner, if GitHub has it yet.
+    async fn find_started_job(
+        &self,
+        w: &crate::job_start::Watch,
+    ) -> Result<Option<(WorkflowRun, Job)>, GithubError> {
+        let mine = |jobs: Vec<Job>| {
+            jobs.into_iter()
+                .find(|j| j.runner_name.as_deref() == Some(w.runner.as_str()))
+        };
+        if w.minted_run != 0 {
+            if let Some(job) = mine(self.gh.run_jobs(&w.repo, w.minted_run).await?) {
+                let run = self.gh.run(&w.repo, w.minted_run).await?;
+                return Ok(Some((run, job)));
+            }
+        }
+        for status in ["in_progress", "queued"] {
+            for run in self.gh.runs_with_status(&w.repo, status).await? {
+                if run.id == w.minted_run {
+                    continue;
+                }
+                if let Some(job) = mine(self.gh.run_jobs(&w.repo, run.id).await?) {
+                    return Ok(Some((run, job)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The dashboard's line for a refusal at start or a hook fault.
+    fn job_start_view(&self, w: &crate::job_start::Watch, reason: &str) -> JobStartView {
+        let j = w.judged();
+        JobStartView {
+            ts_ms: now_ms(),
+            repo: w.repo.clone(),
+            run_id: j.map_or(0, |j| j.run_id),
+            job_id: j.map_or(0, |j| j.job_id),
+            job_name: j.map(|j| j.job_name.clone()).unwrap_or_default(),
+            workflow: j.map(|j| j.workflow.clone()).unwrap_or_default(),
+            runner: w.runner.clone(),
+            minted_for: w.minted_for,
+            reason: reason.to_string(),
+            verdict: j.map(|j| j.verdict.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// Record a job refused when it started (ADR-0059 §6): not a bypass. The
+    /// repo is not held, its cache is kept, the learner learns nothing from the
+    /// runner, and auto-retry leaves the job alone.
+    async fn record_refused_at_start(
+        &self,
+        w: &crate::job_start::Watch,
+        reason: crate::job_start::Reason,
+    ) {
+        let now = now_ms();
+        self.stopped_runners
+            .lock()
+            .unwrap()
+            .insert(w.runner.clone(), now);
+        let view = self.job_start_view(w, reason.word());
+        {
+            let mut m = self.metrics.lock().await;
+            if view.job_id != 0 {
+                m.note_refused_at_start(view.job_id, now);
+            }
+            m.recent_refused_at_start.push_back(view.clone());
+            let window = BYPASS_WINDOW.as_millis() as u64;
+            m.refusals_at_start
+                .retain(|(ts, _)| now.saturating_sub(*ts) <= window);
+            m.refusals_at_start.push_back((now, w.repo.clone()));
+            while m.recent_refused_at_start.len() > BYPASS_RECENT_CAP {
+                m.recent_refused_at_start.pop_front();
+            }
+        }
+        let job = if view.job_id == 0 {
+            "a job faber did not find".to_string()
+        } else {
+            format!(
+                "job {} ({} · {})",
+                view.job_id, view.workflow, view.job_name
+            )
+        };
+        let cause = format!(
+            "{job} was refused when it started on runner {}, minted for job {} ({}{})",
+            w.runner,
+            w.minted_for,
+            reason.word(),
+            if view.verdict.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", view.verdict)
+            }
+        );
+        warn!("{}: {cause}", w.repo);
+        {
+            let mut m = self.metrics.lock().await;
+            m.recent_faults.push_back(FaultEvent {
+                ts_ms: now,
+                repo: w.repo.clone(),
+                scope: "refused_at_start".to_string(),
+                action: reason.key().to_string(),
+                cause: cause.clone(),
+            });
+            while m.recent_faults.len() > FAULT_RECENT_CAP {
+                m.recent_faults.pop_front();
+            }
+        }
+        let rec = Record {
+            job_id: view.job_id,
+            run_id: (view.run_id != 0).then_some(view.run_id),
+            runner: Some(w.runner.clone()),
+            verdict: (!view.verdict.is_empty()).then(|| view.verdict.clone()),
+            label: (view.job_id != 0)
+                .then(|| job_label(&w.repo, Some(&view.workflow), &view.job_name)),
+            ..Record::fault(&w.repo, "refused_at_start", reason.key(), Some(cause))
+        };
+        if let Err(e) = self.audit.append(&rec).await {
+            warn!("audit append failed: {e}");
+        }
+    }
+
+    /// One `hook_fault` line on the faults feed and in the audit log, and the
+    /// 7-day count (ADR-0059 §2): a job in progress with no waiting hook. Loud
+    /// wherever a bypass is.
+    async fn record_hook_fault_line(
+        &self,
+        repo: &str,
+        runner: &str,
+        job_id: Option<u64>,
+        run_id: Option<u64>,
+        action: &str,
+        cause: String,
+    ) {
+        let now = now_ms();
+        let count = {
+            let mut m = self.metrics.lock().await;
+            let window = BYPASS_WINDOW.as_millis() as u64;
+            m.hook_faults.retain(|ts| now.saturating_sub(*ts) <= window);
+            m.hook_faults.push_back(now);
+            while m.recent_hook_faults.len() > BYPASS_RECENT_CAP {
+                m.recent_hook_faults.pop_front();
+            }
+            m.recent_faults.push_back(FaultEvent {
+                ts_ms: now,
+                repo: repo.to_string(),
+                scope: "hook_fault".to_string(),
+                action: action.to_string(),
+                cause: cause.clone(),
+            });
+            while m.recent_faults.len() > FAULT_RECENT_CAP {
+                m.recent_faults.pop_front();
+            }
+            m.hook_faults_since(now)
+        };
+        warn!("{repo}: hook fault — {cause}");
+        if let Some(msg) = hook_fault_warning(count) {
+            warn!("{msg}");
+        }
+        let rec = Record {
+            job_id: job_id.unwrap_or(0),
+            run_id,
+            runner: Some(runner.to_string()),
+            ..Record::fault(repo, "hook_fault", action, Some(cause))
+        };
+        if let Err(e) = self.audit.append(&rec).await {
+            warn!("audit append failed: {e}");
+        }
+    }
+
+    /// Try again every bypass kill that failed (ADR-0059 §4: faber retries until
+    /// the runner is gone). A runner whose claim has gone has exited, which is
+    /// what the kill was for.
+    async fn retry_bypass_kills(&self) {
+        let pending: Vec<BypassView> = {
+            let mut retries = self.kill_retries.lock().unwrap();
+            std::mem::take(&mut *retries).into_values().collect()
+        };
+        for b in pending {
+            self.kill_bypassed_runner(&b).await;
         }
     }
 
@@ -9439,6 +10085,56 @@ fn find_bypasses(
         }
     }
     out
+}
+
+/// Where a found bypass stands with the job-start check (ADR-0059 §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartStanding {
+    /// No refusal at start applies: judge it as a bypass, as before.
+    None,
+    /// Its runner's job start is still being judged: wait for that.
+    Undecided,
+    /// Refused at start, and no step after the hook's ran: not a bypass.
+    RefusedAtStart,
+    /// Refused at start, yet a step after the hook's started: a bypass, and a
+    /// hook fault.
+    RanPastRefusal,
+}
+
+/// The boot and dashboard warning while hook faults have been seen this week
+/// (ADR-0059 §2, §6): a runner ran a job's steps without faber's verdict.
+fn hook_fault_warning(faults_7d: usize) -> Option<String> {
+    (faults_7d > 0).then(|| {
+        format!(
+            "{faults_7d} hook fault{} in the last 7 days — a runner ran a job's steps with no \
+             job-started hook waiting for faber's verdict (ADR-0059). Check the runner image \
+             honours ACTIONS_RUNNER_HOOK_JOB_STARTED and runs a .js hook on its bundled Node.",
+            if faults_7d == 1 { "" } else { "s" }
+        )
+    })
+}
+
+/// The boot line naming how many jobs each repository had refused at start
+/// this week (ADR-0059 §4), so the record is on hand where GitHub may keep no
+/// log of the killed step.
+fn refused_at_start_note(per_repo: &BTreeMap<String, usize>) -> Option<String> {
+    (!per_repo.is_empty()).then(|| {
+        let list: Vec<String> = per_repo.iter().map(|(r, n)| format!("{r} ({n})")).collect();
+        format!(
+            "jobs refused when they started in the last 7 days, before any of their steps \
+             (ADR-0059): {}",
+            list.join(", ")
+        )
+    })
+}
+
+/// The `(job_id, ts_ms)` of each audit fault line of `scope` in `entries`.
+fn replayed_scope(entries: &[crate::audit::Entry], scope: &str) -> Vec<(u64, u64)> {
+    entries
+        .iter()
+        .filter(|e| e.kind == "fault" && e.result.as_deref() == Some(scope))
+        .map(|e| (e.job_id, e.ts_ms))
+        .collect()
 }
 
 /// What enforcement does about one bypass (ADR-0030). Everything or nothing:
@@ -10588,6 +11284,7 @@ pub(crate) mod tests {
                 pr: None,
                 run_created_at: None,
                 attempt: 1,
+                private: true,
             }],
             "cycle 1 claims + intends"
         );
@@ -13156,6 +13853,7 @@ pub(crate) mod tests {
                 pr: None,
                 run_created_at: None,
                 attempt: 1,
+                private: true,
                 job_labels: labels,
             },
         );
@@ -13862,6 +14560,7 @@ pub(crate) mod tests {
                 services: Default::default(),
                 mirror: None,
                 vm_layout: Default::default(),
+                job_start: Default::default(),
                 waste,
             },
             owner: "owner".to_string(),
@@ -13888,6 +14587,9 @@ pub(crate) mod tests {
             minted: std::sync::Mutex::new(HashMap::new()),
             repo_holds: std::sync::Mutex::new(BTreeMap::new()),
             cache_purges: std::sync::Mutex::new(BTreeSet::new()),
+            kill_retries: std::sync::Mutex::new(BTreeMap::new()),
+            job_starts: std::sync::Mutex::new(HashMap::new()),
+            stopped_runners: std::sync::Mutex::new(HashMap::new()),
             profile_images: std::sync::Mutex::new(profile_images),
             retirements: std::sync::Mutex::new(Retirements::default()),
             verdicts_running: Arc::new(AtomicBool::new(false)),
@@ -15806,6 +16508,7 @@ pub(crate) mod tests {
                 pr: None,
                 run_created_at: None,
                 attempt: 1,
+                private: true,
                 job_labels: labels,
             },
         );
@@ -15996,6 +16699,7 @@ pub(crate) mod tests {
                 pr: Some(7),
                 run_created_at: Some("2026-11-01T10:00:00Z".to_string()),
                 attempt: 1,
+                private: true,
                 job_labels: labels,
             },
         );
@@ -16312,6 +17016,7 @@ pub(crate) mod tests {
                 pr: None,
                 run_created_at: None,
                 attempt: 1,
+                private: true,
                 job_labels: labels,
             },
         );
@@ -16366,6 +17071,7 @@ pub(crate) mod tests {
                 pr: None,
                 run_created_at: None,
                 attempt: 1,
+                private: true,
                 job_labels: Vec::new(),
             },
         );
@@ -16581,6 +17287,125 @@ pub(crate) mod tests {
         let replayed = replayed_bypasses(&orch.audit.read_since(0));
         assert_eq!(replayed.len(), 1);
         assert_eq!((replayed[0].0, replayed[0].2), (7, BypassClass::Trust));
+    }
+
+    fn hook_steps(ran: bool) -> Option<Vec<Step>> {
+        let step = |n: i64, name: &str, status: &str, conclusion: Option<&str>| Step {
+            name: name.to_string(),
+            status: status.to_string(),
+            number: n,
+            conclusion: conclusion.map(str::to_string),
+            started_at: None,
+            completed_at: None,
+        };
+        Some(vec![
+            step(1, "Set up job", "completed", Some("success")),
+            step(2, "Set up runner", "completed", Some("failure")),
+            if ran {
+                step(3, "Run tests", "in_progress", None)
+            } else {
+                step(3, "Run tests", "queued", None)
+            },
+        ])
+    }
+
+    /// ADR-0059 §6, #66: a job the job-start check stopped before its first
+    /// step is recorded as refused at start, not as a bypass. Even under
+    /// `enforce` the repo is not held, its cache is kept, the runner teaches the
+    /// learner nothing, and auto-retry leaves the job alone. A step after the
+    /// hook's makes it a bypass after all, and a hook fault.
+    #[tokio::test]
+    async fn a_job_refused_at_start_is_not_a_bypass_and_teaches_no_class() {
+        use crate::job_start::{DeadlineOutcome, Judged, Reason, StartDecision, Watch};
+        let (orch, tmp) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        orch.note_minted("faber-5-100", 5, 0);
+        let mut w = Watch::new(
+            "owner/demo",
+            "faber-5-100",
+            5,
+            50,
+            0,
+            DeadlineOutcome::Refuse,
+        );
+        w.judge(Judged {
+            job_id: 7,
+            run_id: 70,
+            run_attempt: 1,
+            job_name: "build".into(),
+            workflow: "CI".into(),
+            verdict: "refuse:actor:dependabot[bot]".into(),
+            decision: StartDecision::Refuse(Reason::Actor),
+        });
+        orch.record_refused_at_start(&w, Reason::Actor).await;
+
+        let mut runs = ran_on("faber-5-100", "dependabot[bot]");
+        runs[0].1[0].steps = hook_steps(false);
+        orch.detect_bypasses("owner/demo", &runs, &Codes::new())
+            .await;
+        assert!(!orch.was_bypass(7).await);
+        let view = orch.view().await;
+        assert!(view.bypasses.is_empty());
+        assert!(view.repo_holds.is_empty(), "{:?}", view.repo_holds);
+        assert!(orch.cache_purges.lock().unwrap().is_empty());
+        assert!(orch.kill_retries.lock().unwrap().is_empty());
+        assert_eq!(view.refused_at_start.len(), 1);
+        assert_eq!(view.refused_at_start[0].reason, "actor");
+        assert_eq!(view.refused_at_start[0].minted_for, 5);
+        assert_eq!(view.refused_at_start_7d.get("owner/demo"), Some(&1));
+        // The learner and auto-retry both leave it alone.
+        assert!(orch.was_stopped_at_start("faber-5-100"));
+        assert!(orch.was_refused_at_start(7).await);
+        let lines: Vec<_> = audit_lines(&tmp)
+            .into_iter()
+            .filter(|l| l["result"] == "refused_at_start")
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["action"], "actor");
+        assert_eq!(lines[0]["job_id"], 7);
+        assert_eq!(lines[0]["runner"], "faber-5-100");
+        // A restart reads it back.
+        let replayed = replayed_scope(&orch.audit.read_since(0), "refused_at_start");
+        assert_eq!(
+            replayed.iter().map(|(j, _)| *j).collect::<Vec<_>>(),
+            vec![7]
+        );
+
+        // A step after the hook's started: a bypass after all, and a hook fault.
+        runs[0].1[0].steps = hook_steps(true);
+        orch.detect_bypasses("owner/demo", &runs, &Codes::new())
+            .await;
+        assert!(orch.was_bypass(7).await);
+        assert!(audit_lines(&tmp)
+            .iter()
+            .any(|l| l["result"] == "hook_fault" && l["job_id"] == 7));
+        assert_eq!(orch.view().await.hook_faults_7d, 1);
+    }
+
+    /// A job whose start is still being judged is not yet a bypass: detection
+    /// waits for the job-start check rather than racing it to a hold.
+    #[tokio::test]
+    async fn a_bypass_waits_while_its_job_start_is_judged() {
+        use crate::job_start::{DeadlineOutcome, Watch};
+        let (orch, _tmp) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        orch.note_minted("faber-5-100", 5, 0);
+        orch.watch_job_start(Watch::new(
+            "owner/demo",
+            "faber-5-100",
+            5,
+            50,
+            0,
+            DeadlineOutcome::Refuse,
+        ));
+        let runs = ran_on("faber-5-100", "dependabot[bot]");
+        orch.detect_bypasses("owner/demo", &runs, &Codes::new())
+            .await;
+        assert!(!orch.was_bypass(7).await);
+        assert!(orch.view().await.repo_holds.is_empty());
+        // Once the watch is gone, detection judges it as before.
+        orch.job_starts.lock().unwrap().clear();
+        orch.detect_bypasses("owner/demo", &runs, &Codes::new())
+            .await;
+        assert!(orch.was_bypass(7).await);
     }
 
     #[test]

@@ -386,6 +386,29 @@ const TRUST_FIELDS: &[FieldSpec] = &[
         ..f("gate.on_bypass", "On a gate bypass", "enum")
     },
     FieldSpec {
+        // A shorter search lets more jobs reach the hook's deadline outcome,
+        // which on a private repo under `record` is to run unverified.
+        sudo: Some("sudo faber config set gate.job_start_search_secs <seconds>"),
+        unit: Some("s"),
+        min: Some(1.0),
+        hint: Some(
+            "How long faber looks for, and judges, the job a runner was handed once it starts \
+             (ADR-0059). At least one poll interval plus 60 s, and 30 s short of the hook's \
+             deadline.",
+        ),
+        ..f("gate.job_start_search_secs", "Job-start search", "int")
+    },
+    FieldSpec {
+        sudo: Some("sudo faber config set gate.job_start_deadline_secs <seconds>"),
+        unit: Some("s"),
+        min: Some(1.0),
+        hint: Some(
+            "How long a runner's job-started hook waits for faber's verdict. Then it runs the \
+             job unverified on a private repo under record, and stops it otherwise.",
+        ),
+        ..f("gate.job_start_deadline_secs", "Job-start deadline", "int")
+    },
+    FieldSpec {
         sudo: Some("sudo faber config set trusted_actors <logins>"),
         narrows: Some("remove-keep-one"),
         hint: Some("One login per line. Empty = trust by provenance alone."),
@@ -1023,7 +1046,9 @@ const PROFILE_FIELDS: &[FieldSpec] = &[
         narrows: Some("remove"),
         hint: Some(
             "NAME=value entries passed into the runner, ahead of every step of its jobs \
-             (HTTPS_PROXY, ACTIONS_RUNNER_HOOK_*, LD_PRELOAD act before the job can).",
+             (HTTPS_PROXY, ACTIONS_RUNNER_HOOK_*, LD_PRELOAD act before the job can). \
+             RUNNER_JITCONFIG and ACTIONS_RUNNER_HOOK_JOB_STARTED are faber's own and are \
+             refused (ADR-0059).",
         ),
         ..f("env", "Environment", "map")
     },

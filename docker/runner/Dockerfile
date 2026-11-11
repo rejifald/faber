@@ -5,6 +5,15 @@
 # rest — so the image, not faber, owns what a job can actually run. That is the
 # seam: swap the toolchain here and faber does not change.
 #
+# Every runner also waits, at job start, for faber's verdict on the job it was
+# given (ADR-0059). faber mounts a `.js` job-started hook read-only and sets
+# ACTIONS_RUNNER_HOOK_JOB_STARTED to it. The contract that adds:
+#   - the runner honours that variable and runs a `.js` hook on its own bundled
+#     Node (the stock actions/runner below does both);
+#   - no `.env` in the runner's directory names the variable, since the runner
+#     applies its `.env` over its environment (checked at the end of the build);
+#   - `sh` and `wc`, with which faber writes the hook into its volume.
+#
 # This is a starting point, not a fixed recipe. It carries git, Node, and a
 # Docker CLI pointed at the paired dind, which is enough for most JavaScript CI.
 # Add what your jobs need (a JDK, Python, a browser set) and rebuild.
@@ -108,6 +117,13 @@ RUN useradd -m -u 1001 -s /bin/bash runner \
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
+
+# The job-started hook contract (ADR-0059): a runner `.env` that named the hook
+# variable would replace faber's hook, so the build fails on one.
+RUN if grep -qs 'ACTIONS_RUNNER_HOOK_JOB_STARTED' /runner/.env; then \
+      echo "/runner/.env must not name ACTIONS_RUNNER_HOOK_JOB_STARTED (ADR-0059)" >&2; exit 1; \
+    fi \
+ && ls /runner/externals/node*/bin/node >/dev/null
 
 WORKDIR /runner
 
