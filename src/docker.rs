@@ -3336,33 +3336,62 @@ pub(crate) async fn remove_image(tag: &str) -> anyhow::Result<bool> {
 // runner this host minted. Neither is a general-purpose path, and neither should
 // become one.
 
-/// Kill a runner's containers **without asking the runner** (ADR-0030).
+/// Kill a runner's containers **without asking the runner** (ADR-0030, ADR-0059 §4).
 ///
 /// Every other kill of a live runner goes through [`reclaim_clearance`]
 /// (ADR-0017): it refuses while a job is executing, because the job it would abort
 /// is legitimate work. This one exists precisely for the job that is executing —
 /// a job the gate refuses as possibly hostile, which took a runner minted for
-/// another. The job has already started, so this caps the damage rather than
-/// preventing it. The provision task watching the runner sees it exit and tears
+/// another, or one refused when it started. ADR-0017 protects legitimate work,
+/// and this is not. The provision task watching the runner sees it exit and tears
 /// the sandbox down as for any other exit.
 ///
 /// The runner first, then its dind, where the job's own containers live — the
 /// dind whatever happened to the runner, since a runner that already exited may
 /// have left the job's containers running. A container that is absent or no
-/// longer running is already where the kill would put it. An error only when
-/// both kills genuinely failed; one failure alone is logged.
+/// longer running is already where the kill would put it.
+///
+/// Retried until the runner is gone (ADR-0059 §4: "retrying until the runner is
+/// gone"), up to [`FORCE_KILL_TRIES`] times here. Gone is read back from Docker,
+/// not inferred from `docker kill` answering: a kill the daemon accepted but did
+/// not carry out is the case the retry is for. An error when the runner is still
+/// running after the last try; the caller keeps it and tries again on its next
+/// pass, because a runner that outlives this is still executing a refused job.
 pub(crate) async fn force_kill_runner(runner_name: &str) -> anyhow::Result<()> {
     let names = Names::for_runner(runner_name);
-    let runner = docker_rm(&["kill", &names.runner])
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string());
-    let dind = docker_rm(&["kill", &names.dind])
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string());
-    kill_verdict(&names, runner, dind)
+    let mut last = None;
+    for attempt in 1..=FORCE_KILL_TRIES {
+        let runner = docker_rm(&["kill", &names.runner])
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let dind = docker_rm(&["kill", &names.dind])
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let verdict = kill_verdict(&names, runner, dind);
+        // Gone means Docker says it is not running, or not there at all. An
+        // unreadable answer is not gone.
+        if verdict.is_ok() && container_running(&names.runner).await == Some(false) {
+            return Ok(());
+        }
+        last = Some(match verdict {
+            Ok(()) => anyhow::anyhow!("{} is still running after the kill", names.runner),
+            Err(e) => e,
+        });
+        if attempt < FORCE_KILL_TRIES {
+            tokio::time::sleep(FORCE_KILL_BACKOFF * attempt).await;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("killing {} did not run", names.runner)))
 }
+
+/// How many times [`force_kill_runner`] tries before it hands the runner back to
+/// its caller's next pass.
+const FORCE_KILL_TRIES: u32 = 4;
+
+/// The pause between two of [`force_kill_runner`]'s tries, times the try number.
+const FORCE_KILL_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Whether a failed `docker kill` only says the container is already stopped.
 fn kill_moot(err: &str) -> bool {
@@ -3371,6 +3400,12 @@ fn kill_moot(err: &str) -> bool {
 }
 
 /// [`force_kill_runner`]'s result from the two kills.
+///
+/// The runner's kill decides it. A runner whose kill failed is still executing a
+/// refused job, whatever happened to its dind, so that is an error (#66: it used
+/// to read as done when the dind's kill worked, and nothing tried again). A dind
+/// whose kill alone failed is logged: the runner, which ran the job's steps, is
+/// stopped, and teardown removes the dind with the sandbox.
 fn kill_verdict(
     names: &Names,
     runner: Result<(), String>,
@@ -3385,15 +3420,11 @@ fn kill_verdict(
             names.dind
         ),
         (Err(e), Ok(())) => {
-            warn!(
-                "gate bypass: killing {} failed ({e}); its dind was killed",
-                names.runner
-            );
-            Ok(())
+            anyhow::bail!("killing {} failed ({e}); its dind was killed", names.runner)
         }
         (Ok(()), Err(e)) => {
             warn!(
-                "gate bypass: killing {} failed ({e}); the runner was killed",
+                "forced stop: killing {} failed ({e}); the runner was killed",
                 names.dind
             );
             Ok(())
@@ -4704,10 +4735,23 @@ fn dind_run_args(
 /// any local account could read it and take the job. A security review found
 /// `docker/runner/entrypoint.sh` doing exactly that; it now hands the value to
 /// `run.sh` as `ACTIONS_RUNNER_INPUT_JITCONFIG` in the environment instead —
-/// the runner's own CLI parser reads that as `--jitconfig`'s fallback and
-/// scrubs it from its own process environment before a job step ever runs.
-/// Every third-party runner image's entrypoint must do the same.
-const RUNNER_JITCONFIG_ENV: &str = "RUNNER_JITCONFIG";
+/// the runner's own CLI parser reads that as `--jitconfig`'s fallback. Every
+/// third-party runner image's entrypoint must do the same.
+///
+/// That keeps it off argv, and no more. It does **not** keep it from the job
+/// (#66). The runner scrubs the variable from its own process, but the
+/// container's PID 1 was started with it and still carries it in its
+/// environment, and a step running as the runner's user can read that
+/// (`/proc/1/environ`); the container's own config (`docker inspect`) carries
+/// `RUNNER_JITCONFIG` too. By the time a step runs, the config is spent: the
+/// runner has registered with it and taken its one job. Nothing faber relies on
+/// treats it as a secret from the job, and the job-start hook (ADR-0059) in
+/// particular must never depend on it staying one.
+///
+/// A profile's `env` cannot name it: `faber check-config` and the settings save
+/// refuse one that does, and the boot drops it with a warning
+/// ([`crate::config::FABER_OWNED_ENV`]).
+pub(crate) const RUNNER_JITCONFIG_ENV: &str = "RUNNER_JITCONFIG";
 
 /// Whether a failed runner launch is retried once without the git mirror
 /// (ADR-0035 §2: if anything about the mount fails, the job runs without it).
@@ -6954,7 +6998,9 @@ mod tests {
         assert!(kill_verdict(&names, Ok(()), Ok(())).is_ok());
         assert!(kill_verdict(&names, gone(), Ok(())).is_ok());
         assert!(kill_verdict(&names, gone(), gone()).is_ok());
-        assert!(kill_verdict(&names, broken(), Ok(())).is_ok());
+        // #66: a runner whose kill failed is still running the refused job, so
+        // the dind's kill working does not make the stop done.
+        assert!(kill_verdict(&names, broken(), Ok(())).is_err());
         assert!(kill_verdict(&names, Ok(()), broken()).is_ok());
         assert!(kill_verdict(&names, broken(), broken()).is_err());
         assert!(kill_moot("Error: No such container: faber-dind-5-100"));

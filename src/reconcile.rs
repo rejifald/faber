@@ -1826,6 +1826,10 @@ pub struct Orchestrator {
     /// Repos whose cache volume an enforced trust bypass condemned, still to be
     /// deleted once nothing mounts it (ADR-0030).
     cache_purges: std::sync::Mutex<BTreeSet<String>>,
+    /// Enforced trust bypasses whose runner faber failed to kill, by runner name,
+    /// tried again every cycle until the runner is gone (ADR-0059 §4). A runner
+    /// whose kill failed is still executing a job the gate refuses.
+    kill_retries: std::sync::Mutex<BTreeMap<String, BypassView>>,
     /// Which Docker profiles' own images are confirmed missing from this host
     /// (#63). Refreshed once a cycle by [`reconcile_profile_images`]; read by every
     /// claim about to mint, so the check costs one inspect per profile per cycle
@@ -2101,6 +2105,7 @@ impl Orchestrator {
             minted: std::sync::Mutex::new(HashMap::new()),
             repo_holds: std::sync::Mutex::new(repo_holds),
             cache_purges: std::sync::Mutex::new(cache_purges),
+            kill_retries: std::sync::Mutex::new(BTreeMap::new()),
             profile_images: std::sync::Mutex::new(ProfileImages::default()),
             retirements: std::sync::Mutex::new(Retirements::default()),
             verdicts_running: Arc::new(AtomicBool::new(false)),
@@ -4658,6 +4663,9 @@ async fn reconcile_once(orch: &Arc<Orchestrator>) -> Result<Vec<JoinHandle<()>>,
     // Reconcile the claim set against GitHub: release parked claims whose job has
     // finished, and reclaim admitted runners that have gone idle (see issue #1).
     reconcile_claims(orch, &live).await;
+    // Kill again the bypassed runners whose kill failed (ADR-0059 §4). A no-op
+    // unless one did.
+    orch.retry_bypass_kills().await;
     // Delete the cache volumes enforced trust bypasses condemned, once nothing
     // mounts them (ADR-0030). A no-op unless one did.
     purge_bypassed_caches(orch).await;
@@ -9020,8 +9028,32 @@ impl Orchestrator {
                     )
                     .await
                 }
-                Err(e) => warn!("gate bypass: killing runner {} failed: {e:#}", b.runner),
+                Err(e) => {
+                    // Not done: the runner may still be running the refused job.
+                    // Kept, and tried again next cycle until it is gone (#66).
+                    warn!(
+                        "gate bypass: killing runner {} failed: {e:#} — trying again next cycle",
+                        b.runner
+                    );
+                    self.kill_retries
+                        .lock()
+                        .unwrap()
+                        .insert(b.runner.clone(), b.clone());
+                }
             },
+        }
+    }
+
+    /// Try again every bypass kill that failed (ADR-0059 §4: faber retries until
+    /// the runner is gone). A runner whose claim has gone has exited, which is
+    /// what the kill was for.
+    async fn retry_bypass_kills(&self) {
+        let pending: Vec<BypassView> = {
+            let mut retries = self.kill_retries.lock().unwrap();
+            std::mem::take(&mut *retries).into_values().collect()
+        };
+        for b in pending {
+            self.kill_bypassed_runner(&b).await;
         }
     }
 
@@ -13888,6 +13920,7 @@ pub(crate) mod tests {
             minted: std::sync::Mutex::new(HashMap::new()),
             repo_holds: std::sync::Mutex::new(BTreeMap::new()),
             cache_purges: std::sync::Mutex::new(BTreeSet::new()),
+            kill_retries: std::sync::Mutex::new(BTreeMap::new()),
             profile_images: std::sync::Mutex::new(profile_images),
             retirements: std::sync::Mutex::new(Retirements::default()),
             verdicts_running: Arc::new(AtomicBool::new(false)),
