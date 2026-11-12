@@ -54,6 +54,15 @@ struct AgentDeadlines: Sendable {
     /// on a fresh clone. faber's own bound is longer
     /// (src/vm/verify.rs, CHECK_LIMIT), so this one decides.
     var verified: TimeInterval = 360
+    /// How long a `status` reply may take once the agent is in service: after `begin` (a job)
+    /// or `verify` (the image checks). A guest saturating its vCPUs, which is exactly a long
+    /// compile, can answer later than `reply`, and one late answer among the thousands a long
+    /// job makes must not stop the VM (issue #83). The agent is still hostile input, so this is
+    /// a bound, never none: an agent silent this long is `timeout`. Nothing else waits on the
+    /// exchange lock in service, since probe, begin and verify are all behind it. Before that,
+    /// `status` keeps `reply`: probe and begin wait on the same lock inside the supervisor's
+    /// 2 s call.
+    var statusSilence: TimeInterval = 30
     /// The status poll's period.
     var poll: TimeInterval = 1
     /// How long probe and begin wait for a status exchange in flight before giving up
@@ -96,6 +105,9 @@ struct AgentPhaseMachine: Sendable {
     private(set) var probed = false
     private(set) var begunAt: Date?
     private(set) var verifyAt: Date?
+    /// Whether `begin` or `verify` was accepted: the agent is running a job or the image's
+    /// checks, and a `status` reply may take up to `statusSilence`.
+    var inService: Bool { begunAt != nil || verifyAt != nil }
     private(set) var verdict: [CheckCode]?
 
     init(deadlines: AgentDeadlines, since: Date) {
@@ -312,13 +324,14 @@ final class AgentChannel: GuestAgent, @unchecked Sendable {
         onViolation(v)
     }
 
-    /// One request and its one reply. The caller holds exchangeLock.
-    private func exchange(_ request: AgentRequest) throws -> AgentReply {
+    /// One request and its one reply, within `within` (default `reply`). The caller holds
+    /// exchangeLock.
+    private func exchange(_ request: AgentRequest, within: TimeInterval? = nil) throws -> AgentReply {
         guard fd >= 0 else { throw AgentViolation.connectionLost }
         if let unasked = unaskedInput(fd) { throw unasked == .closed ? AgentViolation.connectionLost : AgentViolation.unasked }
         let id = nextID
         nextID = nextID == UInt32.max ? 1 : nextID + 1
-        let deadline = Date().addingTimeInterval(deadlines.reply)
+        let deadline = Date().addingTimeInterval(within ?? deadlines.reply)
         let line: [UInt8]
         do {
             try writeAll(fd, try encodeAgentRequest(AgentRequestFrame(id: id, request: request)), until: deadline)
@@ -342,7 +355,10 @@ final class AgentChannel: GuestAgent, @unchecked Sendable {
         exchangeLock.lock()
         defer { exchangeLock.unlock() }
         try machine.checkDeadlines(now: Date())
-        guard case .status(let s) = try exchange(.status) else { throw AgentViolation.wrongReply }
+        // In service, a slow answer is waited for up to `statusSilence` (issue #83); before it,
+        // `reply` as for every other request.
+        let within = machine.inService ? deadlines.statusSilence : deadlines.reply
+        guard case .status(let s) = try exchange(.status, within: within) else { throw AgentViolation.wrongReply }
         switch try machine.observe(s) {
         case .none, .started:
             return false
