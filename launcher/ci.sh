@@ -36,8 +36,14 @@ mkdir "$bundle"
 mkfile -n 64m "$bundle/disk.raw"
 before=$(ls -A "$bundle")
 
+# The guest size every validate below asks for. The framework caps a guest's memory
+# by the host's (about 7 GiB on GitHub's macOS runners, where validate refuses the
+# default 8 GiB), and a refusal below could then pass for that reason instead of its
+# own. The supervisor always passes --memory-mib, so this is how production calls it.
+fit="--memory-mib 4096"
+
 echo "--- validate accepts the launcher's own configuration"
-"$vm" validate "$bundle" --slot 0 --network shared-nat --wall-only | tee "$work/ok.txt"
+"$vm" validate "$bundle" --slot 0 --network shared-nat $fit --wall-only | tee "$work/ok.txt"
 /usr/bin/grep -q '^wall=ok' "$work/ok.txt"
 [ "$(ls -A "$bundle")" = "$before" ] || { echo "validate wrote into the bundle" >&2; exit 1; }
 
@@ -57,24 +63,24 @@ refuse() {
 }
 
 echo "--- validate refuses what breaks the wall"
-refuse "no slot" validate "$bundle" --network shared-nat --wall-only
-refuse "slot out of range" validate "$bundle" --slot 16 --network shared-nat --wall-only
-refuse "vmnet options on shared NAT" validate "$bundle" --slot 0 --network shared-nat --subnet 192.168.100.0/24 --wall-only
-refuse "vmnet without a network to check" validate "$bundle" --slot 0 --network vmnet --subnet 192.168.100.0/24 --wall-only
-refuse "unknown network mode" validate "$bundle" --slot 0 --network bridged --wall-only
-refuse "unknown option" validate "$bundle" --slot 0 --network shared-nat --share-dir /tmp --wall-only
+refuse "no slot" validate "$bundle" --network shared-nat $fit --wall-only
+refuse "slot out of range" validate "$bundle" --slot 16 --network shared-nat $fit --wall-only
+refuse "vmnet options on shared NAT" validate "$bundle" --slot 0 --network shared-nat --subnet 192.168.100.0/24 $fit --wall-only
+refuse "vmnet without a network to check" validate "$bundle" --slot 0 --network vmnet --subnet 192.168.100.0/24 $fit --wall-only
+refuse "unknown network mode" validate "$bundle" --slot 0 --network bridged $fit --wall-only
+refuse "unknown option" validate "$bundle" --slot 0 --network shared-nat --share-dir /tmp $fit --wall-only
 
 mkdir "$work/both"
 mkfile -n 1m "$work/both/disk.raw"
 mkfile -n 1m "$work/both/vz-hwmodel"
-refuse "a bundle of both kinds" validate "$work/both" --slot 0 --network shared-nat --wall-only
+refuse "a bundle of both kinds" validate "$work/both" --slot 0 --network shared-nat $fit --wall-only
 
 mkdir "$work/symlinked"
 ln -s "$bundle/disk.raw" "$work/symlinked/disk.raw"
-refuse "a symlinked disk" validate "$work/symlinked" --slot 0 --network shared-nat --wall-only
+refuse "a symlinked disk" validate "$work/symlinked" --slot 0 --network shared-nat $fit --wall-only
 
 ln -s "$work/elsewhere.log" "$work/console.log"
-refuse "a symlinked console log" validate "$bundle" --slot 0 --network shared-nat --console-log "$work/console.log" --wall-only
+refuse "a symlinked console log" validate "$bundle" --slot 0 --network shared-nat --console-log "$work/console.log" $fit --wall-only
 
 # The real binary's supervisor: it listens, answers a handshaken list, refuses a request
 # before hello, and exits on exit, removing its socket. No VM is started.
