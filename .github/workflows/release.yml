@@ -254,8 +254,15 @@ jobs:
           # The only leg; the header says why. Every step below runs on it: the
           # daemon, and the macOS-only menu-bar app, VM launcher and guest agent
           # (ADR-0026), all stamped with the daemon's version.
+          #
+          # `xcode-27` (macOS 27, Xcode 27; GitHub still marks it preview) and
+          # not `macos-26`: the launcher compiles against the macOS 27 SDK, which
+          # the macos-26 image does not ship (ci.yml's launcher job says why).
+          # The binaries still run on older macOS: launcher/build.sh and
+          # launcher/golden/build.sh pass every Swift binary `-target
+          # arm64-apple-macos15.0`, and Rust's own default target is older still.
           - target: aarch64-apple-darwin
-            os: macos-26
+            os: xcode-27
     env:
       VERSION: ${{ needs.plan.outputs.version }}
     steps:

@@ -355,13 +355,21 @@ jobs:
 
   launcher:
     # The VM launcher (ADR-0026) is Swift on Apple's Virtualization framework, with no
-    # package manager and no third-party code. It needs the macOS 26+ SDK for the
-    # per-VM vmnet network API, so it runs on the macOS 26 image. It builds and signs
-    # the launcher, runs its unit tests, and holds the real binary's configuration to
-    # the wall with `validate --wall-only`; --wall-only means nothing is booted.
-    # Booting a guest is the owner's builder-side check (launcher/README.md).
+    # package manager and no third-party code. It compiles against the macOS 27 SDK:
+    # the per-VM vmnet network API is macOS 26, and Machine.swift empties macOS 27's
+    # custom virtio device list and labels the VM. `#available` is checked at run time,
+    # so the SDK must still have both members. GitHub ships that SDK (Xcode 27) only
+    # on the `xcode-27` image, macOS 27, still marked preview
+    # (actions/runner-images#14404); `macos-26` has Xcode 26 alone. release.yml's
+    # build leg uses the same image, so this job tests the toolchain the release
+    # ships. Move both to a GA macOS 27 image once GitHub has one.
+    #
+    # It builds and signs the launcher, runs its unit tests, and holds the real
+    # binary's configuration to the wall with `validate --wall-only`; --wall-only
+    # means nothing is booted. Booting a guest is the owner's builder-side check
+    # (launcher/README.md).
     name: launcher · macos
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 30
     if: github.event_name == 'workflow_dispatch' # see test-macos
     steps:
