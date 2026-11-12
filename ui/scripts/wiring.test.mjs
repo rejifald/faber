@@ -196,3 +196,19 @@ test('an open group stays in full, and the first group always shows', () => {
   assert.equal(w.fitJobs({ ...base, room: 200, cap: 300, openIndex: 2 }).full, 3, 'the open group shows even past the cap');
   assert.equal(w.fitJobs({ ...base, heights: [500, 40], room: 200, cap: 700, openIndex: -1 }).full, 1);
 });
+
+test('every command the popover can send is registered with the app', async () => {
+  // A command missing from `generate_handler!` fails only at click time, as "command … not found"
+  // (set_pin did: the OOM-held row's Pin). Every literal `cmd:` the popover sends must be registered.
+  const { readFile } = await import('node:fs/promises');
+  const lib = await readFile(join(ui, '../desktop/src-tauri/src/lib.rs'), 'utf8');
+  const handler = lib.match(/generate_handler!\[([^\]]*)\]/);
+  assert.ok(handler, 'generate_handler! not found in desktop/src-tauri/src/lib.rs');
+  const registered = new Set(handler[1].split(',').map((s) => s.trim()).filter(Boolean));
+  const sent = new Set();
+  for (const f of ['src/popover/wiring.ts', 'src/popover/attention.ts']) {
+    for (const m of (await readFile(join(ui, f), 'utf8')).matchAll(/cmd: '([a-z_]+)'/g)) sent.add(m[1]);
+  }
+  assert.ok(sent.has('set_pin') && sent.has('set_paused'), 'the scan found the popover commands');
+  assert.deepEqual([...sent].filter((c) => !registered.has(c)), []);
+});
