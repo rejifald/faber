@@ -255,8 +255,8 @@ jobs:
           # daemon, and the macOS-only menu-bar app, VM launcher and guest agent
           # (ADR-0026), all stamped with the daemon's version.
           #
-          # `xcode-27` (macOS 27, Xcode 27; GitHub still marks it preview) and
-          # not `macos-26`: the launcher compiles against the macOS 27 SDK, which
+          # `xcode-27` (macOS 27, Xcode 27; generally available since 2026-10-15)
+          # and not `macos-26`: the launcher compiles against the macOS 27 SDK, which
           # the macos-26 image does not ship (ci.yml's launcher job says why).
           # The binaries still run on older macOS: launcher/build.sh and
           # launcher/golden/build.sh pass every Swift binary `-target
