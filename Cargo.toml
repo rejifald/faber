@@ -1,7 +1,11 @@
 [workspace]
 members = ["crates/faber-release", "crates/faber-mirror"]
 # The menu-bar app is its own package with its own lockfile (Tauri), and stays
-# outside the workspace; it depends on `faber-release` by path.
+# outside the workspace; it depends on `faber-release` by path. Cargo skips a
+# root that excludes a package and keeps looking further up, so in a checkout
+# nested inside another (a worktree) the app's manifest also declares an empty
+# `[workspace]` of its own; tests/workspace_layout.rs holds every excluded
+# package to that.
 exclude = ["desktop/src-tauri"]
 
 [package]
