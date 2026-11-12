@@ -359,10 +359,13 @@ jobs:
     # the per-VM vmnet network API is macOS 26, and Machine.swift empties macOS 27's
     # custom virtio device list and labels the VM. `#available` is checked at run time,
     # so the SDK must still have both members. GitHub ships that SDK (Xcode 27) only
-    # on the `xcode-27` image, macOS 27, still marked preview
+    # on the `xcode-27` image, macOS 27, which runner-images still marks preview
     # (actions/runner-images#14404); `macos-26` has Xcode 26 alone. release.yml's
-    # build leg uses the same image, so this job tests the toolchain the release
-    # ships. Move both to a GA macOS 27 image once GitHub has one.
+    # build leg uses the same image, so this job builds and tests the Swift binaries
+    # with the toolchain the release builds them with. The daemon's and the app's
+    # jobs above stay on `macos-latest` (Xcode 26), so the release run is the first
+    # to build those against the macOS 27 SDK. Revisit both labels when GitHub
+    # marks `xcode-27` GA.
     #
     # It builds and signs the launcher, runs its unit tests, and holds the real
     # binary's configuration to the wall with `validate --wall-only`; --wall-only

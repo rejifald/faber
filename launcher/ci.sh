@@ -37,9 +37,11 @@ mkfile -n 64m "$bundle/disk.raw"
 before=$(ls -A "$bundle")
 
 # The guest size every validate below asks for. The framework caps a guest's memory
-# by the host's (about 7 GiB on GitHub's macOS runners, where validate refuses the
-# default 8 GiB), and a refusal below could then pass for that reason instead of its
-# own. The supervisor always passes --memory-mib, so this is how production calls it.
+# by the host's: about 7 GiB on GitHub's macOS runners, where validate refuses the
+# default 8 GiB. The supervisor always passes --memory-mib, so this is how production
+# calls it. The refusals get it too, so each differs from the accepted call only in
+# what it breaks: today each is refused before the memory check, and none can start
+# passing on the memory cap if that order changes.
 fit="--memory-mib 4096"
 
 echo "--- validate accepts the launcher's own configuration"

@@ -313,8 +313,10 @@ jobs:
       # The setup actions take their inputs at their word. This asks the tools
       # themselves, so a toolchain that is not the pinned one stops the build
       # here, and the log records what built the release. Xcode and Swift come
-      # with the runner image, which is pinned to a macOS version but not to an
-      # Xcode: they are recorded, not checked.
+      # with the runner image. `xcode-27` fixes the Xcode major only, not the
+      # minor (27.0, 27.1 and 27.2 are installed, 27.1 the default) nor the macOS
+      # under it (it moved from 26 to 27 under that label): they are recorded,
+      # not checked.
       - name: Check and record the toolchains
         shell: bash
         run: |
