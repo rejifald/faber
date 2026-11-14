@@ -126,32 +126,67 @@ macro_rules! int_newtype {
 
 int_newtype!(
     /// A request id, chosen by the client: 1 to 4 294 967 295.
-    FrameId, u32, "u32", "frame id", 1, u32::MAX
+    FrameId,
+    u32,
+    "u32",
+    "frame id",
+    1,
+    u32::MAX
 );
 int_newtype!(
     /// A protocol version: 1 to 65 535.
-    ProtocolVersion, u16, "u16", "protocol version", 1, u16::MAX
+    ProtocolVersion,
+    u16,
+    "u16",
+    "protocol version",
+    1,
+    u16::MAX
 );
 int_newtype!(
     /// A launcher slot: 0 to 15.
-    Slot, u8, "u8", "slot", 0, SLOTS - 1
+    Slot,
+    u8,
+    "u8",
+    "slot",
+    0,
+    SLOTS - 1
 );
 int_newtype!(
     /// A vCPU count: 1 to 64.
-    Cpus, u8, "u8", "cpus", CPUS_MIN, CPUS_MAX
+    Cpus,
+    u8,
+    "u8",
+    "cpus",
+    CPUS_MIN,
+    CPUS_MAX
 );
 int_newtype!(
     /// A memory size in MiB: 1 024 to 262 144.
-    MemoryMib, u32, "u32", "memory_mib", MEMORY_MIB_MIN, MEMORY_MIB_MAX
+    MemoryMib,
+    u32,
+    "u32",
+    "memory_mib",
+    MEMORY_MIB_MIN,
+    MEMORY_MIB_MAX
 );
 int_newtype!(
     /// The size a Linux VM's disk is grown to before it boots: 1 MiB to 1 TiB, a
     /// whole number of MiB ([`Request::validate`] checks the multiple).
-    DiskBytes, u64, "u64", "disk_bytes", DISK_BYTES_ALIGN, DISK_BYTES_MAX
+    DiskBytes,
+    u64,
+    "u64",
+    "disk_bytes",
+    DISK_BYTES_ALIGN,
+    DISK_BYTES_MAX
 );
 int_newtype!(
     /// A time in seconds since the epoch: 0 to the year 2100.
-    UnixSecs, u64, "u64", "timestamp", 0, MAX_UNIX
+    UnixSecs,
+    u64,
+    "u64",
+    "timestamp",
+    0,
+    MAX_UNIX
 );
 
 fn grammar(s: &str, max: usize, first: fn(u8) -> bool, rest: fn(u8) -> bool) -> bool {
@@ -207,35 +242,63 @@ fn name_first(c: u8) -> bool {
 
 text_newtype!(
     /// faber's own claim id: first `[A-Za-z0-9]`, then `[A-Za-z0-9._-]`, 1 to 64 bytes.
-    ClaimId, "claim", MAX_CLAIM_LEN, alnum, |c| alnum(c) || matches!(c, b'.' | b'_' | b'-')
+    ClaimId,
+    "claim",
+    MAX_CLAIM_LEN,
+    alnum,
+    |c| alnum(c) || matches!(c, b'.' | b'_' | b'-')
 );
 text_newtype!(
     /// A name in the image store or the tools-disk cache, never a path: first
     /// `[a-z0-9]`, then `[a-z0-9._-]`, 1 to 64 bytes.
-    ImageName, "image name", MAX_NAME_LEN, name_first, |c| name_first(c) || matches!(c, b'.' | b'_' | b'-')
+    ImageName,
+    "image name",
+    MAX_NAME_LEN,
+    name_first,
+    |c| name_first(c) || matches!(c, b'.' | b'_' | b'-')
 );
 text_newtype!(
     /// The supervisor's version: 1 to 64 bytes of `[0-9A-Za-z.+-]`.
-    SupervisorVersion, "supervisor version", MAX_VERSION_LEN, |c| alnum(c) || matches!(c, b'.' | b'+' | b'-'), |c| alnum(c) || matches!(c, b'.' | b'+' | b'-')
+    SupervisorVersion,
+    "supervisor version",
+    MAX_VERSION_LEN,
+    |c| alnum(c) || matches!(c, b'.' | b'+' | b'-'),
+    |c| alnum(c) || matches!(c, b'.' | b'+' | b'-')
 );
 text_newtype!(
     /// Xcode's version line as `xcodebuild -version` prints it after `Xcode `:
     /// first a digit, then `[A-Za-z0-9. ]`, 1 to 32 bytes (`27.0`, `27.0 Beta 2`).
-    XcodeVersion, "xcode version", 32, |c| c.is_ascii_digit(), |c| alnum(c) || matches!(c, b'.' | b' ')
+    XcodeVersion,
+    "xcode version",
+    32,
+    |c| c.is_ascii_digit(),
+    |c| alnum(c) || matches!(c, b'.' | b' ')
 );
 text_newtype!(
     /// A build token (Xcode's or a runtime's): ASCII letters and digits, at most 16
     /// bytes. A `verify` holds each to at least 3 ([`Request::validate`]), as the
     /// golden build reads them.
-    BuildToken, "build", 16, alnum, alnum
+    BuildToken,
+    "build",
+    16,
+    alnum,
+    alnum
 );
 text_newtype!(
     /// A simulator runtime's platform, `iOS`, `watchOS`, …: 1 to 16 ASCII letters.
-    RuntimePlatform, "runtime platform", 16, |c| c.is_ascii_alphabetic(), |c| c.is_ascii_alphabetic()
+    RuntimePlatform,
+    "runtime platform",
+    16,
+    |c| c.is_ascii_alphabetic(),
+    |c| c.is_ascii_alphabetic()
 );
 text_newtype!(
     /// A runtime's version: digits and dots, first a digit, 1 to 16 bytes.
-    RuntimeVersion, "runtime version", 16, |c| c.is_ascii_digit(), |c| c.is_ascii_digit() || c == b'.'
+    RuntimeVersion,
+    "runtime version",
+    16,
+    |c| c.is_ascii_digit(),
+    |c| c.is_ascii_digit() || c == b'.'
 );
 
 /// A GitHub JIT runner configuration: a credential. Its `Debug` never prints the
