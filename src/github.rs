@@ -580,6 +580,34 @@ struct RepoSize {
 /// mirror lacks is fetched by the job, as before.
 const OPEN_PULL_PAGES: u32 = 10;
 
+/// Entries per page on every listing faber pages through: GitHub's maximum.
+const PAGE_SIZE: usize = 100;
+
+/// Pages of a run's jobs, a repo's runs at one status, or a repo's runners that
+/// faber reads at most (#66). Each listing used to stop after its first page, so
+/// a job past the 100th in its run was never found, and the job-start check
+/// (ADR-0059 §2) must find whichever job a runner took. Bounded so one runaway
+/// listing cannot turn a poll into hundreds of calls; GitHub itself stops a run's
+/// matrix at 256 jobs.
+const LIST_PAGES: u32 = 10;
+
+/// The path of page `page` of a listing whose first page is `first`. Page 1 is
+/// `first` itself, unchanged, so a listing that fits on one page costs the same
+/// request it always did.
+fn page_path(first: &str, page: u32) -> String {
+    if page <= 1 {
+        first.to_string()
+    } else {
+        format!("{first}&page={page}")
+    }
+}
+
+/// Whether a page of `len` entries is the last one: GitHub fills every page but
+/// the last.
+fn last_page(len: usize) -> bool {
+    len < PAGE_SIZE
+}
+
 /// A pull request as the gate reads it, to learn whose code a run carries
 /// (ADR-0059 §3): who opened it, and the commit its head is at.
 #[derive(Debug, Clone, Deserialize)]
@@ -1858,13 +1886,22 @@ impl Github {
         owner_repo: &str,
         status: &str,
     ) -> Result<Vec<WorkflowRun>, GithubError> {
-        let page: RunsPage = self
-            .get(
-                &format!("repos/{owner_repo}/actions/runs?status={status}&per_page=100"),
-                Scope::of(owner_repo, Permission::ActionsRead),
-            )
-            .await?;
-        Ok(page.workflow_runs)
+        let first = format!("repos/{owner_repo}/actions/runs?status={status}&per_page={PAGE_SIZE}");
+        let mut out = Vec::new();
+        for n in 1..=LIST_PAGES {
+            let page: RunsPage = self
+                .get(
+                    &page_path(&first, n),
+                    Scope::of(owner_repo, Permission::ActionsRead),
+                )
+                .await?;
+            let last = last_page(page.workflow_runs.len());
+            out.extend(page.workflow_runs);
+            if last {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// The login of the authenticated user (faber's account owner) — used to
@@ -1902,22 +1939,41 @@ impl Github {
         Ok((viewer.login, expiry))
     }
 
-    /// Jobs for a run. There is no repo-wide queued-jobs endpoint, so callers
-    /// filter by `status`/`labels` client-side.
+    /// Jobs for a run, every page of them (#66). There is no repo-wide
+    /// queued-jobs endpoint, so callers filter by `status`/`labels` client-side.
     pub async fn run_jobs(&self, owner_repo: &str, run_id: u64) -> Result<Vec<Job>, GithubError> {
-        let page: JobsPage = self
-            .get(
-                &format!("repos/{owner_repo}/actions/runs/{run_id}/jobs?per_page=100"),
-                Scope::of(owner_repo, Permission::ActionsRead),
-            )
-            .await?;
-        Ok(page.jobs)
+        let first = format!("repos/{owner_repo}/actions/runs/{run_id}/jobs?per_page={PAGE_SIZE}");
+        let mut out = Vec::new();
+        for n in 1..=LIST_PAGES {
+            let page: JobsPage = self
+                .get(
+                    &page_path(&first, n),
+                    Scope::of(owner_repo, Permission::ActionsRead),
+                )
+                .await?;
+            let last = last_page(page.jobs.len());
+            out.extend(page.jobs);
+            if last {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// One workflow run by its id: the facts the job-start check judges a job
+    /// by when the run is not in this cycle's scan (ADR-0059 §2).
+    pub async fn run(&self, owner_repo: &str, run_id: u64) -> Result<WorkflowRun, GithubError> {
+        self.get(
+            &format!("repos/{owner_repo}/actions/runs/{run_id}"),
+            Scope::of(owner_repo, Permission::ActionsRead),
+        )
+        .await
     }
 
     /// One job by its stable id, or `Ok(None)` when GitHub no longer has it (404 —
     /// e.g. the run was deleted or its logs expired). The authoritative
     /// terminal-state check for a *parked* claim (a job faber claimed but has not
-    /// yet spawned a runner for): the reconcile loop's run scan is single-page and
+    /// yet spawned a runner for): the reconcile loop's run scan is
     /// eventually-consistent, so "absent from the scan" is too weak to release a
     /// claim on — a still-`queued` job on a later page would be dropped and
     /// double-provisioned. A direct fetch is the trustworthy signal.
@@ -1938,16 +1994,24 @@ impl Github {
     /// The self-hosted runners registered on `owner/repo`, with their live `busy`
     /// flags. Used to reclaim an *admitted* claim: faber matches its own runner by
     /// the `faber-{job_id}-` name prefix and kills it only when it is idle
-    /// (`busy == false`). Single-page like the run/job scans — a personal account's
-    /// simultaneously-registered ephemeral runners sit well under 100.
+    /// (`busy == false`). Every page, like the run and job scans (#66).
     pub async fn list_runners(&self, owner_repo: &str) -> Result<Vec<Runner>, GithubError> {
-        let page: RunnersPage = self
-            .get(
-                &format!("repos/{owner_repo}/actions/runners?per_page=100"),
-                Scope::of(owner_repo, Permission::Administration),
-            )
-            .await?;
-        Ok(page.runners)
+        let first = format!("repos/{owner_repo}/actions/runners?per_page={PAGE_SIZE}");
+        let mut out = Vec::new();
+        for n in 1..=LIST_PAGES {
+            let page: RunnersPage = self
+                .get(
+                    &page_path(&first, n),
+                    Scope::of(owner_repo, Permission::Administration),
+                )
+                .await?;
+            let last = last_page(page.runners.len());
+            out.extend(page.runners);
+            if last {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// The registration named exactly `name`, or `Ok(None)` when none exists.
@@ -3770,6 +3834,39 @@ mod tests {
             items.join(",")
         );
         Box::leak(body.into_boxed_str())
+    }
+
+    /// A jobs page of `n` jobs with ids from `from`.
+    fn jobs_body(from: u64, n: u64) -> &'static str {
+        let jobs: Vec<String> = (from..from + n)
+            .map(|i| format!(r#"{{"id":{i},"name":"j{i}","status":"queued"}}"#))
+            .collect();
+        Box::leak(format!(r#"{{"total_count":0,"jobs":[{}]}}"#, jobs.join(",")).into_boxed_str())
+    }
+
+    /// #66: a job past the 100th in its run is found. The listing reads on while
+    /// pages come back full, and page 1 is the request it always was.
+    #[tokio::test]
+    async fn a_runs_jobs_are_read_past_the_first_page() {
+        let (addr, seen) =
+            spawn_scripted_api(vec![(200, jobs_body(1, 100)), (200, jobs_body(101, 3))]).await;
+        let gh = Github::at(format!("http://{addr}"));
+        let jobs = gh.run_jobs("owner/demo", 7).await.expect("jobs");
+        assert_eq!(jobs.len(), 103);
+        assert_eq!(jobs.last().map(|j| j.id), Some(103));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "GET /repos/owner/demo/actions/runs/7/jobs?per_page=100",
+                "GET /repos/owner/demo/actions/runs/7/jobs?per_page=100&page=2",
+            ]
+        );
+
+        // A page that is not full is the last: one request.
+        let (addr, seen) = spawn_scripted_api(vec![(200, jobs_body(1, 4))]).await;
+        let gh = Github::at(format!("http://{addr}"));
+        assert_eq!(gh.run_jobs("owner/demo", 7).await.expect("jobs").len(), 4);
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     /// A whole answer comes back whole, one page or several.
