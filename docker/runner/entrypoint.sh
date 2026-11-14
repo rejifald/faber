@@ -49,12 +49,18 @@ fi
 # could have read a runner's one-time registration secret and taken its job.
 # ACTIONS_RUNNER_INPUT_JITCONFIG is upstream's own mechanism, not faber's
 # invention — its CommandSettings constructor reads any
-# ACTIONS_RUNNER_INPUT_<ARG> variable as that argument's fallback, then scrubs
-# it from its own process environment before a job step ever runs (verified
-# against actions/runner's source; see src/runner.rs, which uses the same
-# variable for the native backend). RUNNER_JITCONFIG is unset first so the old
-# name never rides into the runner's process tree — nothing there would scrub
-# it, and every job step would otherwise inherit it from its own environment.
+# ACTIONS_RUNNER_INPUT_<ARG> variable as that argument's fallback, and scrubs
+# it from the runner's own process (verified against actions/runner's source).
+# RUNNER_JITCONFIG is unset so the old name is not inherited by the runner's
+# children either.
+#
+# Off argv is all this buys. It does not keep the config from the job: the
+# `exec` below makes run.sh PID 1, which keeps this environment, the exported
+# variable included, and a step running as the runner's user can read it
+# there (/proc/1/environ). The container's own config carries RUNNER_JITCONFIG
+# as well. By then the config is spent, since the runner registered with it and
+# took its one job, and faber's job-start hook (ADR-0059) does not depend on it
+# staying secret.
 export ACTIONS_RUNNER_INPUT_JITCONFIG="$RUNNER_JITCONFIG"
 unset RUNNER_JITCONFIG
 

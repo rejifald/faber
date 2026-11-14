@@ -52,8 +52,9 @@ use tracing::{debug, info, warn};
 
 use crate::cache;
 use crate::docker::{
-    docker_lines, docker_rm, docker_stdout, live_status_filters, CLI_TIMEOUT, KIND_DIND, KIND_NET,
-    KIND_REGISTRY_AUTH, KIND_RUNNER, KIND_VOL, LABEL_ID, LABEL_KIND, LABEL_OWNED, TEARDOWN_TIMEOUT,
+    docker_lines, docker_rm, docker_stdout, live_status_filters, CLI_TIMEOUT, KIND_DIND, KIND_HOOK,
+    KIND_NET, KIND_REGISTRY_AUTH, KIND_RUNNER, KIND_VOL, LABEL_ID, LABEL_KIND, LABEL_OWNED,
+    TEARDOWN_TIMEOUT,
 };
 use crate::host;
 use crate::image::EvictTier;
@@ -815,6 +816,10 @@ async fn sweep(orch: &Orchestrator) {
     // listing because repeated `label=` filters are ANDed (see
     // [`container_ps_args`]).
     volumes.extend(list(&credential_volume_ls_args()).await);
+    // The job-started hook volumes (ADR-0059 §1), labelled from their first
+    // moment like the credential volumes, and listed on their own for the same
+    // reason.
+    volumes.extend(list(&kind_volume_ls_args(KIND_HOOK)).await);
     // A dind's `dockerd` never exits on its own, so a dind orphaned by a crash /
     // forced shutdown / skipped teardown is invisible to the exited-only
     // `containers` listing above and would leak forever (its memory and its
@@ -1186,16 +1191,21 @@ fn services_to_reap(
 /// but one an earlier release or a crash left behind is reaped like the dind
 /// volume, once its claim is no longer in flight.
 ///
+/// [`KIND_HOOK`] is per-job too: the read-only volume holding a runner's
+/// job-started hook (ADR-0059 §1), and the container that filled it. Teardown
+/// removes both; one a crash left is reaped once its claim is out of flight.
+///
 /// [`KIND_SERVICE`] is a per-job service container (ADR-0046 §3), torn down with
 /// its runner. [`crate::services::KIND_SERVICE_SERVER`] is deliberately absent:
 /// the shared server, its volume and its home network carry no job id, outlive
 /// every job, and are retired by idle stop, never by the janitor (§7).
-const REAPABLE_KINDS: [&str; 6] = [
+const REAPABLE_KINDS: [&str; 7] = [
     KIND_RUNNER,
     KIND_DIND,
     KIND_NET,
     KIND_VOL,
     KIND_REGISTRY_AUTH,
+    KIND_HOOK,
     KIND_SERVICE,
 ];
 
@@ -1333,11 +1343,16 @@ fn volume_ls_args() -> Vec<String> {
 /// `org.faber.id` is out of flight, and the daemon's `in use` refusal shields one
 /// a runner still mounts.
 fn credential_volume_ls_args() -> Vec<String> {
+    kind_volume_ls_args(KIND_REGISTRY_AUTH)
+}
+
+/// The `docker volume ls` argv for one per-job volume `kind`, by its label.
+fn kind_volume_ls_args(kind: &str) -> Vec<String> {
     vec![
         "volume".into(),
         "ls".into(),
         "--filter".into(),
-        format!("label={LABEL_KIND}={KIND_REGISTRY_AUTH}"),
+        format!("label={LABEL_KIND}={kind}"),
         "--format".into(),
         candidate_format(".Name"),
     ]
@@ -1852,6 +1867,7 @@ mod tests {
             KIND_NET,
             KIND_VOL,
             KIND_REGISTRY_AUTH,
+            KIND_HOOK,
         ] {
             assert!(REAPABLE_KINDS.contains(&kind), "{kind}");
         }

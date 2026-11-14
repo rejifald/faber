@@ -1213,6 +1213,10 @@ struct Names {
     /// dind's `/var/lib/docker` volume. Named so teardown (and the sweep) can
     /// remove it; anonymous, it would outlive `docker rm` and leak per job.
     vol: String,
+    /// The read-only volume holding the job-started hook (ADR-0059 §1), and
+    /// the container that fills it.
+    hook: String,
+    hook_fill: String,
 }
 
 /// The claim id a runner's containers carry as `org.faber.id`
@@ -1232,6 +1236,8 @@ impl Names {
             dind: format!("faber-dind-{id}"),
             runner: format!("faber-runner-{id}"),
             vol: format!("faber-vol-{id}"),
+            hook: format!("faber-hook-{id}"),
+            hook_fill: format!("faber-hook-fill-{id}"),
         }
     }
 }
@@ -2160,6 +2166,20 @@ async fn run_in_sandbox(
     let mirror = mirror.unwrap_or_default();
     let mirror_secret_names = mirror.secret_env.names();
 
+    // The job-started hook (ADR-0059 §1), in a read-only volume filled over
+    // stdin, and checked to be in place. A runner whose hook is missing would
+    // fail the hook's step and let the job's `always()` steps run, so a fill
+    // that fails or reads back short starts no runner: the error fails the
+    // provision before anything ran, and teardown removes the volume.
+    fill_hook_volume(names, owner_repo, &cfg.image, &claim.hook.script())
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "installing the job-started hook for {}: {e:#}",
+                names.runner
+            )
+        })?;
+
     // Last seam before the runner exists. `Command::status()` spawns eagerly, so
     // without this the container below would start and be killed a moment later by
     // the `select!`'s cancel arm — a reclaimed claim would still pay for a launch.
@@ -2198,6 +2218,7 @@ async fn run_in_sandbox(
                 service_env: &service_env,
                 mirror_env: &mirror.env,
                 mirror_secret_env: &mirror_secret_names,
+                hook_vol: Some(&names.hook),
             },
             cfg,
             &limits.runner,
@@ -3336,33 +3357,62 @@ pub(crate) async fn remove_image(tag: &str) -> anyhow::Result<bool> {
 // runner this host minted. Neither is a general-purpose path, and neither should
 // become one.
 
-/// Kill a runner's containers **without asking the runner** (ADR-0030).
+/// Kill a runner's containers **without asking the runner** (ADR-0030, ADR-0059 §4).
 ///
 /// Every other kill of a live runner goes through [`reclaim_clearance`]
 /// (ADR-0017): it refuses while a job is executing, because the job it would abort
 /// is legitimate work. This one exists precisely for the job that is executing —
 /// a job the gate refuses as possibly hostile, which took a runner minted for
-/// another. The job has already started, so this caps the damage rather than
-/// preventing it. The provision task watching the runner sees it exit and tears
+/// another, or one refused when it started. ADR-0017 protects legitimate work,
+/// and this is not. The provision task watching the runner sees it exit and tears
 /// the sandbox down as for any other exit.
 ///
 /// The runner first, then its dind, where the job's own containers live — the
 /// dind whatever happened to the runner, since a runner that already exited may
 /// have left the job's containers running. A container that is absent or no
-/// longer running is already where the kill would put it. An error only when
-/// both kills genuinely failed; one failure alone is logged.
+/// longer running is already where the kill would put it.
+///
+/// Retried until the runner is gone (ADR-0059 §4: "retrying until the runner is
+/// gone"), up to [`FORCE_KILL_TRIES`] times here. Gone is read back from Docker,
+/// not inferred from `docker kill` answering: a kill the daemon accepted but did
+/// not carry out is the case the retry is for. An error when the runner is still
+/// running after the last try; the caller keeps it and tries again on its next
+/// pass, because a runner that outlives this is still executing a refused job.
 pub(crate) async fn force_kill_runner(runner_name: &str) -> anyhow::Result<()> {
     let names = Names::for_runner(runner_name);
-    let runner = docker_rm(&["kill", &names.runner])
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string());
-    let dind = docker_rm(&["kill", &names.dind])
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string());
-    kill_verdict(&names, runner, dind)
+    let mut last = None;
+    for attempt in 1..=FORCE_KILL_TRIES {
+        let runner = docker_rm(&["kill", &names.runner])
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let dind = docker_rm(&["kill", &names.dind])
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let verdict = kill_verdict(&names, runner, dind);
+        // Gone means Docker says it is not running, or not there at all. An
+        // unreadable answer is not gone.
+        if verdict.is_ok() && container_running(&names.runner).await == Some(false) {
+            return Ok(());
+        }
+        last = Some(match verdict {
+            Ok(()) => anyhow::anyhow!("{} is still running after the kill", names.runner),
+            Err(e) => e,
+        });
+        if attempt < FORCE_KILL_TRIES {
+            tokio::time::sleep(FORCE_KILL_BACKOFF * attempt).await;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("killing {} did not run", names.runner)))
 }
+
+/// How many times [`force_kill_runner`] tries before it hands the runner back to
+/// its caller's next pass.
+const FORCE_KILL_TRIES: u32 = 4;
+
+/// The pause between two of [`force_kill_runner`]'s tries, times the try number.
+const FORCE_KILL_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Whether a failed `docker kill` only says the container is already stopped.
 fn kill_moot(err: &str) -> bool {
@@ -3371,6 +3421,12 @@ fn kill_moot(err: &str) -> bool {
 }
 
 /// [`force_kill_runner`]'s result from the two kills.
+///
+/// The runner's kill decides it. A runner whose kill failed is still executing a
+/// refused job, whatever happened to its dind, so that is an error (#66: it used
+/// to read as done when the dind's kill worked, and nothing tried again). A dind
+/// whose kill alone failed is logged: the runner, which ran the job's steps, is
+/// stopped, and teardown removes the dind with the sandbox.
 fn kill_verdict(
     names: &Names,
     runner: Result<(), String>,
@@ -3385,15 +3441,11 @@ fn kill_verdict(
             names.dind
         ),
         (Err(e), Ok(())) => {
-            warn!(
-                "gate bypass: killing {} failed ({e}); its dind was killed",
-                names.runner
-            );
-            Ok(())
+            anyhow::bail!("killing {} failed ({e}); its dind was killed", names.runner)
         }
         (Ok(()), Err(e)) => {
             warn!(
-                "gate bypass: killing {} failed ({e}); the runner was killed",
+                "forced stop: killing {} failed ({e}); the runner was killed",
                 names.dind
             );
             Ok(())
@@ -3861,6 +3913,10 @@ async fn teardown(
     if let Err(e) = docker_rm(&["network", "rm", &names.net]).await {
         warn!("teardown: removing network {}: {e}", names.net);
     }
+    // The job-started hook's volume (ADR-0059 §1), once the runner that mounted
+    // it is gone. Absent when the run never got as far as filling it, which
+    // `volume rm` answers as already done.
+    remove_volume(&names.hook).await;
     // Only `names.vol` — dind's per-job `/var/lib/docker`. The `faber-cache-<repo>`
     // volume ([`cache_volume_name`]) is deliberately absent from here and from
     // [`Names`] entirely: persisting across jobs is its whole purpose, so it is not
@@ -4244,6 +4300,12 @@ pub(crate) struct CredentialFill<'a> {
 /// a loaded disk deleted it (#348). The fill is judged by its exit, and
 /// [`CredentialVolume::fill`] removes the container after.
 fn credential_fill_args(f: &CredentialFill<'_>) -> Vec<String> {
+    fill_args(f, CREDENTIAL_FILL_SCRIPT)
+}
+
+/// [`credential_fill_args`] with the script the fill container runs: the
+/// credential's, or the hook's ([`HOOK_FILL_SCRIPT`]).
+fn fill_args(f: &CredentialFill<'_>, script: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
         "-i".into(),
@@ -4263,7 +4325,7 @@ fn credential_fill_args(f: &CredentialFill<'_>) -> Vec<String> {
     args.push(f.image.into());
     args.extend([
         "-c".to_string(),
-        CREDENTIAL_FILL_SCRIPT.to_string(),
+        script.to_string(),
         "sh".to_string(),
         f.dir.to_string(),
         f.file.to_string(),
@@ -4385,6 +4447,127 @@ impl Drop for CredentialVolume {
     }
 }
 
+// --- the job-started hook (ADR-0059) -----------------------------------------
+
+/// The script the hook fill runs as `sh -c`, with the mount directory and the
+/// file name as `$1` and `$2`. Unlike a credential, the hook is no secret and
+/// must be readable by whichever user the runner runs as, so it is `0644` in a
+/// `0755` directory, root's. The mount is read-only in the runner, so no user
+/// there can change it. It prints the file's size, which faber checks against
+/// what it sent: that is the check that the hook is in place.
+const HOOK_FILL_SCRIPT: &str = r#"set -e
+umask 022
+cat > "$1/$2"
+chmod 0755 "$1"
+chmod 0644 "$1/$2"
+wc -c < "$1/$2"
+"#;
+
+/// Create the runner's hook volume and write `script` into it over the fill
+/// container's stdin, then check it is all there (ADR-0059 §1). The fill runs
+/// from the runner's own image, which is local (`--pull=never`), with no
+/// network. An error names the step; the caller starts no runner on one, and
+/// teardown removes the volume.
+async fn fill_hook_volume(
+    names: &Names,
+    owner_repo: &str,
+    image: &str,
+    script: &str,
+) -> anyhow::Result<()> {
+    let labels = marks(KIND_HOOK, owner_repo, &names.id);
+    docker_ok(&volume_create_args(&names.hook, &labels), CLI_TIMEOUT)
+        .await
+        .map_err(|e| anyhow::anyhow!("creating volume {}: {e}", names.hook))?;
+    let f = CredentialFill {
+        volume: &names.hook,
+        labels: &labels,
+        container: &names.hook_fill,
+        image,
+        dir: crate::job_start::HOOK_DIR,
+        file: crate::job_start::HOOK_FILE,
+        owner: None,
+    };
+    let mut cmd = docker_command();
+    cmd.args(fill_args(&f, HOOK_FILL_SCRIPT));
+    let out = untrusted::output_within_fed(
+        cmd,
+        script.as_bytes().to_vec(),
+        LAUNCH_TIMEOUT,
+        CREDENTIAL_FILL_CAP,
+        "docker run (hook fill)",
+    )
+    .await;
+    // The fill container has done its work either way; removing it is cleanup,
+    // and one that fails is reaped by its kind.
+    let container = names.hook_fill.clone();
+    tokio::spawn(async move {
+        if let Err(e) = docker_rm(&["rm", "-f", &container]).await {
+            warn!("hook fill: removing container {container}: {e}");
+        }
+    });
+    let out = out?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "filling {}: docker exited {}: {}",
+            names.hook,
+            out.status,
+            stderr_of(&out)
+        );
+    }
+    hook_in_place(&String::from_utf8_lossy(&out.stdout), script.len())
+        .map_err(|e| anyhow::anyhow!("filling {}: {e}", names.hook))
+}
+
+/// Whether the fill's report of the written file's size (`wc -c`) says the
+/// whole hook is in place.
+fn hook_in_place(reported: &str, sent: usize) -> anyhow::Result<()> {
+    match reported.trim().parse::<usize>() {
+        Ok(n) if n == sent && n > 0 => Ok(()),
+        Ok(n) => anyhow::bail!("the hook file holds {n} bytes, not the {sent} written"),
+        Err(_) => anyhow::bail!("the fill did not report the hook file's size"),
+    }
+}
+
+/// What a runner's container shows of its job and its hook right now, by the
+/// name the runner registered with GitHub (ADR-0059 §2). Read from `docker top`
+/// with the executable names and parent pids only: never the command lines.
+pub(crate) async fn job_start_seen(runner_name: &str) -> crate::job_start::Seen {
+    use crate::job_start::{Seen, Top};
+    let names = Names::for_runner(runner_name);
+    match docker_output(&["top", &names.runner, "-eo", "pid,ppid,comm"], CLI_TIMEOUT).await {
+        Ok(out) if out.status.success() => {
+            Seen::Running(Top::parse(&String::from_utf8_lossy(&out.stdout)))
+        }
+        _ => match container_running(&names.runner).await {
+            Some(false) => Seen::Gone,
+            Some(true) | None => Seen::Unknown,
+        },
+    }
+}
+
+/// Write a verdict into a runner's container through the Docker API (ADR-0059
+/// §2): `docker cp -` extracts [`crate::job_start::Delivery::archive`], read
+/// from this child's stdin, into the directory the hook waits on. The caller
+/// delivers only to a hook it has just seen waiting.
+pub(crate) async fn deliver_verdict(runner_name: &str, archive: Vec<u8>) -> anyhow::Result<()> {
+    let names = Names::for_runner(runner_name);
+    let target = format!("{}:{}", names.runner, crate::job_start::VERDICT_DIR);
+    let mut cmd = docker_command();
+    cmd.args(["cp", "-", target.as_str()]);
+    let out = untrusted::output_within_fed(
+        cmd,
+        archive,
+        CLI_TIMEOUT,
+        CREDENTIAL_FILL_CAP,
+        "docker cp (verdict)",
+    )
+    .await?;
+    if !out.status.success() {
+        anyhow::bail!("docker exited {}: {}", out.status, stderr_of(&out));
+    }
+    Ok(())
+}
+
 /// Label key stamped on every resource faber creates. Its presence is the
 /// authoritative answer to "is this mine?".
 pub(crate) const LABEL_OWNED: &str = "org.faber.owned";
@@ -4412,6 +4595,9 @@ pub(crate) const KIND_DIND: &str = "dind";
 pub(crate) const KIND_NET: &str = "net";
 /// The per-job dind `/var/lib/docker` volume.
 pub(crate) const KIND_VOL: &str = "vol";
+/// The per-job read-only volume holding the runner's job-started hook
+/// (ADR-0059 §1), and the short-lived container that filled it.
+pub(crate) const KIND_HOOK: &str = "hook";
 /// The persistent per-repo build cache (ADR-0005). Emphatically **not** a
 /// per-job kind: it is dangling between jobs and must outlive every one of
 /// them, so it is absent from [`crate::sweep`]'s reapable set and the sweep
@@ -4507,6 +4693,12 @@ const LABEL_SERVES: &str = "org.faber.serves";
 /// reads it to detach its services at teardown and to name them in its outcome.
 const LABEL_SERVICES: &str = "org.faber.services";
 
+/// What the runner's job-started hook does at its deadline with no verdict,
+/// decided at mint (ADR-0059 §1): `allow` or `refuse`. Absent on a container
+/// started before the hook existed, which then has no hook, and is left to
+/// bypass detection: watching it would only report a hook fault on every job.
+const LABEL_HOOK: &str = "org.faber.hook";
+
 /// The claim facts stamped on a runner container so a later process can rebuild
 /// it (ADR-0011). Built by `reconcile::spawn_provision`, which is the only place
 /// that knows all five at once.
@@ -4524,6 +4716,9 @@ pub struct ClaimMarks {
     /// [`crate::services::ServicePlan::mark`]: the runner's services. Empty = none,
     /// and then no [`LABEL_SERVICES`] is stamped at all.
     pub services: String,
+    /// The runner's job-started hook (ADR-0059 §1): its deadline, and its
+    /// outcome at the deadline, stamped as [`LABEL_HOOK`].
+    pub hook: crate::job_start::HookPlan,
 }
 
 /// The `--label` flags carrying [`ClaimMarks`]. Appended to [`marks`] for the
@@ -4538,6 +4733,7 @@ fn claim_marks(c: &ClaimMarks) -> Vec<String> {
         format!("{LABEL_RESERVED}={}", c.reserved_mib),
         format!("{LABEL_RESERVED_MCPU}={}", c.reserved_mcpu),
         format!("{LABEL_SERVES}={}", c.serves),
+        format!("{LABEL_HOOK}={}", c.hook.outcome.as_str()),
     ]
     .into_iter()
     .chain((!c.services.is_empty()).then(|| format!("{LABEL_SERVICES}={}", c.services)))
@@ -4615,6 +4811,10 @@ struct Mounts<'a> {
     /// ([`crate::mirror::Injection::secret_env`]): names only, like the services';
     /// their values travel in the `docker` CLI child's own environment.
     mirror_secret_env: &'a [&'a str],
+    /// The volume holding the job-started hook (ADR-0059 §1), mounted read-only.
+    /// Every runner [`run_in_sandbox`] starts has one; `None` only in tests of
+    /// the other mounts.
+    hook_vol: Option<&'a str>,
 }
 
 /// `docker network create` for a per-job network, optionally pinned to `subnet`.
@@ -4704,10 +4904,23 @@ fn dind_run_args(
 /// any local account could read it and take the job. A security review found
 /// `docker/runner/entrypoint.sh` doing exactly that; it now hands the value to
 /// `run.sh` as `ACTIONS_RUNNER_INPUT_JITCONFIG` in the environment instead —
-/// the runner's own CLI parser reads that as `--jitconfig`'s fallback and
-/// scrubs it from its own process environment before a job step ever runs.
-/// Every third-party runner image's entrypoint must do the same.
-const RUNNER_JITCONFIG_ENV: &str = "RUNNER_JITCONFIG";
+/// the runner's own CLI parser reads that as `--jitconfig`'s fallback. Every
+/// third-party runner image's entrypoint must do the same.
+///
+/// That keeps it off argv, and no more. It does **not** keep it from the job
+/// (#66). The runner scrubs the variable from its own process, but the
+/// container's PID 1 was started with it and still carries it in its
+/// environment, and a step running as the runner's user can read that
+/// (`/proc/1/environ`); the container's own config (`docker inspect`) carries
+/// `RUNNER_JITCONFIG` too. By the time a step runs, the config is spent: the
+/// runner has registered with it and taken its one job. Nothing faber relies on
+/// treats it as a secret from the job, and the job-start hook (ADR-0059) in
+/// particular must never depend on it staying one.
+///
+/// A profile's `env` cannot name it: `faber check-config` and the settings save
+/// refuse one that does, and the boot drops it with a warning
+/// ([`crate::config::FABER_OWNED_ENV`]).
+pub(crate) const RUNNER_JITCONFIG_ENV: &str = "RUNNER_JITCONFIG";
 
 /// Whether a failed runner launch is retried once without the git mirror
 /// (ADR-0035 §2: if anything about the mount fails, the job runs without it).
@@ -4785,7 +4998,14 @@ fn runner_run_args(
     args.extend_from_slice(marks);
     // Resource ceilings are `docker run` flags, so they must precede the image.
     limits.push_args(&mut args);
-    for (k, v) in &cfg.env {
+    // A faber-owned name never comes from a profile (ADR-0059 §1): the boot
+    // drops one already, and this keeps any other path to `cfg.env` from
+    // deciding the JIT config or the hook.
+    for (k, v) in cfg
+        .env
+        .iter()
+        .filter(|(k, _)| crate::config::faber_owned_env(k).is_none())
+    {
         args.push("-e".into());
         args.push(format!("{k}={v}"));
     }
@@ -4813,6 +5033,21 @@ fn runner_run_args(
     for name in mounts.mirror_secret_env {
         args.push("-e".into());
         args.push((*name).to_string());
+    }
+    // The job-started hook (ADR-0059 §1), last of all, so faber's value of the
+    // variable is the one the runner sees whatever came before it: Docker
+    // resolves a repeated `-e` to its last occurrence. `:ro`, so nothing in the
+    // container can rewrite the hook, and the hook has run before any of the
+    // job's code can try.
+    if let Some(vol) = mounts.hook_vol {
+        args.push("-v".into());
+        args.push(format!("{vol}:{}:ro", crate::job_start::HOOK_DIR));
+        args.push("-e".into());
+        args.push(format!(
+            "{}={}",
+            crate::job_start::HOOK_ENV,
+            crate::job_start::hook_path()
+        ));
     }
     args.push(cfg.image.clone());
     args
@@ -4950,6 +5185,10 @@ pub struct Adopted {
     /// the same: its corpse still carries the exit code and the OOM verdict, which
     /// is strictly more than the sweep would have recovered.
     pub running: bool,
+    /// What its job-started hook does at the deadline ([`LABEL_HOOK`]), or
+    /// `None` for a container started before the hook existed, which has none
+    /// (ADR-0059 §2: runners adopted after a restart get their verdicts).
+    pub hook: Option<crate::job_start::DeadlineOutcome>,
     names: Names,
 }
 
@@ -5294,6 +5533,9 @@ fn adopted_from(c: &Inspected) -> Option<Adopted> {
         services: services_from_label(c.label(LABEL_SERVICES)),
         started_ms: epoch_ms_from_rfc3339(&c.started_at)?,
         running: c.running,
+        hook: c
+            .label(LABEL_HOOK)
+            .and_then(crate::job_start::DeadlineOutcome::parse),
         names: Names::for_runner(&format!("faber-{id}")),
     })
 }
@@ -6390,6 +6632,10 @@ mod tests {
             reserved_mcpu: 2500,
             serves: "1.61.1".into(),
             services: String::new(),
+            hook: crate::job_start::HookPlan {
+                outcome: crate::job_start::DeadlineOutcome::Allow,
+                deadline: Duration::from_secs(180),
+            },
         };
         let m = runner_marks("owner/demo", "42-1700", &claim);
         let kv: Vec<&String> = m.iter().filter(|a| *a != "--label").collect();
@@ -6405,6 +6651,8 @@ mod tests {
             "org.faber.reserved-mib=1024",
             "org.faber.reserved-mcpu=2500",
             "org.faber.serves=1.61.1",
+            // ADR-0059 §2: the hook's deadline outcome, for adoption.
+            "org.faber.hook=allow",
         ] {
             assert!(kv.iter().any(|v| **v == expected), "missing {expected}");
         }
@@ -6896,6 +7144,88 @@ mod tests {
         c
     }
 
+    /// ADR-0059 §1, #66: every runner mounts its hook read-only, and faber's
+    /// value of the hook variable is the one Docker keeps (the last `-e`),
+    /// whatever the profile's `env` says. A profile naming the JIT config's
+    /// variable does not reach the argv either.
+    #[test]
+    fn the_hook_variable_wins_over_a_profile_env() {
+        let mut c = cfg();
+        c.env.insert(
+            crate::job_start::HOOK_ENV.to_string(),
+            "/evil.js".to_string(),
+        );
+        c.env
+            .insert(RUNNER_JITCONFIG_ENV.to_string(), "forged".to_string());
+        let a = runner_run_args(
+            "faber-runner-5-100",
+            "n",
+            Mounts {
+                hook_vol: Some("faber-hook-5-100"),
+                ..Default::default()
+            },
+            &c,
+            &ResourceLimits::default(),
+            &[],
+        );
+        let ours = format!(
+            "{}={}",
+            crate::job_start::HOOK_ENV,
+            crate::job_start::hook_path()
+        );
+        let hook_settings: Vec<&String> = a
+            .iter()
+            .filter(|s| s.starts_with(crate::job_start::HOOK_ENV))
+            .collect();
+        assert_eq!(hook_settings, vec![&ours], "{a:?}");
+        assert!(!a
+            .iter()
+            .any(|s| s.contains("/evil.js") || s.contains("forged")));
+        assert!(a.windows(2).any(|w| w
+            == [
+                "-v".to_string(),
+                format!("faber-hook-5-100:{}:ro", crate::job_start::HOOK_DIR)
+            ]));
+        // Last before the image, after every other flag.
+        let image = a.len() - 1;
+        assert_eq!(a[image], c.image);
+        assert_eq!(a[image - 1], ours);
+        // The profile's other variables still reach the runner.
+        assert!(a
+            .iter()
+            .any(|s| s == "PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright"));
+    }
+
+    /// The presence check: a hook is in place only when the fill reports the
+    /// size faber wrote.
+    #[test]
+    fn a_hook_is_in_place_only_at_its_full_size() {
+        assert!(hook_in_place("4096\n", 4096).is_ok());
+        assert!(hook_in_place("  4096 ", 4096).is_ok());
+        assert!(hook_in_place("4000", 4096).is_err());
+        assert!(hook_in_place("0", 0).is_err());
+        assert!(hook_in_place("", 4096).is_err());
+        // The fill writes the file readable by the runner's user, under the
+        // directory the runner mounts read-only, and never as a credential.
+        let labels = marks(KIND_HOOK, "owner/demo", "5-100");
+        let names = Names::for_runner("faber-5-100");
+        let f = CredentialFill {
+            volume: &names.hook,
+            labels: &labels,
+            container: &names.hook_fill,
+            image: "faber-runner:local",
+            dir: crate::job_start::HOOK_DIR,
+            file: crate::job_start::HOOK_FILE,
+            owner: None,
+        };
+        let a = fill_args(&f, HOOK_FILL_SCRIPT);
+        assert!(a.iter().any(|s| s == "--pull=never"));
+        assert!(a.windows(2).any(|w| w == ["--network", "none"]));
+        assert!(a.iter().any(|s| s.contains("chmod 0644")));
+        assert!(a.iter().any(|s| s == &format!("{LABEL_KIND}={KIND_HOOK}")));
+        assert_eq!(names.hook, "faber-hook-5-100");
+    }
+
     #[test]
     fn a_bypass_finds_the_repo_cache_by_label_alone() {
         // ADR-0030 deletes exactly one repo's cache, and AGENTS.md: labels, never
@@ -6954,7 +7284,9 @@ mod tests {
         assert!(kill_verdict(&names, Ok(()), Ok(())).is_ok());
         assert!(kill_verdict(&names, gone(), Ok(())).is_ok());
         assert!(kill_verdict(&names, gone(), gone()).is_ok());
-        assert!(kill_verdict(&names, broken(), Ok(())).is_ok());
+        // #66: a runner whose kill failed is still running the refused job, so
+        // the dind's kill working does not make the stop done.
+        assert!(kill_verdict(&names, broken(), Ok(())).is_err());
         assert!(kill_verdict(&names, Ok(()), broken()).is_ok());
         assert!(kill_verdict(&names, broken(), broken()).is_err());
         assert!(kill_moot("Error: No such container: faber-dind-5-100"));
