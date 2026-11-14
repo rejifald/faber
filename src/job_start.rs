@@ -376,6 +376,11 @@ pub enum Act {
 /// lookup is a few GitHub calls.
 pub const SEARCH_EVERY: Duration = Duration::from_secs(4);
 
+/// How late faber may first see a hook that is already waiting: one pass of the
+/// job-start loop (2 s, `JOB_START_TICK` in reconcile.rs), a second for the pass
+/// that sees it leave, and the hook's own 250 ms poll, rounded up.
+pub const HOOK_SEEN_GRACE: Duration = Duration::from_secs(5);
+
 /// One runner faber started, from its mint until its job is decided and done.
 #[derive(Debug, Clone)]
 pub struct Watch {
@@ -609,6 +614,13 @@ impl Watch {
         // deadline, or gone with the worker still running and no allow given.
         let never_seen =
             self.hook_since.is_none() && now.saturating_sub(since) >= ms(deadlines.search);
+        if self.hook_gone && self.delivered.is_none() && self.allowed_at_deadline(now, deadlines) {
+            // The hook left at its own deadline under an allow outcome: the
+            // job runs as planned, so there is nothing left to watch and the
+            // bypass check judges it as before.
+            self.ended = true;
+            return acts;
+        }
         let vanished = self.hook_gone && !self.allowed_at_deadline(now, deadlines);
         if self.delivered.is_none() && (never_seen || vanished) {
             let refused = matches!(self.decision(), Some(StartDecision::Refuse(_)));
@@ -634,7 +646,10 @@ impl Watch {
     /// Whether the hook's own deadline has passed under an allow outcome, so a
     /// hook that left without faber's verdict ran its job as the plan said.
     fn allowed_at_deadline(&self, now: u64, deadlines: &JobStartDeadlines) -> bool {
-        let hook = u64::try_from(deadlines.hook.as_millis()).unwrap_or(u64::MAX);
+        // `hook_since` is when faber first saw the hook, never before the hook
+        // started, so the hook's deadline can fall up to a grace earlier on it.
+        let hook = u64::try_from(deadlines.hook.saturating_sub(HOOK_SEEN_GRACE).as_millis())
+            .unwrap_or(u64::MAX);
         self.outcome == DeadlineOutcome::Allow
             && self
                 .hook_since
@@ -945,6 +960,28 @@ mod tests {
         assert!(w
             .step(91_000, top(true, false), &d, OnBypass::Record)
             .is_empty());
+    }
+
+    #[test]
+    fn a_hook_seen_late_that_leaves_on_time_is_not_a_fault() {
+        let d = deadlines();
+        let mut w = watch(DeadlineOutcome::Allow);
+        // The worker is seen at 0; the hook, which started then, only at 1.5 s.
+        w.step(0, top(true, false), &d, OnBypass::Record);
+        w.step(1_500, top(true, true), &d, OnBypass::Record);
+        // It leaves at its deadline (90 s after it started), 1 s early by
+        // faber's clock.
+        let acts = w.step(
+            1_500 + 90_000 - 1_000,
+            top(true, false),
+            &d,
+            OnBypass::Enforce,
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Act::HookFault { .. })),
+            "{acts:?}"
+        );
+        assert!(w.ended());
     }
 
     #[test]
