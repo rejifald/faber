@@ -17,6 +17,7 @@ func testAgent(_ t: Harness, _ scratch: Scratch) {
     testAgentChannel(t)
     testAgentChannelNoJob(t)
     testAgentViolations(t)
+    testAgentStatusSilence(t)
     testGuestPieces(t)
     testHandoffGate(t, scratch)
 }
@@ -539,6 +540,95 @@ private func scripted(_ fd: Int32, hello: String? = nil, _ script: @escaping @Se
 }
 
 private func ready(_ id: UInt32) -> [UInt8] { line(#"{"id":\#(id),"reply":{"status":{"phase":"ready"}}}"#) }
+
+private func running(_ id: UInt32) -> [UInt8] { line(#"{"id":\#(id),"reply":{"status":{"phase":"running"}}}"#) }
+private func exited(_ id: UInt32) -> [UInt8] {
+    line(#"{"id":\#(id),"reply":{"status":{"phase":"exited","exit_code":0,"job":"started"}}}"#)
+}
+
+/// Issue #83: once a job has begun, a `status` reply later than `reply` is waited for, up to
+/// `statusSilence`, and the VM is not stopped for it. An agent silent past `statusSilence` is
+/// still `timeout`, and before `begin` a late reply is `timeout` at `reply`, as it always was.
+@MainActor
+private func testAgentStatusSilence(_ t: Harness) {
+    // reply 0.3 s, silence 1.5 s; the slow answer takes 0.8 s, past one and inside the other.
+    let d = AgentDeadlines(ready: 5, reply: 0.3, started: 5, statusSilence: 1.5, poll: 0.05, lockWait: 0.4)
+    let slow: UInt32 = 800_000
+
+    /// Walk to begin, then answer statuses by `after(nAfterBegin, id)`. Returns the channel's
+    /// violation (nil when none was reported within `wait`) and whether the job finished.
+    func walk(_ name: String, wait: Double, after: @escaping @Sendable (Int, UInt32) -> [UInt8]?) -> (AgentViolation?, Bool) {
+        guard let (host, guest) = socketPair() else {
+            t.check("\(name): socketpair", false)
+            return (nil, false)
+        }
+        let violation = Box<AgentViolation?>(nil)
+        let begun = Box(-1)
+        let status = ChildStatus()
+        _ = status.move(from: .starting, to: .booting)
+        scripted(guest) { n, f in
+            switch f.request {
+            case .probe: return line(#"{"id":\#(f.id),"reply":{"probed":{"sent":3}}}"#)
+            case .begin:
+                begun.set(n)
+                return line(#"{"id":\#(f.id),"reply":{"accepted":{}}}"#)
+            default:
+                if begun.get < 0 { return ready(f.id) }
+                return after(n - begun.get, f.id)
+            }
+        }
+        let channel = AgentChannel(status: status, probeTarget: "192.168.64.1", deadlines: d) { violation.set($0) }
+        channel.start()
+        channel.connect(fd: host, owner: nil)
+        _ = eventually { status.state == .ready }
+        t.accepts("\(name): probe") { try channel.sendProbe() }
+        _ = status.move(from: .ready, to: .probeSent)
+        t.accepts("\(name): begin") { try channel.begin(jitConfig: JitConfig(secret)) }
+        _ = status.move(from: .probeSent, to: .inService)
+        let finished = eventually(wait) { violation.get != nil || status.state == .jobFinished }
+            && status.state == .jobFinished
+        let seen = violation.get
+        status.set(.stopping)
+        usleep(150_000)
+        close(host)
+        close(guest)
+        return (seen, finished)
+    }
+
+    // Late answers mid-job, each inside the bound: the job runs to its end.
+    let (late, finished) = walk("late status in service", wait: 6) { k, id in
+        if k <= 2 { return running(id) }
+        if k <= 5 { usleep(slow); return running(id) }
+        return exited(id)
+    }
+    t.check("a status answered past reply, inside statusSilence, in service is no violation",
+            late == nil, "\(String(describing: late))")
+    t.check("the job with late answers still finishes", finished)
+
+    // An agent that falls silent mid-job is still stopped, as timeout.
+    let started = Date()
+    let (silent, _) = walk("silent in service", wait: 4) { k, id in k <= 2 ? running(id) : nil }
+    t.check("an agent silent past statusSilence in service is timeout", silent == .timeout, "\(String(describing: silent))")
+    t.check("…and not before statusSilence", Date().timeIntervalSince(started) >= d.statusSilence)
+
+    // Before begin, a late status is timeout at `reply`, unchanged.
+    guard let (host, guest) = socketPair() else { return t.check("socketpair", false) }
+    let violation = Box<AgentViolation?>(nil)
+    let status = ChildStatus()
+    _ = status.move(from: .starting, to: .booting)
+    scripted(guest) { n, f in
+        if n >= 2 { usleep(slow) }
+        return ready(f.id)
+    }
+    let channel = AgentChannel(status: status, probeTarget: "192.168.64.1", deadlines: d) { violation.set($0) }
+    channel.start()
+    channel.connect(fd: host, owner: nil)
+    t.check("a status answered past reply before begin is timeout", eventually { violation.get != nil } && violation.get == .timeout,
+            "\(String(describing: violation.get))")
+    usleep(100_000)
+    close(host)
+    close(guest)
+}
 
 @MainActor
 private func testAgentViolations(_ t: Harness) {
