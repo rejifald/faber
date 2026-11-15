@@ -1479,6 +1479,51 @@ async fn unhold(app: AppHandle, state: State<'_, AppState>) -> Result<(), String
     }
 }
 
+/// The body of a `POST /api/pin` request (the daemon's `web::PinUpdate`).
+/// CPU is left out: the daemon defaults it to "still learned".
+#[derive(Debug, Serialize)]
+struct PinRequest {
+    class: String,
+    runner_mib: u64,
+    dind_mib: u64,
+    pin: bool,
+}
+
+/// `POST /api/pin` — pin a class's memory cap (the learner stops sizing it) or,
+/// with `pin = false`, hand it back to the learner. The popover's OOM-held row
+/// sends this with the caps the daemon says stop the OOMs (ADR-0053). Same
+/// shape as `clear_repo_hold`.
+#[tauri::command]
+async fn set_pin(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    class: String,
+    runner_mib: u64,
+    dind_mib: u64,
+    pin: bool,
+) -> Result<(), String> {
+    let url = format!("{}/api/pin", state.base_url);
+    let resp = state
+        .client
+        .post(&url)
+        .json(&PinRequest {
+            class,
+            runner_mib,
+            dind_mib,
+            pin,
+        })
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        poll_once(&app).await;
+        Ok(())
+    } else {
+        Err(body_or_status(resp).await)
+    }
+}
+
 /// The body of a `POST /api/repo-hold/clear` request.
 #[derive(Debug, Serialize)]
 struct RepoHoldClear {
@@ -1993,6 +2038,7 @@ pub fn run() {
             hold,
             unhold,
             clear_repo_hold,
+            set_pin,
             dismiss_attention,
             restore_attention,
             ack_trust,
