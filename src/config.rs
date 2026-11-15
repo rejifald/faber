@@ -242,6 +242,14 @@
 //! # dispatched workflow's labels and secrets (ADR-0059). Turning it on warns at
 //! # every boot.
 //! allow_job_token_dispatches = false
+//! # Every runner faber starts waits, at job start, for faber's verdict on the
+//! # job GitHub actually gave it (ADR-0059). faber looks for that job for up to
+//! # job_start_search_secs; the runner's hook waits up to job_start_deadline_secs
+//! # and then applies the outcome decided when the runner was minted. Both must
+//! # outlast one poll interval plus a daemon restart, and the search must end
+//! # before the hook's deadline.
+//! job_start_search_secs = 120
+//! job_start_deadline_secs = 180
 //!
 //! # Each profile leads with the `faber` tag (so a job's `runs-on` self-documents
 //! # who provisions it) plus a per-executor label that routes to the backend.
@@ -1447,6 +1455,116 @@ pub struct GatePolicy {
     /// on, faber warns at every boot and on the dashboard.
     #[serde(default)]
     pub allow_job_token_dispatches: bool,
+    /// How long faber looks for the job a runner was handed, and judges it,
+    /// once it notices the assignment (ADR-0059 §2). It gives up before the
+    /// hook's deadline, [`Self::job_start_deadline_secs`].
+    #[serde(default = "default_job_start_search_secs")]
+    pub job_start_search_secs: u64,
+    /// How long a runner's job-started hook waits for faber's verdict before it
+    /// applies the outcome decided at mint (ADR-0059 §1).
+    #[serde(default = "default_job_start_deadline_secs")]
+    pub job_start_deadline_secs: u64,
+}
+
+/// [`GatePolicy::job_start_search_secs`] when unstated: two minutes, which
+/// outlasts the default poll interval plus a daemon restart.
+pub const DEFAULT_JOB_START_SEARCH_SECS: u64 = 120;
+/// [`GatePolicy::job_start_deadline_secs`] when unstated: a minute past the
+/// search, so a verdict faber found at the end of it still reaches the hook.
+pub const DEFAULT_JOB_START_DEADLINE_SECS: u64 = 180;
+/// What a daemon restart is allowed to take, on top of one poll interval, when
+/// the job-start deadlines are checked (ADR-0059 §2: "both outlast one poll
+/// interval plus a daemon restart").
+pub const JOB_START_RESTART_SECS: u64 = 60;
+/// How long before the hook's deadline faber's search must end, so the verdict
+/// it found last still has time to be delivered.
+pub const JOB_START_DELIVERY_SECS: u64 = 30;
+
+fn default_job_start_search_secs() -> u64 {
+    DEFAULT_JOB_START_SEARCH_SECS
+}
+
+fn default_job_start_deadline_secs() -> u64 {
+    DEFAULT_JOB_START_DEADLINE_SECS
+}
+
+/// The two job-start deadlines in force (ADR-0059 §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobStartDeadlines {
+    /// How long faber searches for, and judges, the job a runner took.
+    pub search: Duration,
+    /// How long the runner's hook waits for the verdict.
+    pub hook: Duration,
+}
+
+impl Default for JobStartDeadlines {
+    fn default() -> Self {
+        Self {
+            search: Duration::from_secs(DEFAULT_JOB_START_SEARCH_SECS),
+            hook: Duration::from_secs(DEFAULT_JOB_START_DEADLINE_SECS),
+        }
+    }
+}
+
+impl GatePolicy {
+    /// What is wrong with the job-start deadlines under `poll_secs`, as
+    /// `faber check-config` and the settings save print it. Empty when nothing
+    /// is.
+    pub fn job_start_errors(&self, poll_secs: u64) -> Vec<String> {
+        let mut errs = Vec::new();
+        let floor = poll_secs.saturating_add(JOB_START_RESTART_SECS);
+        if self.job_start_search_secs < floor {
+            errs.push(format!(
+                "gate.job_start_search_secs must be at least {floor} — one poll interval \
+                 ({poll_secs} s) plus {JOB_START_RESTART_SECS} s for a daemon restart \
+                 (ADR-0059 §2)"
+            ));
+        }
+        let hook_floor = self
+            .job_start_search_secs
+            .saturating_add(JOB_START_DELIVERY_SECS);
+        if self.job_start_deadline_secs < hook_floor {
+            errs.push(format!(
+                "gate.job_start_deadline_secs must be at least {hook_floor} — \
+                 {JOB_START_DELIVERY_SECS} s past gate.job_start_search_secs, so faber gives \
+                 up its search before the runner's hook gives up waiting (ADR-0059 §2)"
+            ));
+        }
+        errs
+    }
+
+    /// The deadlines a daemon runs with under `poll_secs`. Values
+    /// [`Self::job_start_errors`] refuses are warned about and raised to the
+    /// least that satisfies it, never refused at boot (AGENTS.md).
+    pub fn job_start_deadlines(&self, poll_secs: u64) -> JobStartDeadlines {
+        for e in self.job_start_errors(poll_secs) {
+            tracing::warn!("{e}; using the least value that is");
+        }
+        let search = self
+            .job_start_search_secs
+            .max(poll_secs.saturating_add(JOB_START_RESTART_SECS));
+        let hook = self
+            .job_start_deadline_secs
+            .max(search.saturating_add(JOB_START_DELIVERY_SECS));
+        JobStartDeadlines {
+            search: Duration::from_secs(search),
+            hook: Duration::from_secs(hook),
+        }
+    }
+}
+
+/// The variables of a runner's environment that are faber's to set, never a
+/// profile's (ADR-0059 §1, #66): the JIT config the runner registers with, and
+/// the job-started hook that judges what it runs. Docker resolves a repeated
+/// `-e` to its last occurrence, so a profile `env` naming either would decide
+/// it. `faber check-config` and the settings save refuse a profile that names
+/// one; a daemon booting with one warns and leaves it out of the runner.
+pub const FABER_OWNED_ENV: [&str; 2] = ["RUNNER_JITCONFIG", "ACTIONS_RUNNER_HOOK_JOB_STARTED"];
+
+/// The faber-owned variable `name` is, if it is one. Matched after trimming, as
+/// Docker would read the name.
+pub fn faber_owned_env(name: &str) -> Option<&'static str> {
+    FABER_OWNED_ENV.into_iter().find(|n| *n == name.trim())
 }
 
 /// The boot warning and dashboard notice while `[gate]
@@ -1475,6 +1593,8 @@ impl Default for GatePolicy {
             allow_public_repos: false,
             on_bypass: crate::gate::OnBypass::default(),
             allow_job_token_dispatches: false,
+            job_start_search_secs: DEFAULT_JOB_START_SEARCH_SECS,
+            job_start_deadline_secs: DEFAULT_JOB_START_DEADLINE_SECS,
         }
     }
 }
@@ -3587,6 +3707,7 @@ impl FileConfig {
         if self.poll_interval_secs == 0 {
             errs.push("poll_interval_secs must be at least 1".into());
         }
+        errs.extend(self.gate.job_start_errors(self.poll_interval_secs));
 
         // The autoupdate knobs are only checked for shapes that would make the
         // updater unable to work at all. A wrong-but-valid repo is not something
@@ -3767,6 +3888,15 @@ impl FileConfig {
             }
             if p.env.keys().any(|k| k.trim().is_empty()) {
                 errs.push(format!("{who}: env names must not be blank"));
+            }
+            // ADR-0059 §1: faber sets these after a profile's `env`, but a
+            // profile naming one means the operator expects it to decide, and a
+            // future reordering would let it. Refused where a human is looking.
+            for name in p.env.keys().filter_map(|k| faber_owned_env(k)) {
+                errs.push(format!(
+                    "{who}: env must not set {name} — faber sets it on every runner it starts \
+                     (ADR-0059)"
+                ));
             }
             if matches!(p.backend, BackendKind::MacosVm) {
                 errs.extend(
@@ -4400,7 +4530,26 @@ impl FileConfig {
                         if let Some(d) = &p.dind_image {
                             cfg.dind_image = d.clone();
                         }
-                        cfg.env = p.env.clone();
+                        // ADR-0059 §1: a faber-owned name is warned about and
+                        // left out, never refused at boot (AGENTS.md).
+                        cfg.env = p
+                            .env
+                            .iter()
+                            .filter(|(k, _)| match faber_owned_env(k) {
+                                Some(name) => {
+                                    tracing::warn!(
+                                        "profile '{}': env sets {name}, which faber sets on \
+                                         every runner it starts (ADR-0059) — leaving the \
+                                         profile's value out. Run `faber check-config` to fix \
+                                         the file.",
+                                        p.name
+                                    );
+                                    false
+                                }
+                                None => true,
+                            })
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
                         cfg.cache_volume = p.cache_volume;
                         cfg.git_mirror = p.git_mirror;
                         cfg.mirror = p.mirror;
@@ -6618,6 +6767,78 @@ image = "macos-27"
         assert!(!b.allow_public_repos);
     }
 
+    /// ADR-0059 §1, #66: a profile's `env` naming a variable faber sets on
+    /// every runner is refused where a human is looking, and left out of the
+    /// runner by a daemon booting with it.
+    #[test]
+    fn a_profile_env_naming_a_faber_variable_is_refused_and_dropped_at_boot() {
+        for name in FABER_OWNED_ENV {
+            let text = format!(
+                r#"
+topic = "faber"
+[[profile]]
+name = "d"
+labels = ["faber", "docker"]
+backend = "docker"
+image = "faber-runner:local"
+dind = false
+[profile.env]
+{name} = "/elsewhere.js"
+KEPT = "1"
+"#
+            );
+            let cfg: FileConfig = toml::from_str(&text).unwrap();
+            let errs = cfg.validate_structural();
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains(name) && e.contains("must not set")),
+                "{name}: {errs:?}"
+            );
+            let profiles = cfg.into_profiles("2.335.1").unwrap();
+            let Backend::Docker(d) = &profiles[0].backend else {
+                panic!("a docker profile");
+            };
+            assert!(!d.env.contains_key(name), "{name} reached the runner");
+            assert_eq!(d.env.get("KEPT").map(String::as_str), Some("1"));
+        }
+        // A name that only looks like one is not refused.
+        assert_eq!(faber_owned_env("ACTIONS_RUNNER_HOOK_JOB_COMPLETED"), None);
+        assert_eq!(
+            faber_owned_env(" RUNNER_JITCONFIG "),
+            Some("RUNNER_JITCONFIG")
+        );
+    }
+
+    /// ADR-0059 §2: both job-start deadlines come from config, outlast a poll
+    /// plus a restart, and the search ends before the hook's deadline.
+    #[test]
+    fn the_job_start_deadlines_outlast_a_poll_and_end_in_order() {
+        let gate = GatePolicy::default();
+        assert!(gate.job_start_errors(DEFAULT_POLL_SECS).is_empty());
+        assert_eq!(
+            gate.job_start_deadlines(DEFAULT_POLL_SECS),
+            JobStartDeadlines::default()
+        );
+        let cfg: FileConfig =
+            toml::from_str("[gate]\njob_start_search_secs = 90\njob_start_deadline_secs = 100\n")
+                .unwrap();
+        let errs = cfg.gate.job_start_errors(20);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("job_start_deadline_secs"));
+        assert!(cfg
+            .validate_structural()
+            .iter()
+            .any(|e| e.contains("job_start_deadline_secs")));
+        // A daemon raises what check-config refuses, never boots without it.
+        let d = cfg.gate.job_start_deadlines(20);
+        assert_eq!(d.search, Duration::from_secs(90));
+        assert_eq!(d.hook, Duration::from_secs(120));
+        // A slow poll raises the search too.
+        let d = gate.job_start_deadlines(300);
+        assert_eq!(d.search, Duration::from_secs(360));
+        assert_eq!(d.hook, Duration::from_secs(390));
+    }
+
     #[test]
     fn an_absent_on_bypass_records_and_a_stated_one_reaches_every_profile() {
         // ADR-0030: hosts rely on bypasses running today, so a config that says
@@ -7583,6 +7804,8 @@ allowed_events = ["pull_request_target"]"#,
             // be asking for its own pushed code to run.
             "[gate]\nallow_job_token_dispatches = true",
             "allow_job_token_dispatches = true",
+            "[gate]\njob_start_deadline_secs = 1",
+            "job_start_search_secs = 1",
         ] {
             assert!(
                 toml::from_str::<RepoConfig>(forbidden).is_err(),

@@ -66,9 +66,17 @@ holds the launcher's frames to the same strictness, as defence in depth.
     (`--agent-ready-timeout`). The guest's desktop session was measured at about
     57 s after boot in the 2026-10-10 spike (ADR-0026); faber's own macOS VMs
     start in a login session (ADR-0051).
-  - **every reply:** 1.5 s. `probe` and `begin` are answered inside the
-    supervisor's 2 s call to the child, so neither waits on slow work: `begin`
-    replies once the config is held, and the runner starts after.
+  - **every reply:** 1.5 s, except `status` in service (below). `probe` and
+    `begin` are answered inside the supervisor's 2 s call to the child, so neither
+    waits on slow work: `begin` replies once the config is held, and the runner
+    starts after.
+  - **`status` in service:** 30 s. Once `begin` or `verify` is accepted, a
+    `status` reply may take up to 30 s. A guest saturating its vCPUs on a long
+    compile can answer later than 1.5 s, and one late answer among the thousands a
+    long job makes must not stop the VM (issue #83). It stays a bound: an agent
+    silent for 30 s in service is `timeout`. Nothing else waits behind the poll
+    then, since `probe`, `begin` and `verify` all come before it. Before service,
+    `status` keeps 1.5 s, because `probe` and `begin` wait on the same lock.
   - **started:** after `begin`, the agent must report `running` (or `exited`)
     within 300 s. That is longer than the guest's own deadlines add up to: 50 s
     for the Software Update writes before the hand-off (5 s each plus 5 s for its
