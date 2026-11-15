@@ -38,3 +38,5 @@ faber-release = { path = "../../crates/faber-release" }
 # policy for end-to-end tests. Never on by default.
 sandbox-policy = ["faber-release/sandbox-policy"]
 
+# Its own workspace root: a worktree nested inside another checkout would otherwise fail to build.
+[workspace]
