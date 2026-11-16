@@ -11,7 +11,7 @@ repository = "https://github.com/rejifald/faber"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 over a downloaded release asset, before faber will execute it.
-sha2 = "0.10"
+sha2 = "0.11"
 tracing = "0.1"
 # The release verifier (ADR-0031, #119): a follower checks a release's GitHub
 # attestation in-process. Every crate of the family is pinned exactly, the
