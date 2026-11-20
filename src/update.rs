@@ -3494,8 +3494,9 @@ async fn request_session_supervisor_restart<C, R>(
             }
         }
         Err(why) => info!(
-            "no macOS VM session to restart onto launcher {version} ({why}): its supervisor \
-             starts on it at the next login"
+            "no macOS VM session to restart onto launcher {version} (its supervisor: {}): it \
+             starts on it at the next login",
+            why.sentence()
         ),
     }
 }
@@ -6303,10 +6304,10 @@ mod tests {
         }
     }
 
-    struct Session(Result<(), String>);
+    struct Session(Result<(), crate::vm::admit::ProbeFailure>);
 
     impl crate::vm::session::Handshake for Session {
-        async fn reach(&self) -> Result<(), String> {
+        async fn reach(&self) -> Result<(), crate::vm::admit::ProbeFailure> {
             self.0.clone()
         }
     }
@@ -6321,7 +6322,7 @@ mod tests {
         let h = test_handle(tmp.paths(), "1.2.3");
         let ok = SupervisorVersion::try_from("1.2.3").unwrap();
         let fake = FakeRestart::new(Ok(RestartOutcome::Restarted { version: ok }));
-        let down = Session(Err("no socket".into()));
+        let down = Session(Err(crate::vm::admit::ProbeFailure::NoSocket));
         request_session_supervisor_restart(&down, &fake, "1.2.3", &h).await;
         assert_eq!(fake.calls(), 0);
         assert!(h.view().supervisor_restart.is_none());

@@ -197,7 +197,12 @@ fn vm_lines(vm: &serde_json::Value) -> Vec<String> {
         .and_then(|v| v.as_str())
         .filter(|s| *s != "not_required")
     {
-        let mut line = format!("session  {}", field(session));
+        let state = match session {
+            "agent_down" => "agent down",
+            "no_account" => "no account",
+            other => other,
+        };
+        let mut line = format!("session  {}", field(state));
         if let Some(why) = vm.get("session_detail").and_then(|v| v.as_str()) {
             line.push_str(&format!(" · {}", field(why)));
         }
@@ -994,6 +999,18 @@ mod tests {
                 "\nsession  down · log _faber_mac in: the supervisor's socket is not there\n"
             ),
             "{down}"
+        );
+        // #95: a logged-in session whose agent is down, in words of its own.
+        let agent = at(serde_json::json!({
+            "wall": "open", "session": "agent_down",
+            "session_detail": "_faber_mac is logged in, but its VM supervisor does not answer",
+        }));
+        assert!(
+            agent.contains(
+                "\nsession  agent down · _faber_mac is logged in, but its VM supervisor does \
+                 not answer\n"
+            ),
+            "{agent}"
         );
         // ADR-0049 §7: a golden image's standing, and what to do about it.
         let golden = at(serde_json::json!({

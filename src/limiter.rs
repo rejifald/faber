@@ -1744,6 +1744,18 @@ impl Limiter {
         });
     }
 
+    /// Record a probe of the session supervisor with what the probe saw of the
+    /// session account (#95): a failure while it is logged in is its agent's,
+    /// and is told apart from a missing session ([`admit::session_state`]).
+    pub fn observe_vm_session_probe(
+        &self,
+        probe: Result<(), admit::ProbeFailure>,
+        presence: admit::Presence,
+        uid: u32,
+    ) {
+        self.set_vm_session(|mode| admit::session_state(mode, probe, presence, uid));
+    }
+
     /// Record that the record's session account is not this host's
     /// `_faber_mac` (`why` says how), so faber does not connect to it.
     pub fn observe_no_session_account(&self, why: String) {
@@ -1768,6 +1780,10 @@ impl Limiter {
                 VmSession::Down { mode, why } => warn!(
                     "autolimiter: no macOS VM session ({why}) — starting no macOS VM job: {}",
                     mode.action()
+                ),
+                VmSession::AgentDown { uid, probe } => warn!(
+                    "autolimiter: {} — starting no macOS VM job",
+                    admit::agent_down_detail(*uid, probe)
                 ),
                 VmSession::NoAccount(why) => {
                     warn!("autolimiter: {why} — starting no macOS VM job")
@@ -2132,12 +2148,7 @@ impl Limiter {
             wall_detail: wall.detail(),
             wall_required: inner.vm.wall_required,
             session: inner.vm.session.as_str(),
-            session_detail: match &inner.vm.session {
-                VmSession::NoAccount(why) => Some(why.clone()),
-                VmSession::Unprobed(mode) => Some(format!("not probed yet: {}", mode.action())),
-                VmSession::Down { mode, why } => Some(format!("{}: {why}", mode.action())),
-                VmSession::NotRequired | VmSession::Up => None,
-            },
+            session_detail: inner.vm.session.detail(),
             macos_running: inner.vm.macos_running,
             macos_cap: inner.vm.layout.macos_vms,
             macos_vm_mib: inner.vm.layout.macos_vm_mib,
@@ -9082,12 +9093,27 @@ mod vm_admission_tests {
         drop(running);
     }
 
-    struct Probes(std::sync::Mutex<Vec<Result<(), String>>>);
+    struct Probes(std::sync::Mutex<Vec<Result<(), admit::ProbeFailure>>>);
 
     impl crate::vm::session::Handshake for Probes {
-        async fn reach(&self) -> Result<(), String> {
+        async fn reach(&self) -> Result<(), admit::ProbeFailure> {
             self.0.lock().unwrap().remove(0)
         }
+    }
+
+    /// Who is logged in, as the console users list would say.
+    struct Seen(admit::Presence);
+
+    impl crate::vm::session::SessionPresence for Seen {
+        async fn presence(&self) -> admit::Presence {
+            self.0.clone()
+        }
+    }
+
+    const NOBODY: Seen = Seen(admit::Presence::Absent);
+
+    fn other(why: &str) -> Result<(), admit::ProbeFailure> {
+        Err(admit::ProbeFailure::Other(why.into()))
     }
 
     /// ADR-0051's "no VM session" gate: absent until the record's session
@@ -9099,13 +9125,13 @@ mod vm_admission_tests {
         let l = lim();
         l.observe_wall(Judgement::Green);
         let probes = Probes(std::sync::Mutex::new(vec![
-            Err("ignored".into()),
-            Err("the supervisor's socket is not there".into()),
+            other("ignored"),
+            other("the supervisor's socket is not there"),
             Ok(()),
-            Err("connection refused".into()),
+            other("connection refused"),
         ]));
         // No session account recorded: no gate, and a probe changes nothing.
-        probe_once(&probes, &l).await;
+        probe_once(&probes, &NOBODY, 600, &l).await;
         assert_eq!(l.snapshot().vm.session, "not_required");
         let a = l
             .vm_begin(None)
@@ -9129,7 +9155,7 @@ mod vm_admission_tests {
             )
         );
 
-        probe_once(&probes, &l).await;
+        probe_once(&probes, &NOBODY, 600, &l).await;
         assert_eq!(gate_of(l.vm_begin(None)), "vm_session");
         let view = l.snapshot().vm;
         assert_eq!(view.session, "down");
@@ -9138,13 +9164,13 @@ mod vm_admission_tests {
             .unwrap()
             .ends_with("the supervisor's socket is not there"));
 
-        probe_once(&probes, &l).await;
+        probe_once(&probes, &NOBODY, 600, &l).await;
         assert_eq!(l.snapshot().vm.session, "up");
         let a = l.vm_begin(None).expect("the session answers");
 
         // Down again: the running job keeps its slot, new ones wait, and the
         // words still name the mode.
-        probe_once(&probes, &l).await;
+        probe_once(&probes, &NOBODY, 600, &l).await;
         assert_eq!(gate_of(l.vm_begin(None)), "vm_session");
         assert_eq!(l.snapshot().vm.macos_running, 1);
         assert!(l
@@ -9160,6 +9186,47 @@ mod vm_admission_tests {
         assert_eq!(gate_of(l.vm_begin(None)), "wall");
     }
 
+    /// #95: the session account is logged in and its supervisor's agent is
+    /// gone. Refused under the same gate, said as the agent's fault with the
+    /// command that brings it back, never the reboot mode's "unlock the disk";
+    /// and open again at the first probe that answers.
+    #[tokio::test]
+    async fn a_logged_in_session_with_its_agent_down_says_so() {
+        use crate::vm::session::probe_once;
+        let l = lim();
+        l.observe_wall(Judgement::Green);
+        l.require_vm_session(SessionMode::Unlock);
+        let probes = Probes(std::sync::Mutex::new(vec![
+            Err(admit::ProbeFailure::NoSocket),
+            Err(admit::ProbeFailure::NoSocket),
+            Ok(()),
+        ]));
+        let logged_in = Seen(admit::Presence::LoggedIn);
+
+        probe_once(&probes, &logged_in, 600, &l).await;
+        assert_eq!(gate_of(l.vm_begin(None)), "vm_session");
+        let view = l.snapshot().vm;
+        assert_eq!(view.session, "agent_down");
+        let detail = view.session_detail.unwrap();
+        assert!(detail.contains("launchctl bootstrap gui/600 "), "{detail}");
+        assert!(detail.contains("unsupervised"), "{detail}");
+        assert!(!detail.contains("unlock the disk"), "{detail}");
+        assert_eq!(view.refusal.map(|r| r.detail), Some(detail));
+
+        // The same failure with nobody logged in is the reboot mode's.
+        probe_once(&probes, &NOBODY, 600, &l).await;
+        let view = l.snapshot().vm;
+        assert_eq!(view.session, "down");
+        assert!(view
+            .session_detail
+            .unwrap()
+            .starts_with("unlock the disk as _faber_mac"));
+
+        probe_once(&probes, &logged_in, 600, &l).await;
+        assert_eq!(l.snapshot().vm.session, "up");
+        drop(l.vm_begin(None).expect("the agent is back"));
+    }
+
     /// The record names a session account this host lacks (a setup run that
     /// stopped after writing the record, or a removed account): faber neither
     /// connects nor says "log in", it says to re-run setup; once the account is
@@ -9173,7 +9240,7 @@ mod vm_admission_tests {
         l.require_vm_session(SessionMode::Manual);
         let probes = Probes(std::sync::Mutex::new(vec![Ok(())]));
 
-        probe_checked(&probes, account_check(600, None), &l).await;
+        probe_checked(&probes, &NOBODY, 600, account_check(600, None), &l).await;
         assert!(!account_trusted());
         assert_eq!(
             probes.0.lock().unwrap().len(),
@@ -9189,11 +9256,11 @@ mod vm_admission_tests {
         assert!(!detail.contains("log _faber_mac in"), "{detail}");
 
         // A uid the account no longer holds is refused the same way.
-        probe_checked(&probes, account_check(600, Some(601)), &l).await;
+        probe_checked(&probes, &NOBODY, 600, account_check(600, Some(601)), &l).await;
         assert_eq!(l.snapshot().vm.session, "no_account");
 
         // The account is there: the handshake decides.
-        probe_checked(&probes, account_check(600, Some(600)), &l).await;
+        probe_checked(&probes, &NOBODY, 600, account_check(600, Some(600)), &l).await;
         assert!(account_trusted());
         assert_eq!(l.snapshot().vm.session, "up");
         assert!(l.vm_begin(None).is_ok());

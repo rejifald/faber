@@ -795,7 +795,7 @@ mod tests {
     struct Fake {
         vms: Mutex<Vec<VmRecord>>,
         calls: Mutex<Vec<String>>,
-        down: bool,
+        down: std::sync::atomic::AtomicBool,
     }
 
     impl Fake {
@@ -849,7 +849,7 @@ mod tests {
             }
         }
         async fn list(&self) -> Result<Vec<VmRecord>, SupervisorError> {
-            if self.down {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(SupervisorError::Unreachable);
             }
             self.calls.lock().unwrap().push("list".into());
@@ -927,11 +927,68 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_supervisor_is_not_an_empty_one() {
         let fake = Fake {
-            down: true,
+            down: true.into(),
             ..Default::default()
         };
         let jobs = VmJobs::default();
         assert_eq!(adopt_at_boot(&fake, &jobs, ME).await, None);
+    }
+
+    /// #95: the session supervisor went away mid-job, so the job's stop was
+    /// never confirmed and its claim is held in quarantine while the VM keeps
+    /// running unsupervised. Sweeps while the supervisor is gone do nothing
+    /// (and free nothing); the first sweep after it is back, and has adopted
+    /// the VM by its marker, stops it, and the next settles its slot.
+    #[tokio::test]
+    async fn a_vm_orphaned_while_the_supervisor_was_gone_is_swept_when_it_returns() {
+        use std::sync::atomic::Ordering;
+        let orphan = claim(1);
+        let id = ClaimId::try_from(orphan.as_str()).unwrap();
+        let fake = Fake::with(vec![mac(0, &orphan, VmState::InService)]);
+        fake.down.store(true, Ordering::SeqCst);
+        let jobs = VmJobs::default();
+        assert!(jobs.hold(&id, Slot::try_from(0).unwrap(), VmStep::Orphaned));
+
+        for _ in 0..3 {
+            assert_eq!(sweep_once(&fake, &jobs, ME, NOW, |_| {}).await, None);
+        }
+        assert!(fake.stops().is_empty());
+        assert_eq!(jobs.quarantined(), [0], "its slot stays held while unseen");
+
+        fake.down.store(false, Ordering::SeqCst);
+        let plan = sweep_once(&fake, &jobs, ME, NOW, |_| {}).await.unwrap();
+        assert_eq!(plan.stop, [(id.clone(), "its stop was never confirmed")]);
+        assert_eq!(fake.stops(), std::slice::from_ref(&orphan));
+
+        fake.vms.lock().unwrap()[0].state = VmState::Stopped;
+        sweep_once(&fake, &jobs, ME, NOW, |_| {}).await.unwrap();
+        assert!(jobs.quarantined().is_empty(), "slot 0 is free again");
+    }
+
+    /// #95, after a daemon restart while the supervisor was gone (an install,
+    /// say): the quarantine is lost with the old process, so boot adoption is
+    /// what takes the VM back. It waits for the supervisor, then watches the
+    /// job it finds in service; its job cap counts from the VM's start, so a VM
+    /// a day old ends at once ([`crate::vm::job::watch_adopted`]).
+    #[tokio::test]
+    async fn boot_adoption_waits_for_a_returning_supervisor_and_takes_the_orphan_back() {
+        use std::sync::atomic::Ordering;
+        let orphan = claim(1);
+        let fake = Fake::with(vec![mac(0, &orphan, VmState::InService)]);
+        fake.down.store(true, Ordering::SeqCst);
+        let jobs = VmJobs::default();
+        assert_eq!(adopt_at_boot(&fake, &jobs, ME).await, None, "not empty");
+
+        fake.down.store(false, Ordering::SeqCst);
+        let rebuilt = adopt_at_boot(&fake, &jobs, ME).await.unwrap();
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].claim.as_str(), orphan);
+        assert_eq!(
+            rebuilt[0].started_unix, OLD,
+            "the cap counts from its start"
+        );
+        let (live, _) = jobs.held();
+        assert_eq!(live, set(&[orphan.as_str()]));
     }
 
     #[tokio::test]

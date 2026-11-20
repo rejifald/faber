@@ -98,7 +98,7 @@ export interface VmView {
   linux_vm_mib?: number;
   images?: { linux?: string; macos?: string };
   runner_image?: string;
-  /** The macOS VM session (ADR-0051): `up` and `not_required` admit; anything else refuses. */
+  /** The macOS VM session (ADR-0051): `up` and `not_required` admit; anything else refuses. `agent_down`: logged in, its supervisor agent not answering (#95). */
   session?: string;
   session_detail?: string | null;
   /** The gate refusing a macOS VM job right now, if one does. */

@@ -10,6 +10,12 @@
 //! jobs while it does not answer ([`crate::vm::admit::VmRefusal::NoVmSession`]),
 //! saying which reboot mode applies and what to do.
 //!
+//! A failed handshake while the account is logged in at the console is not a
+//! missing session but its LaunchAgent gone or not serving (#95): the agent
+//! was booted out of a live session once, and the reboot-mode words ("unlock
+//! the disk") pointed the operator at a fix that does nothing. So a failed
+//! probe also asks who is logged in ([`SessionPresence`]), and says which.
+//!
 //! A record without the account has no gate, and its macOS VM jobs keep
 //! `_faber_vm`'s supervisor, as before (AGENTS.md: an absent key keeps the old
 //! behaviour).
@@ -19,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::admit::SessionMode;
+use super::admit::{Presence, ProbeFailure, SessionMode};
 use super::client::SupervisorClient;
 use crate::limiter::Limiter;
 use crate::platform::record::SetupRecord;
@@ -32,17 +38,78 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// Something that can be asked whether it answers: the session client's
 /// handshake, or a fake in tests.
 pub trait Handshake {
-    /// `Ok` when the supervisor answered in this release's protocol, else why
-    /// not, in words.
-    fn reach(&self) -> impl Future<Output = Result<(), String>> + Send;
+    /// `Ok` when the supervisor answered in this release's protocol, else how
+    /// it failed.
+    fn reach(&self) -> impl Future<Output = Result<(), ProbeFailure>> + Send;
 }
 
 impl Handshake for SupervisorClient {
-    async fn reach(&self) -> Result<(), String> {
-        self.handshake()
+    async fn reach(&self) -> Result<(), ProbeFailure> {
+        let Err(e) = self.handshake().await else {
+            return Ok(());
+        };
+        let unreachable = matches!(e, super::client::ClientError::Unreachable(_));
+        // Looked at after the failure: a socket that went in between is gone.
+        let missing = match std::fs::symlink_metadata(self.socket_path()) {
+            Ok(_) => Some(false),
+            Err(io) if io.kind() == std::io::ErrorKind::NotFound => Some(true),
+            Err(_) => None,
+        };
+        Err(ProbeFailure::classify(missing, unreachable, e.to_string()))
+    }
+}
+
+/// Something that can say whether the session account is logged in: the
+/// console users list, or a fake in tests.
+pub trait SessionPresence {
+    fn presence(&self) -> impl Future<Output = Presence> + Send;
+}
+
+/// The console users list (utmpx, through `who`): world-readable, so no root.
+pub struct ConsoleUsers;
+
+/// How long `who` may take before the presence is "not known".
+const WHO_LIMIT: Duration = Duration::from_secs(5);
+
+impl SessionPresence for ConsoleUsers {
+    async fn presence(&self) -> Presence {
+        tokio::task::spawn_blocking(console_presence_bounded)
             .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .unwrap_or_else(|e| Presence::Unknown(format!("the lookup did not finish: {e}")))
+    }
+}
+
+/// `who`, bounded, read for `_faber_mac`. Blocking.
+fn console_presence_bounded() -> Presence {
+    use crate::setup::tools::{output_within, Tool, SAFE_PATH};
+    let mut cmd = std::process::Command::new(Tool::Who.path());
+    cmd.env_clear()
+        .env("PATH", SAFE_PATH)
+        .stdin(std::process::Stdio::null());
+    match output_within(cmd, WHO_LIMIT) {
+        Ok(out) if out.success => {
+            console_presence(&out.stdout, crate::platform::layout::FABER_MAC_ACCOUNT)
+        }
+        Ok(out) => Presence::Unknown(format!(
+            "who failed: {}",
+            crate::setup::tools::sanitize_child_output(out.stderr.trim(), 200)
+        )),
+        Err(e) => Presence::Unknown(format!("who: {e:#}")),
+    }
+}
+
+/// Whether `who`'s output shows `account` logged in at the console: a GUI
+/// session, which is what runs a LaunchAgent limited to `Aqua`. A terminal or
+/// SSH login (`ttys…`) is not one. Pure.
+pub fn console_presence(who: &str, account: &str) -> Presence {
+    let at_console = who.lines().any(|line| {
+        let mut cols = line.split_whitespace();
+        cols.next() == Some(account) && cols.next() == Some("console")
+    });
+    if at_console {
+        Presence::LoggedIn
+    } else {
+        Presence::Absent
     }
 }
 
@@ -137,21 +204,34 @@ async fn lookup() -> SessionLookup {
         .unwrap_or_else(|e| SessionLookup::Failed(format!("the lookup did not finish: {e}")))
 }
 
-/// One probe, into the limiter's gate: the handshake.
-pub async fn probe_once<H: Handshake>(target: &H, limiter: &Limiter) {
-    limiter.observe_vm_session(target.reach().await);
+/// One probe, into the limiter's gate: the handshake, and, only when it
+/// failed, whether account `uid` is logged in.
+pub async fn probe_once<H: Handshake, P: SessionPresence>(
+    target: &H,
+    seen: &P,
+    uid: u32,
+    limiter: &Limiter,
+) {
+    let probe = target.reach().await;
+    let presence = match probe {
+        Ok(()) => Presence::LoggedIn,
+        Err(_) => seen.presence().await,
+    };
+    limiter.observe_vm_session_probe(probe, presence, uid);
 }
 
 /// One probe given the account check: no handshake at all unless the account
 /// is the recorded one, and a refusal that says why if not.
-pub async fn probe_checked<H: Handshake>(
+pub async fn probe_checked<H: Handshake, P: SessionPresence>(
     target: &H,
+    seen: &P,
+    uid: u32,
     account: Result<(), String>,
     limiter: &Limiter,
 ) {
     ACCOUNT_OK.store(account.is_ok(), Ordering::SeqCst);
     match account {
-        Ok(()) => probe_once(target, limiter).await,
+        Ok(()) => probe_once(target, seen, uid, limiter).await,
         Err(why) => limiter.observe_no_session_account(why),
     }
 }
@@ -169,7 +249,7 @@ async fn watch<H: Handshake>(
     loop {
         tokio::time::sleep(PROBE_INTERVAL).await;
         let account = checker.judge(recorded_uid, lookup().await, Instant::now());
-        probe_checked(target, account, &limiter).await;
+        probe_checked(target, &ConsoleUsers, recorded_uid, account, &limiter).await;
     }
 }
 
@@ -191,7 +271,7 @@ pub async fn start_for_this_host(limiter: Arc<Limiter>) -> bool {
     limiter.require_vm_session(mode);
     let mut checker = AccountChecker::default();
     let account = checker.judge(uid, lookup().await, Instant::now());
-    probe_checked(client, account, &limiter).await;
+    probe_checked(client, &ConsoleUsers, uid, account, &limiter).await;
     tokio::spawn(watch(client, uid, checker, limiter));
     true
 }
@@ -200,6 +280,20 @@ pub async fn start_for_this_host(limiter: Arc<Limiter>) -> bool {
 mod tests {
     use super::*;
     use crate::platform::record::SessionAccount;
+
+    /// #95: only a console login is a GUI session; a terminal or SSH login of
+    /// the same account, or another account at the console, is not.
+    #[test]
+    fn the_console_users_list_is_read_for_the_account_at_the_console() {
+        let who = "owner            console      Nov  9 00:48 \n\
+                   _faber_mac       console      Nov  9 00:50 \n";
+        assert_eq!(console_presence(who, "_faber_mac"), Presence::LoggedIn);
+        let elsewhere = "owner            console      Nov  9 00:48 \n\
+                         _faber_mac       ttys003      Nov  9 00:50 \n\
+                         _faber_mac_x     console      Nov  9 00:50 \n";
+        assert_eq!(console_presence(elsewhere, "_faber_mac"), Presence::Absent);
+        assert_eq!(console_presence("", "_faber_mac"), Presence::Absent);
+    }
 
     fn record(session: Option<SessionAccount>) -> SetupRecord {
         let mut r = SetupRecord::from_json(

@@ -162,6 +162,117 @@ impl SessionMode {
     }
 }
 
+/// Why the session supervisor's handshake failed, as far as the probe can tell
+/// (#95). The socket is the agent's: it binds it when launchd starts it and
+/// removes it when it exits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// The socket is not there: the agent is not loaded (or not started yet).
+    NoSocket,
+    /// The socket is there and nothing answers on it (refused, the handshake
+    /// timed out, or closed): the agent is loaded but not serving, or it died
+    /// without removing its socket. The client's words.
+    NotServing(String),
+    /// Anything else, in the client's words: another uid holds the socket, or
+    /// the supervisor speaks another protocol. A setup matter.
+    Other(String),
+}
+
+impl ProbeFailure {
+    /// Which failure the client's `why` is, given whether the socket file is
+    /// missing (`Some(true)`), present (`Some(false)`) or could not be checked
+    /// (`None`). `unreachable` is whether the client never got a handshake
+    /// through (its `Unreachable` error). Pure.
+    pub fn classify(socket_missing: Option<bool>, unreachable: bool, why: String) -> Self {
+        match (socket_missing, unreachable) {
+            (Some(true), _) => ProbeFailure::NoSocket,
+            (_, true) => ProbeFailure::NotServing(why),
+            (_, false) => ProbeFailure::Other(why),
+        }
+    }
+
+    /// The failure as a clause: what is wrong with the supervisor.
+    pub fn sentence(&self) -> String {
+        match self {
+            ProbeFailure::NoSocket => {
+                "its socket is missing, so its agent is not loaded".to_string()
+            }
+            ProbeFailure::NotServing(why) => format!(
+                "its socket is there but nothing answers on it ({why}), so its agent is loaded \
+                 and not serving"
+            ),
+            ProbeFailure::Other(why) => why.clone(),
+        }
+    }
+}
+
+/// Whether the session account has a GUI session now, as the console users
+/// list says (utmpx, read without root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    LoggedIn,
+    Absent,
+    /// The list could not be read; why.
+    Unknown(String),
+}
+
+/// What the session is, given its reboot `mode`, the probe's result, whether
+/// the account is logged in, and its uid. Pure (#95): a failed probe with the
+/// account logged in is the agent's fault, not a missing session, and is told
+/// apart, since the reboot-mode action ("unlock the disk…") does nothing then.
+pub fn session_state(
+    mode: SessionMode,
+    probe: Result<(), ProbeFailure>,
+    presence: Presence,
+    uid: u32,
+) -> VmSession {
+    let Err(probe) = probe else {
+        return VmSession::Up;
+    };
+    match presence {
+        Presence::LoggedIn => VmSession::AgentDown { uid, probe },
+        Presence::Absent => VmSession::Down {
+            mode,
+            why: probe.sentence(),
+        },
+        Presence::Unknown(about) => VmSession::Down {
+            mode,
+            why: format!(
+                "{}; whether {} is logged in is not known ({about})",
+                probe.sentence(),
+                crate::platform::layout::FABER_MAC_ACCOUNT
+            ),
+        },
+    }
+}
+
+/// What the operator runs to bring a logged-in session's agent back. Pure.
+pub fn agent_action(uid: u32, probe: &ProbeFailure) -> String {
+    let label = crate::platform::service::SESSION_AGENT_LABEL;
+    match probe {
+        ProbeFailure::NoSocket => format!(
+            "run `sudo launchctl bootstrap gui/{uid} {}`, or `sudo faber setup`",
+            crate::setup::session::agent_path().display()
+        ),
+        ProbeFailure::NotServing(_) => {
+            format!("run `sudo launchctl kickstart -k gui/{uid}/{label}`, or `sudo faber setup`")
+        }
+        ProbeFailure::Other(_) => "run `sudo faber setup`".to_string(),
+    }
+}
+
+/// The whole sentence for a logged-in session whose agent does not answer:
+/// what is wrong, what to run, and that a VM may be running unsupervised.
+pub fn agent_down_detail(uid: u32, probe: &ProbeFailure) -> String {
+    format!(
+        "{} is logged in, but its VM supervisor does not answer: {}; {}. A macOS VM it was \
+         running may still run, unsupervised, until it is back, and is swept then",
+        crate::platform::layout::FABER_MAC_ACCOUNT,
+        probe.sentence(),
+        agent_action(uid, probe)
+    )
+}
+
 /// Whether the macOS VM session's supervisor answers (ADR-0051), as the
 /// session probe last found it ([`crate::vm::session`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -173,8 +284,12 @@ pub enum VmSession {
     Unprobed(SessionMode),
     /// Its supervisor answered the last handshake.
     Up,
-    /// It did not; `why` is the client's error.
+    /// It did not, and the account is not logged in (or that is not known):
+    /// the session itself is down. `why` says how the probe failed.
     Down { mode: SessionMode, why: String },
+    /// It did not, and the account is logged in: its LaunchAgent is not loaded
+    /// or not serving (#95). Bringing the session back would change nothing.
+    AgentDown { uid: u32, probe: ProbeFailure },
     /// The recorded account does not resolve to `_faber_mac` (never made, or
     /// removed, or another uid): faber does not connect, and setup is the fix.
     NoAccount(String),
@@ -185,14 +300,28 @@ impl VmSession {
         matches!(self, VmSession::NotRequired | VmSession::Up)
     }
 
-    /// `"not_required"`, `"unprobed"`, `"up"` or `"down"`, for `/api/state`.
+    /// `"not_required"`, `"unprobed"`, `"up"`, `"down"`, `"agent_down"` or
+    /// `"no_account"`, for `/api/state`.
     pub fn as_str(&self) -> &'static str {
         match self {
             VmSession::NotRequired => "not_required",
             VmSession::Unprobed(_) => "unprobed",
             VmSession::Up => "up",
             VmSession::Down { .. } => "down",
+            VmSession::AgentDown { .. } => "agent_down",
             VmSession::NoAccount(_) => "no_account",
+        }
+    }
+
+    /// What `/api/state` says of it: what is wrong and what to do, `None`
+    /// while it admits.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            VmSession::NoAccount(why) => Some(why.clone()),
+            VmSession::Unprobed(mode) => Some(format!("not probed yet: {}", mode.action())),
+            VmSession::Down { mode, why } => Some(format!("{}: {why}", mode.action())),
+            VmSession::AgentDown { uid, probe } => Some(agent_down_detail(*uid, probe)),
+            VmSession::NotRequired | VmSession::Up => None,
         }
     }
 }
@@ -208,6 +337,12 @@ pub enum VmRefusal {
     NoVmSession {
         mode: SessionMode,
         why: Option<String>,
+    },
+    /// The session account is logged in and its supervisor agent does not
+    /// answer (#95).
+    SessionAgentDown {
+        uid: u32,
+        probe: ProbeFailure,
     },
     /// The job's golden image has not passed verification on this host
     /// (ADR-0049 §7), or one is running.
@@ -269,6 +404,9 @@ impl VmRefusal {
                         .unwrap_or_default()
                 ),
             ),
+            VmRefusal::SessionAgentDown { uid, probe } => {
+                ("vm_session", agent_down_detail(*uid, probe))
+            }
             VmRefusal::ImageUnverified { image, standing } => (
                 "golden_image",
                 standing
@@ -354,6 +492,12 @@ pub fn decide_macos(i: &MacosInput) -> Result<(), VmRefusal> {
             return Err(VmRefusal::NoVmSession {
                 mode: *mode,
                 why: Some(why.clone()),
+            })
+        }
+        VmSession::AgentDown { uid, probe } => {
+            return Err(VmRefusal::SessionAgentDown {
+                uid: *uid,
+                probe: probe.clone(),
             })
         }
         VmSession::NoAccount(why) => return Err(VmRefusal::NoSessionAccount(why.clone())),
@@ -464,6 +608,143 @@ mod tests {
         let red = WallGate::Red("pf is off".into());
         let mut i = input(&red);
         i.session = VmSession::Unprobed(SessionMode::Manual);
+        assert!(matches!(decide_macos(&i), Err(VmRefusal::Wall(_))));
+    }
+
+    /// #95: which failure a probe is. A missing socket means the agent is not
+    /// loaded, whatever the client said; a socket nobody answers on means it is
+    /// loaded and not serving; the rest is the client's own words.
+    #[test]
+    fn a_probe_failure_is_classified_by_the_socket_then_the_error() {
+        let why = || "the VM supervisor is not reachable: connecting: entity not found".to_string();
+        assert_eq!(
+            ProbeFailure::classify(Some(true), true, why()),
+            ProbeFailure::NoSocket
+        );
+        assert_eq!(
+            ProbeFailure::classify(Some(true), false, why()),
+            ProbeFailure::NoSocket,
+            "no socket is no socket, whatever the client said"
+        );
+        for missing in [Some(false), None] {
+            assert_eq!(
+                ProbeFailure::classify(missing, true, "the handshake timed out".into()),
+                ProbeFailure::NotServing("the handshake timed out".into())
+            );
+            assert_eq!(
+                ProbeFailure::classify(missing, false, "speaks protocol 9".into()),
+                ProbeFailure::Other("speaks protocol 9".into())
+            );
+        }
+        assert!(ProbeFailure::NoSocket
+            .sentence()
+            .contains("socket is missing, so its agent is not loaded"));
+        let refused = ProbeFailure::NotServing("connecting: connection refused".into()).sentence();
+        assert!(
+            refused.contains("(connecting: connection refused)"),
+            "{refused}"
+        );
+        assert!(refused.contains("loaded and not serving"), "{refused}");
+    }
+
+    /// #95: the state of the session for every combination the probe can see.
+    #[test]
+    fn the_session_state_tells_a_down_agent_from_a_missing_session() {
+        let m = SessionMode::Unlock;
+        for presence in [
+            Presence::LoggedIn,
+            Presence::Absent,
+            Presence::Unknown("x".into()),
+        ] {
+            assert_eq!(
+                session_state(m, Ok(()), presence.clone(), 600),
+                VmSession::Up,
+                "{presence:?}"
+            );
+        }
+        // Logged in: the agent's fault, whatever the reboot mode says.
+        assert_eq!(
+            session_state(m, Err(ProbeFailure::NoSocket), Presence::LoggedIn, 600),
+            VmSession::AgentDown {
+                uid: 600,
+                probe: ProbeFailure::NoSocket
+            }
+        );
+        // Not logged in: the reboot mode's action, with how the probe failed.
+        let down = session_state(m, Err(ProbeFailure::NoSocket), Presence::Absent, 600);
+        assert_eq!(down.as_str(), "down");
+        let detail = down.detail().unwrap();
+        assert!(
+            detail.starts_with("unlock the disk as _faber_mac"),
+            "{detail}"
+        );
+        assert!(detail.contains("socket is missing"), "{detail}");
+        // Not known: the reboot mode's words too, saying it is not known.
+        let unknown = session_state(
+            m,
+            Err(ProbeFailure::NotServing("timed out".into())),
+            Presence::Unknown("who: did not finish".into()),
+            600,
+        );
+        assert_eq!(unknown.as_str(), "down");
+        let detail = unknown.detail().unwrap();
+        assert!(
+            detail.contains("is not known (who: did not finish)"),
+            "{detail}"
+        );
+    }
+
+    /// #95: a logged-in session whose agent is down is refused under the same
+    /// gate, in words that name the right command, never the reboot mode's.
+    #[test]
+    fn a_down_agent_refuses_with_the_command_that_brings_it_back() {
+        let w = WallGate::Open;
+        let mut i = input(&w);
+        i.session = VmSession::AgentDown {
+            uid: 600,
+            probe: ProbeFailure::NoSocket,
+        };
+        assert!(!i.session.admits());
+        assert_eq!(i.session.as_str(), "agent_down");
+        let (gate, detail) = decide_macos(&i).unwrap_err().describe();
+        assert_eq!(gate, "vm_session");
+        assert!(detail.starts_with("_faber_mac is logged in"), "{detail}");
+        assert!(
+            detail.contains(&format!(
+                "`sudo launchctl bootstrap gui/600 {}`",
+                crate::setup::session::agent_path().display()
+            )),
+            "{detail}"
+        );
+        assert!(detail.contains("unsupervised"), "{detail}");
+        assert!(!detail.contains("unlock the disk"), "{detail}");
+        assert_eq!(i.session.detail(), Some(detail));
+
+        // Loaded and not serving: bootstrap would fail ("already loaded").
+        i.session = VmSession::AgentDown {
+            uid: 600,
+            probe: ProbeFailure::NotServing("the handshake timed out".into()),
+        };
+        let (_, detail) = decide_macos(&i).unwrap_err().describe();
+        assert!(
+            detail.contains(
+                "`sudo launchctl kickstart -k gui/600/io.github.rejifald.faber.mac-vm-supervisor`"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains("bootstrap"), "{detail}");
+
+        // Something else (a wrong peer, another protocol): setup.
+        let other = agent_action(600, &ProbeFailure::Other("held by uid 0".into()));
+        assert_eq!(other, "run `sudo faber setup`");
+
+        // Still behind the wall.
+        let red = WallGate::Red("pf is off".into());
+        let mut i = input(&red);
+        i.session = VmSession::AgentDown {
+            uid: 600,
+            probe: ProbeFailure::NoSocket,
+        };
         assert!(matches!(decide_macos(&i), Err(VmRefusal::Wall(_))));
     }
 

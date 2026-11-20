@@ -161,7 +161,8 @@ function macosRefusalRow(vm: VmView, gates: Budget['gates']): AttentionRow | nul
   const gate = vm.refusal?.gate;
   if (!gate || !MACOS_GATES.has(gate)) return null;
   const parked = gates?.[gate]?.parked_now ?? 0;
-  const head = MACOS_GATES.get(gate);
+  // A logged-in session whose supervisor agent is down (#95) is not a missing session.
+  const head = gate === 'vm_session' && vm.session === 'agent_down' ? 'macOS VM supervisor not running' : MACOS_GATES.get(gate);
   // A session not probed yet is the first seconds after a start, not a fault.
   if ((!head || vm.session === 'unprobed') && !parked) return null;
   // The session's detail says what to do; the refusal's repeats the head before it.

@@ -128,6 +128,7 @@ export const AttentionActions: Story = { args: { snap: fx.attentionActions } };
 
 /** macOS jobs parked behind a missing VM session and a failed golden image: two rows, each counting what waits. */
 export const MacosHeld: Story = { args: { snap: fx.macosHeld } };
+export const MacosAgentDown: Story = { args: { snap: fx.macosAgentDown } };
 
 /** A class OOM-killed at the most faber grants unasked (ADR-0053): one red row naming it, the other counted. */
 export const OomHeld: Story = { args: { snap: fx.oomHeld } };
