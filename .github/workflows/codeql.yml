@@ -1,0 +1,104 @@
+name: CodeQL
+
+# Code scanning, from this file rather than GitHub's default setup, so the Swift
+# code is analysed too. Default setup builds Swift itself, and finds no Swift
+# package or Xcode project here to build: the launcher, the guest agent and
+# golden-prep are compiled by scripts. So it analysed every language but Swift.
+# This file analyses the four it did, as it did, and Swift by running those
+# scripts.
+#
+# Default setup must stay off (infra/github/README.md): while it is on, GitHub
+# refuses the analyses a workflow uploads.
+#
+# Each analysis keeps default setup's category, `/language:<language>`, so it
+# continues that configuration and the alerts already raised in it. Without
+# `category`, the action derives one from this file's path and the job: a second
+# configuration beside the old one.
+on:
+  push:
+    branches: [main]
+  # Only pull requests to main, unlike ci.yml: code scanning compares a pull
+  # request's analysis with its base branch's, and only main is analysed. Each
+  # runs every language, Swift too, so none of main's categories is missing from
+  # the comparison.
+  pull_request:
+    branches: [main]
+  # Weekly, as default setup ran.
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+# Newer pushes to the same branch/PR cancel superseded runs.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing at the top. Each job reads the code and writes its results to code
+# scanning (`security-events: write`), and asks for no more. Each checkout drops
+# the token once it has cloned, as ci.yml's do.
+permissions: {}
+
+# GitHub-hosted runners only (ADR-0031; ci.yml says why).
+
+jobs:
+  # What CodeQL reads as it is, with nothing built: the three languages it
+  # interprets, and Rust, whose extractor needs no build.
+  analyze:
+    name: codeql · ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      # One language failing leaves the others' results standing.
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript, python, rust]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}
+
+  # Swift: CodeQL reads what the compiler is given during a real build. This runs
+  # the three builds that make a release's Swift binaries, as launcher/ci.sh runs
+  # them, and nothing else. They compile against the macOS 27 SDK, which only the
+  # `xcode-27` image ships (ci.yml's launcher job says why). Each signs ad hoc, so
+  # no signing identity is needed.
+  swift:
+    name: codeql · swift
+    runs-on: xcode-27
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # For the log: the image's Swift can be newer than the versions CodeQL
+      # documents.
+      - run: swiftc --version
+
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: swift
+          build-mode: manual
+
+      - run: launcher/build.sh
+      - run: launcher/build.sh --agent
+      - run: launcher/golden/build.sh --compile-only
+
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:swift
