@@ -24,9 +24,15 @@ refuse() { printf 'arm.sh: %s\n' "$*" >&2; exit 1; }
 if id runner >/dev/null 2>&1; then
   refuse "a user named runner exists. The build makes that user itself; name the admin account something else, or start from a fresh install."
 fi
-if [ "$(fdesetup isactive 2>/dev/null || true)" = true ]; then
-  refuse "FileVault is on. Automatic login needs it off: turn it off in System Settings > Privacy & Security, wait for it to finish, then run this again."
-fi
+# FileVault is judged as the verification judges it (launcher/agent/Sources/Checks.swift,
+# fileVaultOff): `fdesetup status` exits 0 and says "FileVault is Off". `fdesetup isactive`
+# answers another question, so an image arm.sh let through could still fail the verification,
+# and only after the build's hours. launcher/Tests/VerifyTests.swift holds the two equal.
+fv=$(fdesetup status 2>/dev/null) || fv=
+case $fv in
+  *"FileVault is Off"*) ;;
+  *) refuse "FileVault is not off (fdesetup status: $(printf '%s\n' "${fv:-no answer}" | head -n 1)). Automatic login needs it off: turn it off in System Settings > Privacy & Security, wait until fdesetup status says FileVault is Off, then run this again." ;;
+esac
 for f in provision.sh provision-wrapper.sh io.github.rejifald.faber.golden-provision.plist bootstrap.sh \
   io.github.rejifald.faber.guest-agent.plist; do
   [ -f "$src/$f" ] || refuse "$src/$f is missing; run this from the setup disk"

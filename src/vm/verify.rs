@@ -264,8 +264,9 @@ impl Standing {
                     s.push_str(&format!(". Then run {rerun}"));
                 } else {
                     s.push_str(&format!(
-                        ". Rebuild the image (`faber golden prepare --from {image}`, then `sudo \
-                         faber golden build`), then run {rerun}"
+                        ". Rebuild the image (`{}`, then the `sudo faber golden build` it \
+                         prints), then run {rerun}",
+                        rebuild_command(image)
                     ));
                 }
                 s
@@ -273,6 +274,16 @@ impl Standing {
         })
     }
 }
+
+/// The operator's first step to rebuild `image`: `faber golden prepare` takes the bundle to
+/// prepare as its one required argument, so the command names a placeholder for it, and
+/// `--from` carries the image's recipe over. Pure.
+pub fn rebuild_command(image: &str) -> String {
+    format!("faber golden prepare {REBUILD_BUNDLE_PLACEHOLDER} --from {image}")
+}
+
+/// The placeholder for the new bundle's directory in [`rebuild_command`].
+pub const REBUILD_BUNDLE_PLACEHOLDER: &str = "<new bundle dir>";
 
 /// Where the macOS VM supervisor keeps the guest console of `image`'s latest
 /// verification: the agent's `FABER-GOLDEN-VERIFY` line per check, naming the
@@ -1741,7 +1752,14 @@ mod tests {
             };
             let text = s.detail("img").unwrap();
             assert!(text.contains(&format!("({})", check.as_str())), "{text}");
-            assert!(text.contains("faber golden prepare --from img"), "{text}");
+            assert!(
+                text.contains("`faber golden prepare <new bundle dir> --from img`"),
+                "the rebuild names prepare's required bundle: {text}"
+            );
+            assert!(
+                text.contains("then the `sudo faber golden build` it prints"),
+                "{text}"
+            );
             assert!(
                 text.contains("`sudo cat -v /var/db/faber-mac/state/verify-img-latest.log`"),
                 "a failed check names where its details are: {text}"
