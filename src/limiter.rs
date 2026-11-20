@@ -9513,7 +9513,10 @@ mod vm_admission_tests {
         assert_eq!(gate, "golden_image");
         assert!(text.contains("(apple_id)"), "{text}");
         assert!(text.contains("Apple ID is signed in"), "{text}");
-        assert!(text.contains("faber golden prepare --from img"), "{text}");
+        assert!(
+            text.contains("`faber golden prepare <new bundle dir> --from img`"),
+            "{text}"
+        );
         // Another image's pass does not open this one.
         l.observe_golden("other", Standing::Verified);
         assert!(l.vm_begin(Some("img")).is_err());

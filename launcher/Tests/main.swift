@@ -13,6 +13,8 @@ let fixturesPath = CommandLine.arguments.dropFirst(2).first
 let provisionPath = entitlementsPath.map {
     URL(fileURLWithPath: $0).deletingLastPathComponent().appendingPathComponent("golden/provision.sh").path
 }
+// The script that arms a prepared bundle, beside it.
+let armPath = provisionPath.map { URL(fileURLWithPath: $0).deletingLastPathComponent().appendingPathComponent("arm.sh").path }
 
 print("faber-vm-tests: macos=\(macOSVersion) vz_supported=\(VZVirtualMachine.isSupported) version=\(faberVMVersion)")
 let scratch: Scratch
@@ -45,6 +47,7 @@ testAgent(harness, scratch)
 testHandoffDiagnostics(harness, scratch)
 testRunnerTail(harness, scratch)
 testVerify(harness)
+testArmFileVault(harness, arm: armPath)
 testVerifyDiagnostics(harness, scratch)
 testUpdates(harness, provision: provisionPath)
 scratch.remove()

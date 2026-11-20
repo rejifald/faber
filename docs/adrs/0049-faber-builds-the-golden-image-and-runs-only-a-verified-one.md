@@ -193,6 +193,36 @@ and the operator's staging copy is deleted only when they agree.
     guest's console instead. §7 still judges the plist exactly as before, so a
     key that boot removes again after the agent's write still fails
     verification.
+  - *Amended 2026-11-20: the agent watches the keys.* Two moments were not
+    enough. On a real host an image failed verification with
+    `AutomaticCheckEnabled` absent, although the agent's write at `serve` had
+    logged `ok=true wrote=5/5` just before, and `softwareupdate --schedule`
+    said automatic checking was on. So macOS removes the key after the agent
+    writes it, and a rebuild cannot help: the image is not where it is lost.
+    What removes it has not been seen in a guest yet. The verify console holds
+    only the agent's lines, and the clone is gone. macOS's own Software Update
+    framework (read on a macOS 27 host) handles `AutomaticCheckEnabled` beside
+    an `AutomaticCheckOverride` and the legacy `AutomaticCheckDisabled` and
+    `ScheduleFrequency` keys. That fits `softwareupdated` rewriting the
+    setting itself, but it is not proof, so the fix does not depend on it:
+    - the agent watches `/Library/Preferences/com.apple.SoftwareUpdate.plist`
+      once a second for the life of the clone, and writes all five keys again,
+      the same way, whenever one of the four is absent or not false. A key
+      macOS removes is back within about a second. It restores only keys it
+      writes, so it never loops on one writing cannot fix;
+    - the first restore also writes, from the guest's own log of the 30 s
+      before, which processes logged about Software Update and their newest
+      messages about automatic checking. The next verification's console
+      therefore names the remover. If it turns out to be a setting macOS keeps
+      elsewhere, that setting replaces the watch in a later amendment;
+    - the writes at `serve` and `begin` stay.
+
+    The alternatives were weighed. A configuration profile is the mechanism
+    macOS does not rewrite, but `profiles` can no longer install one without a
+    person approving it in System Settings, and an MDM is not something faber
+    runs. Writing the file directly instead of through `defaults` would fight
+    `cfprefsd`. Reapplying only right before the checks would hide the race
+    from verification but leave it open for a job.
 - **The Setup Assistant admin is locked.** The provisioner gives it a random
   32-byte password that is never stored, sets its shell to `/usr/bin/false` and
   hides it. It stays, because macOS can misbehave with no admin at all. A usable
@@ -264,6 +294,25 @@ strictness is unchanged. After its line, the agent writes one evidence line with
 the first line of `softwareupdate --schedule`. That line never changes the
 verdict. A clone that had lost `AutomaticCheckEnabled` at boot is why the agent
 now writes the keys again at boot (§5, *Software Update is off in the guest*).
+
+*Amended 2026-11-20: the software_update check reads twice when it has to.*
+With the agent's watch (§5), a key macOS removes is back within about a second,
+but the check can still read inside that second. So when the first read fails,
+the agent writes the keys once more, waits 3 s and reads again, and the second
+read is the verdict. The check's line says when it passed that way, and what
+the first read found. It is not more lenient about what Software Update is
+doing: a write that fails, a key the agent does not write
+(`AutomaticallyInstallMacOSUpdates`), or anything that turns a key straight
+back on still fails, because the second read still sees it. A second evidence
+line gives the watch's restores since `serve` started, and its first loss. It
+changes no verdict either: a clone whose keys are off is what a job gets, and
+the count says how hard macOS pushed. No check got stricter, so the record's
+schema stays (src/vm/verify.rs, `SCHEMA`).
+
+The same day, `launcher/golden/arm.sh` was made to judge FileVault the way the
+`filevault` check does, `fdesetup status` saying `FileVault is Off`, instead of
+asking `fdesetup isactive`. A bundle the check would fail is now refused when it
+is armed, not after the build's hours. A test holds the two equal.
 
 *Amended 2026-10-26, a third time: the developer tools as `runner` sees them.*
 An image passed every check, `xcode` included, and then every macOS job it
