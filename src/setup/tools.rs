@@ -61,11 +61,15 @@ pub enum Tool {
     Diskutil,
     /// macOS: to quit the operator's menu-bar app before setup replaces it.
     Pkill,
+    /// macOS: the console users list (utmpx), which the daemon reads, without
+    /// root, to tell a session whose VM supervisor is down from a missing one
+    /// (#95).
+    Who,
 }
 
 impl Tool {
     /// Every tool, for the test that pins their paths.
-    pub const ALL: [Tool; 20] = [
+    pub const ALL: [Tool; 21] = [
         Tool::Sysadminctl,
         Tool::Dseditgroup,
         Tool::Dscl,
@@ -86,6 +90,7 @@ impl Tool {
         Tool::Defaults,
         Tool::Diskutil,
         Tool::Pkill,
+        Tool::Who,
     ];
 
     /// The tool's absolute path.
@@ -111,6 +116,7 @@ impl Tool {
             Tool::Defaults => "/usr/bin/defaults",
             Tool::Diskutil => "/usr/sbin/diskutil",
             Tool::Pkill => "/usr/bin/pkill",
+            Tool::Who => "/usr/bin/who",
         }
     }
 }
@@ -636,6 +642,7 @@ mod tests {
         assert_eq!(Tool::Defaults.path(), "/usr/bin/defaults");
         assert_eq!(Tool::Diskutil.path(), "/usr/sbin/diskutil");
         assert_eq!(Tool::Pkill.path(), "/usr/bin/pkill");
+        assert_eq!(Tool::Who.path(), "/usr/bin/who");
     }
 
     #[test]

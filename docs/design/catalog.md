@@ -102,8 +102,8 @@ How many stories show each entry. Counted per story file.
 | Maintenance | Screens | 11 |
 | Memory | Screens | 9 |
 | Overview | Screens | 7 |
-| Popover | Screens | 45 |
-| PopoverFallback | Screens | 45 |
+| Popover | Screens | 46 |
+| PopoverFallback | Screens | 46 |
 | Settings | Screens | 56 |
 
 ## Kit
@@ -1618,9 +1618,9 @@ The dashboard's home view (screens.md § 4): is the host healthy, what is it doi
 The tray popover (popover.md, popover/anatomy.md): does faber need me? The header and its ⋯ menu, then every active issue, the gates (bars that open in place), the job groups with their pips, the virtual machines (rows that open in place), other hosts, and Pause or Resume. While job groups show it is 620 px in two columns, gauges and hosts left and the groups right, folded at the gauges' height into compact lines; otherwise a 308 px column. Offline it collapses to the dashboard link; before the first snapshot it shows the loading frame.
 
 - **Use when:** the Tauri popover window, through `ui/popover/main.tsx`, which feeds it snapshots.
-- **States:** loading, idle, idle with a VM up, idle with a stale peer, an issue and no jobs, running, waiting, finished, busy, busy overflow, folded into compact lines, folded past the compact lines, a folded group open, folded list open, attention list open, a gate open, a gate open while jobs wait, a gate open while idle, a VM open, paused and frozen, attention rows, dismissed rows, dismissed rows open, all dismissed, trust changes acknowledged, mirror down, mirror passing through, mirror image missing, macOS jobs held, action failed, two actions in flight, VMs stale, menu open, limits view, offline
+- **States:** loading, idle, idle with a VM up, idle with a stale peer, an issue and no jobs, running, waiting, finished, busy, busy overflow, folded into compact lines, folded past the compact lines, a folded group open, folded list open, attention list open, a gate open, a gate open while jobs wait, a gate open while idle, a VM open, paused and frozen, attention rows, dismissed rows, dismissed rows open, all dismissed, trust changes acknowledged, mirror down, mirror passing through, mirror image missing, macOS jobs held, macOS VM supervisor not running, action failed, two actions in flight, VMs stale, menu open, limits view, offline
 - **Source:** `src/screens/Popover.tsx`
-- **Stories:** 45
+- **Stories:** 46
 
 | Prop | Type | Description |
 | --- | --- | --- |
@@ -1647,7 +1647,7 @@ What the popover shows when a snapshot it cannot draw arrives: the header, one l
 - **Use when:** only as the popover entry's error fallback (`PopoverApp`).
 - **States:** default
 - **Source:** `src/screens/Popover.tsx`
-- **Stories:** 45
+- **Stories:** 46
 
 | Prop | Type | Description |
 | --- | --- | --- |

@@ -96,7 +96,7 @@ const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
  * Offline it collapses to the dashboard link; before the first snapshot it shows the loading frame.
  *
  * @useWhen the Tauri popover window, through `ui/popover/main.tsx`, which feeds it snapshots.
- * @states loading, idle, idle with a VM up, idle with a stale peer, an issue and no jobs, running, waiting, finished, busy, busy overflow, folded into compact lines, folded past the compact lines, a folded group open, folded list open, attention list open, a gate open, a gate open while jobs wait, a gate open while idle, a VM open, paused and frozen, attention rows, dismissed rows, dismissed rows open, all dismissed, trust changes acknowledged, mirror down, mirror passing through, mirror image missing, macOS jobs held, action failed, two actions in flight, VMs stale, menu open, limits view, offline
+ * @states loading, idle, idle with a VM up, idle with a stale peer, an issue and no jobs, running, waiting, finished, busy, busy overflow, folded into compact lines, folded past the compact lines, a folded group open, folded list open, attention list open, a gate open, a gate open while jobs wait, a gate open while idle, a VM open, paused and frozen, attention rows, dismissed rows, dismissed rows open, all dismissed, trust changes acknowledged, mirror down, mirror passing through, mirror image missing, macOS jobs held, macOS VM supervisor not running, action failed, two actions in flight, VMs stale, menu open, limits view, offline
  */
 export function Popover({
   snap,

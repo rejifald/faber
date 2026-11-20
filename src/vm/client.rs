@@ -270,6 +270,11 @@ impl SupervisorClient {
         }
     }
 
+    /// The socket this client connects to.
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.endpoint.path
+    }
+
     /// The supervisor version the last successful handshake reported.
     pub fn supervisor_version(&self) -> Option<SupervisorVersion> {
         self.seen.lock().unwrap().clone()

@@ -285,6 +285,25 @@ export const macosHeld = online({
   ],
 });
 
+/** The session account is logged in and its supervisor agent is gone (#95): not a missing session. */
+export const macosAgentDown = online({
+  budget: budget({
+    gates: { vm_session: { parked_now: 1 } },
+    vm: {
+      wall: 'open',
+      session: 'agent_down',
+      session_detail: '_faber_mac is logged in, but its VM supervisor does not answer: its socket is missing, so its agent is not loaded; run `sudo launchctl bootstrap gui/600 /var/db/faber-mac/Library/LaunchAgents/io.github.rejifald.faber.mac-vm-supervisor.plist`, or `sudo faber setup`. A macOS VM it was running may still run, unsupervised, until it is back, and is swept then',
+      refusal: { gate: 'vm_session', detail: '_faber_mac is logged in, but its VM supervisor does not answer: its socket is missing, so its agent is not loaded; run `sudo launchctl bootstrap gui/600 /var/db/faber-mac/Library/LaunchAgents/io.github.rejifald.faber.mac-vm-supervisor.plist`, or `sudo faber setup`. A macOS VM it was running may still run, unsupervised, until it is back, and is swept then' },
+      macos_cap: 2,
+      macos_running: 0,
+      images: { linux: 'current', macos: 'current' },
+    },
+  }),
+  inflight: [
+    job({ profile: 'macos-native', job_name: 'release', admitted: false, step: null, waiting: { gate: 'vm_session', detail: '_faber_mac is logged in, but its VM supervisor does not answer: its socket is missing, so its agent is not loaded; run `sudo launchctl bootstrap gui/600 /var/db/faber-mac/Library/LaunchAgents/io.github.rejifald.faber.mac-vm-supervisor.plist`, or `sudo faber setup`. A macOS VM it was running may still run, unsupervised, until it is back, and is swept then' }, elapsed_s: 600 }),
+  ],
+});
+
 /** Two classes OOM-killed at the escalation threshold (ADR-0053): the worst named, the other counted. */
 export const oomHeld = online({
   budget: budget({
