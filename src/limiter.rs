@@ -562,7 +562,8 @@ impl VmRun {
     pub fn session_lost(&self, why: String) -> bool {
         let gated = self.limiter.inner.lock().unwrap().vm.session != VmSession::NotRequired;
         if gated {
-            self.limiter.observe_vm_session(Err(why));
+            self.limiter
+                .set_vm_session_from(|mode, before| admit::session_lost(before, mode, why));
         }
         gated
     }
@@ -1763,12 +1764,17 @@ impl Limiter {
     }
 
     fn set_vm_session(&self, next: impl FnOnce(SessionMode) -> VmSession) {
+        self.set_vm_session_from(|mode, _| next(mode));
+    }
+
+    /// [`Self::set_vm_session`], given the session as it stands too.
+    fn set_vm_session_from(&self, next: impl FnOnce(SessionMode, &VmSession) -> VmSession) {
         let (before, after) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.vm.session == VmSession::NotRequired {
                 return;
             }
-            let next = next(inner.vm.session_mode);
+            let next = next(inner.vm.session_mode, &inner.vm.session);
             let before = std::mem::replace(&mut inner.vm.session, next.clone());
             (before, next)
         };

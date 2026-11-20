@@ -246,6 +246,18 @@ pub fn session_state(
     }
 }
 
+/// The session after a VM start found its supervisor gone (`why`), given the
+/// session as the last probe left it. Pure. A session last seen with its agent
+/// down stays so (the account is still logged in, and the reboot-mode words
+/// would be wrong again, #95); any other closes as a down session until the
+/// next probe, which asks who is logged in, says which.
+pub fn session_lost(before: &VmSession, mode: SessionMode, why: String) -> VmSession {
+    match before {
+        VmSession::AgentDown { .. } => before.clone(),
+        _ => VmSession::Down { mode, why },
+    }
+}
+
 /// What the operator runs to bring a logged-in session's agent back. Pure.
 pub fn agent_action(uid: u32, probe: &ProbeFailure) -> String {
     let label = crate::platform::service::SESSION_AGENT_LABEL;
@@ -254,9 +266,13 @@ pub fn agent_action(uid: u32, probe: &ProbeFailure) -> String {
             "run `sudo launchctl bootstrap gui/{uid} {}`, or `sudo faber setup`",
             crate::setup::session::agent_path().display()
         ),
-        ProbeFailure::NotServing(_) => {
-            format!("run `sudo launchctl kickstart -k gui/{uid}/{label}`, or `sudo faber setup`")
-        }
+        // A socket an agent that died left behind looks the same: launchd no
+        // longer has the service then, and kickstart fails where bootstrap works.
+        ProbeFailure::NotServing(_) => format!(
+            "run `sudo launchctl kickstart -k gui/{uid}/{label}` (if launchd no longer has \
+             it, `sudo launchctl bootstrap gui/{uid} {}`), or `sudo faber setup`",
+            crate::setup::session::agent_path().display()
+        ),
         ProbeFailure::Other(_) => "run `sudo faber setup`".to_string(),
     }
 }
@@ -694,6 +710,27 @@ mod tests {
         );
     }
 
+    /// #95: a VM start that finds the supervisor gone keeps an agent-down
+    /// session as it is, rather than putting back the reboot mode's words.
+    #[test]
+    fn a_lost_supervisor_keeps_an_agent_down_session() {
+        let agent = VmSession::AgentDown {
+            uid: 600,
+            probe: ProbeFailure::NoSocket,
+        };
+        let m = SessionMode::Unlock;
+        assert_eq!(session_lost(&agent, m, "lost".into()), agent);
+        for before in [VmSession::Up, VmSession::Unprobed(m)] {
+            assert_eq!(
+                session_lost(&before, m, "lost".into()),
+                VmSession::Down {
+                    mode: m,
+                    why: "lost".into()
+                }
+            );
+        }
+    }
+
     /// #95: a logged-in session whose agent is down is refused under the same
     /// gate, in words that name the right command, never the reboot mode's.
     #[test]
@@ -732,7 +769,10 @@ mod tests {
             ),
             "{detail}"
         );
-        assert!(!detail.contains("bootstrap"), "{detail}");
+        assert!(
+            detail.contains("if launchd no longer has it, `sudo launchctl bootstrap gui/600 "),
+            "a socket left behind by a dead agent: {detail}"
+        );
 
         // Something else (a wrong peer, another protocol): setup.
         let other = agent_action(600, &ProbeFailure::Other("held by uid 0".into()));
