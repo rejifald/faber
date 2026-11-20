@@ -199,6 +199,9 @@ and the operator's staging copy is deleted only when they agree.
     logged `ok=true wrote=5/5` just before, and `softwareupdate --schedule`
     said automatic checking was on. So macOS removes the key after the agent
     writes it, and a rebuild cannot help: the image is not where it is lost.
+    It does not happen on every boot: a later verification of the same image on
+    the same host passed. A race the agent wins only sometimes is still a race
+    a job can lose.
     What removes it has not been seen in a guest yet. The verify console holds
     only the agent's lines, and the clone is gone. macOS's own Software Update
     framework (read on a macOS 27 host) handles `AutomaticCheckEnabled` beside
