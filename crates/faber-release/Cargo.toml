@@ -11,7 +11,7 @@ repository = "https://github.com/rejifald/faber"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SHA-256 over a downloaded release asset, before faber will execute it.
-sha2 = "0.10"
+sha2 = "0.11"
 tracing = "0.1"
 # The release verifier (ADR-0031, #119): a follower checks a release's GitHub
 # attestation in-process. Every crate of the family is pinned exactly, the
@@ -19,15 +19,15 @@ tracing = "0.1"
 # decides what a follower installs. A version bump is a reviewed change, subject
 # to the owner's origin check for new dependencies (approved for 0.14.0 on
 # 2026-10-11, #119).
-sigstore-verify = { version = "=0.15.1", features = ["tuf"] }
-sigstore-trust-root = { version = "=0.15.1", features = ["tuf"] }
-sigstore-tuf = "=0.15.1"
-sigstore-types = "=0.15.1"
-sigstore-bundle = "=0.15.1"
-sigstore-crypto = "=0.15.1"
-sigstore-merkle = "=0.15.1"
-sigstore-rekor = "=0.15.1"
-sigstore-tsa = "=0.15.1"
+sigstore-verify = { version = "=0.16.0", features = ["tuf"] }
+sigstore-trust-root = { version = "=0.16.0", features = ["tuf"] }
+sigstore-tuf = "=0.16.0"
+sigstore-types = "=0.16.0"
+sigstore-bundle = "=0.16.0"
+sigstore-crypto = "=0.16.0"
+sigstore-merkle = "=0.16.0"
+sigstore-rekor = "=0.16.0"
+sigstore-tsa = "=0.16.0"
 
 [features]
 # Swaps the compiled-in release-verification policy for the throwaway sandbox
