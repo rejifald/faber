@@ -114,13 +114,3 @@ export const DismissFailed: Story = {
 /** Acknowledged trust changes, folded into one quiet row that opens to list them. */
 export const WithDetails: Story = { args: { row: acked }, render: (args) => onCard(<AttentionRow {...args} />) };
 export const DetailsOpen: Story = { args: { row: acked, defaultDetailsOpen: true }, render: (args) => onCard(<AttentionRow {...args} />) };
-
-// DRAFT (speed-up hints, for the owner's review): how a hint would read if the popover carried
-// it. A popover row clamps at three lines, so it is the short form; the dashboard has the rest.
-const hint: Row = {
-  key: 'hint:git_mirror',
-  sev: 'info',
-  icon: 'info',
-  parts: [{ strong: 'Checkout could be faster' }, ' — a median of 24s on 300 runs this week, and the git mirror is held off. The dashboard says why.'],
-};
-export const SpeedHint: Story = { args: { row: hint, onDismiss: () => {} }, render: (args) => onCard(<AttentionRow {...args} />) };

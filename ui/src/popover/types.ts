@@ -632,35 +632,35 @@ export interface DaemonState {
   awake?: AwakeView;
   credential?: CredentialView;
   git_mirrors?: GitMirror[];
-  /** Faster ways to run jobs that exist on this host and are off or unused. Absent with nothing to gain, and from an older daemon. */
+  /** Speed-up hints (ADR faber-says-when-a-faster-way-to-run-jobs-is-off): faster ways to run jobs that this host leaves off. Empty with nothing to gain; absent from an older daemon. */
   hints?: SpeedHint[];
   /** The operator's dismissals and trust acknowledgement (ADR-0064). Absent from an older daemon. */
   attention?: AttentionState;
 }
 
 /**
- * One speed-up hint: a capability faber has that this host leaves off, and what the step it
- * shortens cost here. The figures are this host's own step timings over `window_days`; with no
- * timed run they are absent and the row says so.
+ * One speed-up hint (ADR faber-says-when-a-faster-way-to-run-jobs-is-off): a capability faber has that this host leaves off, and what the
+ * step it shortens costs here. Every figure is this host's own, over `window_days`; with no timed
+ * step on record `runs`, `median_ms` and `total_ms` are absent and the row says so.
  */
 export interface SpeedHint {
   /** The capability: `git_mirror` (ADR-0035). */
   kind: string;
-  /** Why it is not in use: `off` (no profile asks for it), or held beside dind (`dind_granted`, `engine_marked`). */
+  /** Why it is not in use: no profile asks for it, or it is held off beside dind. */
   cause: 'off' | 'dind_granted' | 'engine_marked';
   /** The docker profiles that grant dind, for `dind_granted`. */
   profiles?: string[];
   window_days: number;
+  /** Docker runs in the window, and how many of them were handed a Docker daemon. */
+  docker_runs: number;
+  dind_runs: number;
+  /** When the last run handed a Docker daemon finished; absent when none is on record. */
+  last_dind_ms?: number;
   /** Runs in the window with a timed step of the kind the capability shortens. */
   runs?: number;
-  /** The median such step time per run, and the sum over the window. */
+  /** The median time in such steps per run, and the sum over the window. */
   median_ms?: number;
   total_ms?: number;
-  /** Docker runs in the window, and how many of them were given a Docker daemon (`dind` is `granted` on the run's record). */
-  docker_runs?: number;
-  dind_runs?: number;
-  /** When the last run given a Docker daemon finished, in any window; absent when the records hold none. */
-  last_dind_ms?: number;
 }
 
 /** One dismissed attention row (ADR-0064 § 2): its key and the identity it had when dismissed. */

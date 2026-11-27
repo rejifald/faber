@@ -2,7 +2,7 @@
 // with nothing to say; `full` carries every field the daemon serves and trips every alarm.
 // Names are acme/web, acme/api, acme/mobile and owner/demo on the hosts alpha and beta only
 // (AGENTS.md: nothing private in the tree).
-import type { Budget, ClassCap, DaemonState, Inflight, Outcome } from '../popover/types';
+import type { Budget, ClassCap, DaemonState, Inflight, Outcome, SpeedHint } from '../popover/types';
 import { rowIdent } from '../popover/attention';
 import { dashboardAlarms } from './alarms';
 import type { JobClass, JobsView, PhaseId, PhaseSpread, RunFootprint, Spread } from './jobs';
@@ -196,6 +196,22 @@ export const quiet: DaemonState = {
   git_mirrors: [{ repo: 'acme/web', ready: true, refreshing: false, size_kib: 20480, last_refresh_ms: ago(120), last_attempt_ms: ago(120), last_error: null, blocked: null }],
 };
 
+/**
+ * A git-mirror hint with a week of checkout timings (illustrative figures): the mirror off, or held
+ * off beside dind. `over` sets what the cause needs: the granting profiles, the runs handed a daemon.
+ */
+export const checkoutHint = (cause: SpeedHint['cause'], over: Partial<SpeedHint> = {}): SpeedHint => ({
+  kind: 'git_mirror',
+  cause,
+  window_days: 7,
+  docker_runs: 300,
+  dind_runs: 0,
+  runs: 280,
+  median_ms: 24_000,
+  total_ms: 7_500_000,
+  ...over,
+});
+
 /** Every field the daemon serves, and every alarm the dashboard raises. */
 export const full: DaemonState = {
   ...quiet,
@@ -236,6 +252,7 @@ export const full: DaemonState = {
     { profile: 'macos', days_remaining: 20, urgent: false, runner_version: '2.331.0', cutoff: '2026-11-17', image: null, job_id: 9002, seen_ms: ago(3600), message: 'actions/runner 2.331.0 stops on 2026-11-17 (20 days) for macos' },
   ],
   peers: [{ instance: 'beta', first_seen_ms: ago(86400), last_seen_ms: ago(20), runners: { linux: 2 } }],
+  hints: [checkoutHint('engine_marked')],
   git_mirrors: [
     { repo: 'acme/web', ready: true, refreshing: true, size_kib: 20480, last_refresh_ms: ago(120), last_attempt_ms: ago(5), last_error: 'fetch failed: connection reset', blocked: null },
     { repo: 'acme/api', ready: false, refreshing: false, size_kib: null, last_refresh_ms: null, last_attempt_ms: null, last_error: null, blocked: 'is held by a volume faber did not label' },

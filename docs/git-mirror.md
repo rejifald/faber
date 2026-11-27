@@ -282,3 +282,25 @@ the same under `git_mirrors` (an additive field):
 
 A failed refresh leaves the previous mirror in place. A stale mirror is still
 correct, only less useful, and nothing about it fails a job.
+
+While the mirror is off or held off, the dashboard's Overview shows a neutral
+hint ([the speed-up hints ADR](adrs/0068-faber-says-when-a-faster-way-to-run-jobs-is-off.md)): how
+long checkout took on this host's runs in the last 7 days, why the mirror is
+not in use, and what turning it on, or back on, takes. Held off beside dind, it
+also says how many runs were given a Docker daemon in those 7 days, so a grant
+nothing uses any more is visible as what holds the mirror off. `/api/state`
+carries it under `hints` (an additive field), with the figures as numbers:
+
+```json
+"hints": [
+  {"kind": "git_mirror", "cause": "dind_granted", "profiles": ["linux-dind"],
+   "window_days": 7, "docker_runs": 300, "dind_runs": 0,
+   "runs": 280, "median_ms": 24000, "total_ms": 7500000}
+]
+```
+
+`cause` is `off`, `dind_granted` or `engine_marked`. `runs`, `median_ms` and
+`total_ms` are absent when no run in the window has a timed checkout step: a
+step GitHub named `Run actions/checkout@…`, or one a workflow named beginning
+with "Checkout". The figures are illustrative. `[host] speed_hints = false`
+turns the hint off.

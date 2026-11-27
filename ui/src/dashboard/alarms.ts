@@ -1,12 +1,13 @@
 // Everything on the daemon that needs attention, worst first: the dashboard's attention list.
 // It composes the popover's producers (popover/attention.ts, untouched) and adds the notices the
 // inline page showed that the popover folds away or lacks: the credential, the gate, the dind
-// wall and label rule, every missing image, the mirrors, the update's other phases. Rows are
+// wall and label rule, every missing image, the mirrors, the update's other phases, and the
+// speed-up hints, which only the dashboard shows (ADR faber-says-when-a-faster-way-to-run-jobs-is-off). Rows are
 // data; daemon and GitHub text stays in string parts, which React sets as text, never as markup.
-import { applyAttention, daemonRows, hintRows, mirrorParts, retireIdent, rowIdent, sortRows, trustRows, updateRows } from '../popover/attention';
+import { applyAttention, daemonRows, mirrorParts, retireIdent, rowIdent, sortRows, trustRows, updateRows } from '../popover/attention';
 import type { AttentionRow, Part, Severity } from '../popover/attention';
-import { fmtClock, fmtDateTime, plural } from '../popover/format';
-import type { DaemonState } from '../popover/types';
+import { fmtAgo, fmtClock, fmtDateTime, fmtUptime, plural } from '../popover/format';
+import type { DaemonState, SpeedHint } from '../popover/types';
 import { phaseWords } from './maintenance';
 
 /** An alarm is a popover attention row: `sev` is its tone, `actions` name what the Release/Clear/Install buttons run. */
@@ -265,6 +266,65 @@ function updatePhaseAlarms(s: DaemonState): Alarm[] {
   return out;
 }
 
+/** `profile 'a' grants`, `profiles 'a' and 'b' grant`: the daemon's wording for the same list. */
+function profilesGrant(names: string[]): string {
+  const quoted = names.map((n) => `'${n}'`);
+  if (quoted.length <= 1) return `profile ${quoted[0] ?? ''} grants`;
+  return `profiles ${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]} grant`;
+}
+
+const lastDays = (h: SpeedHint) => `the last ${plural(h.window_days, 'day')}`;
+
+/** What checkout costs on this host, from its own step timings; said plainly when it has none. */
+function checkoutCost(h: SpeedHint): string {
+  if (!h.runs || h.median_ms == null) return `faber has no checkout timings from ${lastDays(h)}, so it cannot say what checkout costs here.`;
+  const total = h.total_ms != null ? `, ${fmtUptime(h.total_ms / 1000)} in all` : '';
+  return `Checkout took a median of ${fmtUptime(h.median_ms / 1000)} on ${plural(h.runs, 'run')} in ${lastDays(h)}${total}.`;
+}
+
+/** Whether the dind grant that holds a mirror off is in use: the runs handed a daemon, or how long ago the last one was. */
+function dindUse(h: SpeedHint, now: number): string {
+  if (h.dind_runs > 0) {
+    return `${h.dind_runs} of ${plural(h.docker_runs, 'run')} on docker profiles in ${lastDays(h)} ${h.dind_runs === 1 ? 'was' : 'were'} given a Docker daemon. `;
+  }
+  const last = h.last_dind_ms != null ? `; the last was ${fmtAgo((now - h.last_dind_ms) / 1000)} ago` : '';
+  return `No run in ${lastDays(h)} was given a Docker daemon${last}. `;
+}
+
+/**
+ * Speed-up hints (ADR faber-says-when-a-faster-way-to-run-jobs-is-off): a faster way to run jobs that this host has and leaves off. Neutral
+ * rows that stop nothing, on the dashboard only, and with no button: every fix is a config change,
+ * and the row names what the change accepts. A row states what the step costs here today, from
+ * this host's own records, and never what the capability would save.
+ */
+function hintAlarms(s: DaemonState, now: number): Alarm[] {
+  const out: Alarm[] = [];
+  for (const h of s.hints || []) {
+    if (h.kind !== 'git_mirror') continue;
+    const parts: Part[] = [{ strong: 'Checkout could be faster' }, ` — ${checkoutCost(h)} `];
+    if (h.cause === 'off') {
+      parts.push(
+        'A git mirror shortens it; no run here has used one, so faber cannot say by how much. It is off: no docker profile sets ',
+        { mono: 'git_mirror' },
+        '. Turning it on widens trust: each refresh puts faber’s GitHub token on the Docker engine. The steps are in ',
+        { mono: 'docs/git-mirror.md' },
+        '.',
+      );
+    } else {
+      const why = h.cause === 'dind_granted' ? `${profilesGrant(h.profiles || [])} dind` : 'this host’s Docker engine has granted dind';
+      parts.push(
+        `The git mirror shortens it, and is held off here: ${why}. ${dindUse(h, now)}The way back is `,
+        { mono: 'dind = false' },
+        ' on every docker profile and a fresh Linux VM disk, since a job has been root on this one. That is an operator step with risks of its own: ',
+        { mono: 'docs/git-mirror.md' },
+        ', “Turning them back on”.',
+      );
+    }
+    out.push(alarm(`hint:${h.kind}`, 'info', parts));
+  }
+  return out;
+}
+
 /**
  * Everything that needs attention, worst first (stable within a tone), dismissed rows included.
  * `now` is the clock the trust-change ages read against. A view shows `activeAlarms`.
@@ -301,7 +361,7 @@ export function dashboardAlarms(s: DaemonState, now: number): Alarm[] {
     ...noticeAlarms(s),
     ...awakeAlarms(s),
     ...peerAlarms(s),
-    ...hintRows(s, now),
+    ...hintAlarms(s, now),
     ...trustRows(s, undefined, now),
   ]);
 }
