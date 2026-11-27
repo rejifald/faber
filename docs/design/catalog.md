@@ -51,7 +51,7 @@ How many stories show each entry. Counted per story file.
 | Tooltip | Kit | 5 |
 | TooltipProvider | Kit | 5 |
 | AttentionCard | Blocks | 11 |
-| AttentionRow | Blocks | 12 |
+| AttentionRow | Blocks | 13 |
 | BudgetRail | Blocks | 4 |
 | ClassDetail | Blocks | 8 |
 | CodeBlock | Blocks | 2 |
@@ -101,7 +101,7 @@ How many stories show each entry. Counted per story file.
 | LimitsView | Screens | 10 |
 | Maintenance | Screens | 11 |
 | Memory | Screens | 9 |
-| Overview | Screens | 7 |
+| Overview | Screens | 12 |
 | Popover | Screens | 46 |
 | PopoverFallback | Screens | 46 |
 | Settings | Screens | 56 |
@@ -783,7 +783,7 @@ One active issue in the popover's attention list: a full-bleed band tinted by se
 - **Use when:** the popover's attention list, one per active issue, worst first (popover.md). Not for the healthy state: a healthy popover shows no row. An action with `confirm` asks in place first: its question and consequence, Cancel and the confirmed action, where the actions were. Focus moves to Cancel, Escape cancels, and either answer hands focus back to the action that asked. A row that does not stop jobs carries a quiet Dismiss (×) at its end (ADR-0064). A row with `details` (acknowledged trust changes) opens in place to list them.
 - **States:** bad, warn, info, with actions, action pending, action failed, confirming, dismissable, dismiss pending, dismiss failed, with details, details open
 - **Source:** `src/blocks/AttentionRow.tsx`
-- **Stories:** 12
+- **Stories:** 13
 
 | Prop | Type | Description |
 | --- | --- | --- |
@@ -1606,7 +1606,7 @@ The dashboard's home view (screens.md § 4): is the host healthy, what is it doi
 - **Use when:** the dashboard's `/` view. A pure function of the state it is handed; actions go through `run`.
 - **States:** busy, healthy, fresh host (empty panels), stale, alarm action failed, alarms dismissed, dismissed open, trust changes acknowledged
 - **Source:** `src/screens/Overview.tsx`
-- **Stories:** 7
+- **Stories:** 12
 
 | Prop | Type | Description |
 | --- | --- | --- |

@@ -632,8 +632,30 @@ export interface DaemonState {
   awake?: AwakeView;
   credential?: CredentialView;
   git_mirrors?: GitMirror[];
+  /** Faster ways to run jobs that exist on this host and are off or unused. Absent with nothing to gain, and from an older daemon. */
+  hints?: SpeedHint[];
   /** The operator's dismissals and trust acknowledgement (ADR-0064). Absent from an older daemon. */
   attention?: AttentionState;
+}
+
+/**
+ * One speed-up hint: a capability faber has that this host leaves off, and what the step it
+ * shortens cost here. The figures are this host's own step timings over `window_days`; with no
+ * timed run they are absent and the row says so.
+ */
+export interface SpeedHint {
+  /** The capability: `git_mirror` (ADR-0035). */
+  kind: string;
+  /** Why it is not in use: `off` (no profile asks for it), or held beside dind (`dind_granted`, `engine_marked`). */
+  cause: 'off' | 'dind_granted' | 'engine_marked';
+  /** The docker profiles that grant dind, for `dind_granted`. */
+  profiles?: string[];
+  window_days: number;
+  /** Runs in the window with a timed step of the kind the capability shortens. */
+  runs?: number;
+  /** The median such step time per run, and the sum over the window. */
+  median_ms?: number;
+  total_ms?: number;
 }
 
 /** One dismissed attention row (ADR-0064 § 2): its key and the identity it had when dismissed. */

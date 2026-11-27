@@ -1,9 +1,9 @@
 // The attention list (popover.md, Attention list): every active issue as its own row, worst
 // first. Rows are data; the screen draws them. Daemon and GitHub text stays in string parts,
 // which React sets as text, never as markup.
-import { fmtAgo, fmtClock, fmtDateTime, gib1, plural, rearmWhen, shellWord, waitIn } from './format';
+import { fmtAgo, fmtClock, fmtDateTime, fmtUptime, gib1, plural, rearmWhen, shellWord, waitIn } from './format';
 import { DAEMON_LABEL_SEP } from './groups';
-import type { AppUpdate, AttentionState, Budget, DaemonState, MirrorRow, UpdateView, VmView } from './types';
+import type { AppUpdate, AttentionState, Budget, DaemonState, MirrorRow, SpeedHint, UpdateView, VmView } from './types';
 
 export type Severity = 'bad' | 'warn' | 'info';
 /** The row's leading glyph; the screen maps each to a lucide icon. */
@@ -493,6 +493,54 @@ export function trustRows(s: DaemonState, shrank: boolean | undefined, now: numb
       ts_ms: c.ts_ms,
       parts: [{ strong: 'Trust widened:' }, ` ${c.sentence}, from ${VIA[c.via] ?? c.via} ${fmtAgo((now - c.ts_ms) / 1000)} ago`],
     });
+  }
+  return rows;
+}
+
+/** `profile 'a' grants`, `profiles 'a' and 'b' grant`: the daemon's own wording for the same list. */
+function profilesGrant(names: string[]): string {
+  const quoted = names.map((n) => `'${n}'`);
+  if (quoted.length <= 1) return `profile ${quoted[0] ?? ''} grants`;
+  return `profiles ${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]} grant`;
+}
+
+/** What the step a hint is about cost on this host, from its own step timings; said plainly when it has none. */
+function hintCost(h: SpeedHint, step: string): string {
+  if (!h.runs || h.median_ms == null) return `faber has no ${step} timings on this host yet, so it cannot say what ${step} costs here.`;
+  const total = h.total_ms != null ? `, ${fmtUptime(h.total_ms / 1000)} in all` : '';
+  return `${capitalize(step)} took a median of ${fmtUptime(h.median_ms / 1000)} on ${plural(h.runs, 'run')} in the last ${plural(h.window_days, 'day')}${total}.`;
+}
+
+/**
+ * Speed-up hints: a faster way to run jobs that this host has and leaves off. Neutral rows that
+ * stop nothing and carry no button: every fix here is a config change, and the ones that widen
+ * trust name what they put at risk. The saving is never estimated; the row states what the step
+ * costs here today, from this host's records.
+ */
+export function hintRows(s: DaemonState): AttentionRow[] {
+  const rows: AttentionRow[] = [];
+  for (const h of s.hints || []) {
+    if (h.kind !== 'git_mirror') continue;
+    const parts: Part[] = [{ strong: 'Checkout could be faster' }, ` — ${hintCost(h, 'checkout')} `];
+    if (h.cause === 'off') {
+      parts.push(
+        'A git mirror shortens it; no run here has used one, so faber cannot say by how much. It is off: no docker profile sets ',
+        { mono: 'git_mirror' },
+        '. Turning it on widens trust: each refresh puts faber’s GitHub token on the Docker engine. The steps are in ',
+        { mono: 'docs/git-mirror.md' },
+        '.',
+      );
+    } else {
+      const why = h.cause === 'dind_granted' ? `${profilesGrant(h.profiles || [])} dind` : 'this host’s Docker engine has granted dind';
+      parts.push(
+        `The git mirror shortens it, and is held off here: ${why}. The way back is a fresh Linux VM disk with `,
+        { mono: 'dind = false' },
+        ' on every docker profile, an operator step with risks of its own: ',
+        { mono: 'docs/git-mirror.md' },
+        ', “Turning them back on”.',
+      );
+    }
+    rows.push({ key: `hint:${h.kind}`, sev: 'info', icon: 'info', parts });
   }
   return rows;
 }

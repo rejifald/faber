@@ -3,7 +3,7 @@
 // inline page showed that the popover folds away or lacks: the credential, the gate, the dind
 // wall and label rule, every missing image, the mirrors, the update's other phases. Rows are
 // data; daemon and GitHub text stays in string parts, which React sets as text, never as markup.
-import { applyAttention, daemonRows, mirrorParts, retireIdent, rowIdent, sortRows, trustRows, updateRows } from '../popover/attention';
+import { applyAttention, daemonRows, hintRows, mirrorParts, retireIdent, rowIdent, sortRows, trustRows, updateRows } from '../popover/attention';
 import type { AttentionRow, Part, Severity } from '../popover/attention';
 import { fmtClock, fmtDateTime, plural } from '../popover/format';
 import type { DaemonState } from '../popover/types';
@@ -301,6 +301,7 @@ export function dashboardAlarms(s: DaemonState, now: number): Alarm[] {
     ...noticeAlarms(s),
     ...awakeAlarms(s),
     ...peerAlarms(s),
+    ...hintRows(s),
     ...trustRows(s, undefined, now),
   ]);
 }

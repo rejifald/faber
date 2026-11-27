@@ -70,3 +70,17 @@ export const AlarmsDismissed: Story = { args: { state: dismissedAlarms } };
 
 /** The dismissed alarms opened, each with Restore, then Restore all. */
 export const DismissedOpen: Story = { args: { state: dismissedAlarms, defaultDismissedOpen: true } };
+
+// DRAFT (speed-up hints, for the owner's review): illustrative figures, not a real host's.
+const checkout = { kind: 'git_mirror', window_days: 7, runs: 300, median_ms: 24_000, total_ms: 7_500_000 };
+
+/** A hint on a healthy host: the git mirror is held off beside dind, with what checkout costs here. */
+export const SpeedHintHeld: Story = { args: { state: { ...quiet, hints: [{ ...checkout, cause: 'engine_marked' }] } } };
+/** The same capability simply off: no profile asks for it. The fix widens trust, and the row says so. */
+export const SpeedHintOff: Story = { args: { state: { ...quiet, hints: [{ ...checkout, cause: 'off' }] } } };
+/** A profile grants dind now. */
+export const SpeedHintDindGranted: Story = { args: { state: { ...quiet, hints: [{ ...checkout, cause: 'dind_granted', profiles: ['linux'] }] } } };
+/** No timed run yet: the row says so and states no figure. */
+export const SpeedHintNoRecord: Story = { args: { state: { ...quiet, hints: [{ kind: 'git_mirror', cause: 'off', window_days: 7 }] } } };
+/** Among real alarms the hint sorts last: neutral, after red and amber. */
+export const SpeedHintAmongAlarms: Story = { args: { state: { ...full, hints: [{ ...checkout, cause: 'engine_marked' }] } } };
