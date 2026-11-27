@@ -227,7 +227,7 @@ ADR-0049 §7: run the golden image's checks on this fresh clone instead of a job
 | `remote_login` | `launchctl print-disabled system` lists sshd as disabled, or, when it does not list it, `launchctl print system/com.openssh.sshd` exits 113 (not loaded). |
 | `filevault` | `fdesetup status` says FileVault is off. |
 | `apple_id` | No account under `/Users` has a non-empty `Accounts` list in `Library/Preferences/MobileMeAccounts.plist`. |
-| `software_update` | `/Library/Preferences/com.apple.SoftwareUpdate.plist` holds `AutomaticDownload`, `CriticalUpdateInstall`, `ConfigDataInstall` and `AutomaticCheckEnabled`, each false, and `AutomaticallyInstallMacOSUpdates` is absent or false. |
+| `software_update` | `/Library/Preferences/com.apple.SoftwareUpdate.plist` holds `AutomaticDownload`, `CriticalUpdateInstall`, `ConfigDataInstall` and `AutomaticCheckEnabled`, each false, and `AutomaticallyInstallMacOSUpdates` is absent or false. When the first read fails, the agent writes the keys once more, waits 3 s and reads again, and that second read is the verdict (below). |
 | `xcode` | As `runner` (`sudo -n -H -u runner` from root, the account and home a job has): `xcodebuild -version` exits 0, and, when `xcode` is expected, prints `Xcode <version>` first and `Build version <build>`; `xcode-select -p` resolves to a directory `runner` can enter and read; and `/usr/bin/cc` and `/usr/bin/swiftc` each compile, link and run a trivial program in a fresh directory under `/private/tmp`. Root bypasses every permission bit, so root's answer is not a job's. |
 | `runtimes` | Every expected runtime is in `xcrun simctl list runtimes -j` with its platform, version and build, and `isAvailable`. |
 | `brew_owner` | `/opt/homebrew` is owned by `runner`'s uid and `/opt/homebrew/bin/brew` exists. |
@@ -245,15 +245,34 @@ does) and writes one line per check, then a last one, each on a line of its own:
 ```
 FABER-GOLDEN-VERIFY start checks=10
 FABER-GOLDEN-VERIFY check=admins_locked ok=false why=admin _mbsetupuser shell /bin/bash
-FABER-GOLDEN-VERIFY check=software_update ok=false why=AutomaticallyInstallMacOSUpdates=1
+FABER-AGENT updates_off at=check ok=true wrote=5/5
+FABER-GOLDEN-VERIFY check=software_update ok=false why=AutomaticallyInstallMacOSUpdates=1 (written again at the check)
 FABER-GOLDEN-VERIFY evidence check=software_update schedule=exit 0 'Automatic checking for updates is turned off.'
+FABER-GOLDEN-VERIFY evidence check=software_update watch_restores=1 first=AutomaticCheckEnabled absent after=63s
 FABER-GOLDEN-VERIFY done failed=admins_locked,software_update
 ```
 
-The `evidence` line follows the software_update line. It holds the first line of
-`softwareupdate --schedule` (stdout and stderr, at most 100 bytes, 20 s at most),
-or `did not run or timed out`. It is for the operator only. The check's verdict
-is the plist's alone, and this line never changes it.
+**The software_update check reads twice when it has to.** Its first read of the
+plist is the verdict when it passes. When it fails, that may be the watch's race:
+macOS removed a key a moment ago and the watch has not put it back yet. So the
+agent writes the keys once more (the `updates_off at=check` line), waits 3 s,
+longer than one watch interval and a round of writes, and reads again. The
+second read is the verdict. A pass then says so, and what the first read found:
+`why=written again at the check, then off (first read: AutomaticCheckEnabled
+absent (it defaults to on))`. A failure adds `(written again at the check)`. So
+a Software Update that is really on still fails: a write that fails, a key the
+agent does not write, or anything that turns a key straight back on. The second
+read adds at most 53 s (five writes of 10 s, and the wait), within `verified`'s
+360 s.
+
+Two `evidence` lines follow the software_update line. The first holds the first
+line of `softwareupdate --schedule` (stdout and stderr, at most 100 bytes, 20 s
+at most), or `did not run or timed out`. The second says how often the watch has
+written the keys again since `serve` started, and what it found first, or
+`watch_restores=0`. They are for the operator only and never change the verdict:
+a clone whose watch restored the keys a hundred times still passes when the
+keys are off, because that is the state a job gets, and the count says how hard
+macOS pushed.
 
 `why` is the one fact that decided the check: the account, the key and its value,
 the command and its exit status, or why a plist could not be read. A line is
@@ -284,22 +303,33 @@ mounts it read-only, `nosuid,nodev,nobrowse`, at `/private/var/faber/tools`
 and runs the agent from it as root. The image holds neither the agent nor the
 runner.
 
-**Software Update, written again.** A clone's boot does not keep the image's
-Software Update keys: on a real host a verify clone lost `AutomaticCheckEnabled`
-about a minute after boot (ADR-0049 §5, amended 2026-10-26). So the agent, as
-root, runs the golden build's step a again (`launcher/golden/provision.sh`):
-`/usr/bin/defaults write /Library/Preferences/com.apple.SoftwareUpdate <key> -bool
-false` for `AutomaticDownload`, `CriticalUpdateInstall`, `ConfigDataInstall` and
+**Software Update, written again, and watched.** A clone does not keep the
+image's Software Update keys: macOS removes `AutomaticCheckEnabled` after boot,
+and absent it defaults to on. The other three stay false. Writing the keys once
+when `serve` starts does not win that race: on a real host a verify clone logged
+`updates_off at=serve ok=true wrote=5/5`, and the software_update check that
+followed found the key absent (ADR-0049 §5, amended 2026-10-26 and 2026-11-20).
+So the agent, as root, runs the golden build's step a again
+(`launcher/golden/provision.sh`): `/usr/bin/defaults write
+/Library/Preferences/com.apple.SoftwareUpdate <key> -bool false` for
+`AutomaticDownload`, `CriticalUpdateInstall`, `ConfigDataInstall` and
 `AutomaticCheckEnabled`, then `AutoUpdate` false in
-`/Library/Preferences/com.apple.commerce`. Each write gets 5 s, plus 5 s for its output reader. It runs them at
-two moments:
+`/Library/Preferences/com.apple.commerce`. Each write gets 5 s, plus 5 s for its
+output reader. It runs them:
 
 1. when `serve` starts, before the agent opens its vsock port, so it never
    reports `ready` first;
 2. on `begin`, after the `accepted` reply and before the hand-off below, so a
-   job starts with the keys off whatever rewrote them in between.
+   job starts with the keys off whatever rewrote them in between;
+3. whenever the **watch** finds one of the four keys absent or not false. From
+   `serve` on, for the life of the clone, the agent reads
+   `/Library/Preferences/com.apple.SoftwareUpdate.plist` once a second, the file
+   the verification judges, and writes all five again at once when a key is
+   lost. A key macOS removes is back within about a second. The watch restores
+   only the keys the agent writes: `AutomaticallyInstallMacOSUpdates`, which it
+   never writes, is left to the verification, which fails it;
+4. in the `software_update` check, when its first read fails (*verify*, below).
 
-`verify` writes nothing of its own; it judges the plist as the clone left it.
 A write that fails or times out never stops the agent. It runs the rest, then
 writes one line to the guest's console and to its log:
 
@@ -307,6 +337,27 @@ writes one line to the guest's console and to its log:
 FABER-AGENT updates_off at=serve ok=true wrote=5/5
 FABER-AGENT updates_off at=begin ok=false wrote=4/5 failed=AutomaticCheckEnabled exit 1
 ```
+
+A restore by the watch is two lines, the loss and the writes, with the seconds
+since the watch started and how many restores so far. After five restores only
+every hundredth is written out, so a daemon that fights the agent cannot flood
+the console; every one is still made and counted.
+
+```
+FABER-AGENT updates_lost after=63s restores=1 why=AutomaticCheckEnabled absent
+FABER-AGENT updates_off at=watch ok=true wrote=5/5
+FABER-AGENT evidence updates_lost=AutomaticCheckEnabled absent log=exit 0 logged=softwareupdated:4,cfprefsd:2
+FABER-AGENT evidence updates_lost=AutomaticCheckEnabled absent said=softwareupdated: BackgroundActions: Automatic check parameters: ...
+```
+
+The first restore also says who removed the key. After the writes, the agent
+reads the guest's own log for the 30 s before (`log show --last 30s --style
+ndjson`, 30 s at most) for messages from `softwareupdated`, from the Software
+Update subsystems, or naming `SoftwareUpdate` or `AutomaticCheck`, never from
+`log` itself. It writes one line counting them per process, most first, and up to
+three lines quoting the newest that mention automatic checking, 100 bytes each.
+The log shows its dynamic values as `<private>`, so nothing private is quoted.
+This is the operator's evidence of what macOS did; it changes no verdict.
 
 **Ready.** The agent reads the console user with
 `SCDynamicStoreCopyConsoleUser` and reports `ready` only when it is `runner`
