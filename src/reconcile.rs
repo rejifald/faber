@@ -9475,6 +9475,43 @@ impl Orchestrator {
                 .await;
             }
             Act::RanUnverified => self.record_passed_hook(&w, Passed::Unverified).await,
+            Act::Stands(passed) => {
+                // Loud, and in the audit log: a job runs on here on a verdict
+                // from before the restart, because faber could not ask again.
+                let stands = match passed {
+                    Passed::Allowed {
+                        run_id,
+                        run_attempt,
+                        ..
+                    } => format!(
+                        "the allow faber delivered before the restart (run {run_id}, attempt \
+                         {run_attempt}) stands"
+                    ),
+                    Passed::Unverified => {
+                        "its hook let it run unverified before the restart, and that stands"
+                            .to_string()
+                    }
+                };
+                let why = w
+                    .last_miss()
+                    .map_or_else(String::new, |m| format!(" ({})", m.words()));
+                warn!(
+                    "{}: runner {}'s job was past its hook before this start and could not be \
+                     judged again by the search deadline{why} — {stands} (ADR-0059 §2)",
+                    w.repo, w.runner
+                );
+                self.record_fault(
+                    &w.repo,
+                    "job_start",
+                    "not_judged_again",
+                    Some(format!(
+                        "runner {} (minted for job {}): not judged again by the search deadline \
+                         after a restart{why}; {stands}",
+                        w.runner, w.minted_for
+                    )),
+                )
+                .await;
+            }
             Act::HookFault { stop, why } => {
                 let judged = w.judged().cloned();
                 if stop {
@@ -9521,7 +9558,7 @@ impl Orchestrator {
     ) {
         match landed {
             Ok(()) => {
-                if let Some(passed) = d.passed() {
+                if let Some(passed) = w.passed_by(d) {
                     self.record_passed_hook(w, passed).await;
                 }
             }
@@ -9620,6 +9657,7 @@ impl Orchestrator {
             workflow: run.name.clone().unwrap_or_default(),
             verdict: verdict_str(&verdict),
             decision: crate::job_start::start_decision(&verdict, self.on_bypass()),
+            record_only: crate::job_start::allowed_only_under_record(&verdict, self.on_bypass()),
         })
     }
 
@@ -17324,6 +17362,7 @@ pub(crate) mod tests {
             .expect("the wide search finds it");
         assert_eq!((judged.job_id, judged.run_id), (7, 70));
         assert_eq!(judged.decision, StartDecision::Allow);
+        assert!(!judged.record_only, "the gate admits it in either mode");
 
         let seen = seen.lock().unwrap();
         assert!(
@@ -17571,6 +17610,7 @@ pub(crate) mod tests {
             workflow: "CI".into(),
             verdict: "refuse:actor:dependabot[bot]".into(),
             decision: StartDecision::Refuse(Reason::Actor),
+            record_only: false,
         });
         orch.record_refused_at_start(&w, Reason::Actor).await;
 
@@ -17679,16 +17719,18 @@ pub(crate) mod tests {
             workflow: "CI".into(),
             verdict: "provision".into(),
             decision: crate::job_start::StartDecision::Allow,
+            record_only: false,
         }
     }
 
     /// Every act an adopted runner's watch asks for while its job is in
     /// mid-run, with the worker running and no hook waiting, from its first
-    /// pass until after the search deadline. Its first search finds `judged`.
+    /// pass until after the search deadline. Its first search finds `judged`,
+    /// or with `None` no search finds anything.
     fn acts_mid_run(
         orch: &Orchestrator,
         runner: &str,
-        judged: crate::job_start::Judged,
+        judged: Option<crate::job_start::Judged>,
     ) -> (Vec<crate::job_start::Act>, crate::job_start::Watch) {
         use crate::job_start::{Seen, Top};
         let mut w = orch
@@ -17701,28 +17743,23 @@ pub(crate) mod tests {
             hook_waiting: false,
         });
         let mut acts = w.step(0, mid_run, &d, orch.on_bypass());
-        w.judge(judged);
+        if let Some(judged) = judged {
+            w.judge(judged);
+        }
         for now in [2_000, search, search + 2_000] {
             acts.extend(w.step(now, mid_run, &d, orch.on_bypass()));
         }
         (acts, w)
     }
 
-    /// ADR-0059 §2 across a restart (ADR-0011): a job that got past its hook
-    /// before the restart is in mid-run when the next process adopts its
-    /// runner. Its worker is running and no hook is waiting, because the hook
-    /// already let it through. Under `enforce` that job used to be stopped as
-    /// a hook fault once the search deadline passed.
-    ///
-    /// It is told from a job whose hook never ran by faber's own record of the
-    /// allow it delivered, and by nothing else: the second runner here is in
-    /// the same state with no such record, and is still a hook fault.
-    #[tokio::test]
-    async fn an_adopted_job_already_past_its_hook_is_not_a_hook_fault() {
-        use crate::job_start::{Act, DeadlineOutcome, Passed, Seen, Top, Watch};
-
-        // Before the restart. The process that minted the runner sees its
-        // hook waiting, judges the job it took, and delivers the allow.
+    /// A restart, as far as the job-start check sees one. Before it, the
+    /// process that minted `faber-7-1000` sees its hook waiting, judges the job
+    /// it took and delivers the allow, which lands. After it, a new process has
+    /// only the log the first one wrote and the containers it left running:
+    /// that runner, and `faber-8-2000`, whose hook nothing recorded. Both are
+    /// adopted. Returns the new process and its log.
+    async fn restarted_past_a_delivered_allow() -> (Arc<Orchestrator>, TempDir) {
+        use crate::job_start::{Act, DeadlineOutcome, Seen, Top, Watch};
         let (before, log) = test_orch_with(bypass_profiles(OnBypass::Enforce));
         let d = before.cfg.job_start;
         let waiting = Seen::Running(Top {
@@ -17745,8 +17782,6 @@ pub(crate) mod tests {
         };
         before.delivery_done(&w, delivery, Ok(())).await;
 
-        // The restart: a new process, with the log the last one wrote and the
-        // containers it left running, both in mid-run.
         let (after, log_after) = test_orch_with(bypass_profiles(OnBypass::Enforce));
         std::fs::copy(
             log.path.join("audit.jsonl"),
@@ -17761,13 +17796,36 @@ pub(crate) mod tests {
             opaque: Vec::new(),
         };
         assert_eq!(after.adopt_scan(scan, |_, _, _, _, _| {}).await, 2);
+        (after, log_after)
+    }
 
-        let (acts, w) = acts_mid_run(&after, "faber-7-1000", allowed_job(7));
+    /// The fault a job in progress whose hook never ran gets under `enforce`.
+    const STOPPED_FOR_NO_HOOK: crate::job_start::Act = crate::job_start::Act::HookFault {
+        stop: true,
+        why: "no job-started hook was seen waiting",
+    };
+
+    /// ADR-0059 §2 across a restart (ADR-0011): a job that got past its hook
+    /// before the restart is in mid-run when the next process adopts its
+    /// runner. Its worker is running and no hook is waiting, because the hook
+    /// already let it through. Under `enforce` that job used to be stopped as
+    /// a hook fault once the search deadline passed.
+    ///
+    /// It is told from a job whose hook never ran by faber's own record of the
+    /// allow it delivered, and by nothing else: the second runner here is in
+    /// the same state with no such record, and is still a hook fault.
+    #[tokio::test]
+    async fn an_adopted_job_already_past_its_hook_is_not_a_hook_fault() {
+        use crate::job_start::{Act, Passed};
+        let (after, _log) = restarted_past_a_delivered_allow().await;
+
+        let (acts, w) = acts_mid_run(&after, "faber-7-1000", Some(allowed_job(7)));
         assert_eq!(
             w.passed(),
             Some(Passed::Allowed {
                 run_id: 900,
-                run_attempt: 1
+                run_attempt: 1,
+                record_only: false
             })
         );
         assert!(
@@ -17779,15 +17837,137 @@ pub(crate) mod tests {
         assert!(w.ended(), "and there is nothing left to watch");
 
         // The control: nothing recorded that this runner's hook ever ran.
-        let (acts, w) = acts_mid_run(&after, "faber-8-2000", allowed_job(8));
+        let (acts, w) = acts_mid_run(&after, "faber-8-2000", Some(allowed_job(8)));
         assert_eq!(w.passed(), None);
         assert!(
-            acts.contains(&Act::HookFault {
-                stop: true,
-                why: "no job-started hook was seen waiting"
-            }) && acts.contains(&Act::Kill),
+            acts.contains(&STOPPED_FOR_NO_HOOK) && acts.contains(&Act::Kill),
             "a job in progress whose hook never ran is still stopped: {acts:?}"
         );
+    }
+
+    /// The same restart while GitHub does not answer: the new process cannot
+    /// judge the job again by the search deadline. Under `enforce` that job
+    /// too used to be stopped as a hook fault, though faber's own log showed
+    /// the allow it had delivered. The recorded allow stands, the job runs on,
+    /// and faber says so on the faults feed and in the audit log. A runner
+    /// with no record is stopped, as before.
+    #[tokio::test]
+    async fn an_adopted_job_faber_cannot_judge_again_runs_on_its_recorded_allow() {
+        use crate::job_start::{Act, Miss, Passed};
+        let (after, log) = restarted_past_a_delivered_allow().await;
+        for runner in ["faber-7-1000", "faber-8-2000"] {
+            after
+                .job_starts
+                .lock()
+                .unwrap()
+                .get_mut(runner)
+                .expect("adopted and watched")
+                .missed(Miss::Github("timed out".to_string()));
+        }
+
+        let stands = Passed::Allowed {
+            run_id: 900,
+            run_attempt: 1,
+            record_only: false,
+        };
+        let (acts, w) = acts_mid_run(&after, "faber-7-1000", None);
+        assert_eq!(acts.last(), Some(&Act::Stands(stands)), "{acts:?}");
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Act::HookFault { .. } | Act::Kill | Act::Unverified)),
+            "a job faber's own log says it allowed was faulted: {acts:?}"
+        );
+        assert!(w.ended(), "and there is nothing left to watch");
+
+        // Said aloud: the job runs on a verdict from before the restart.
+        after
+            .job_start_act("faber-7-1000", Act::Stands(stands))
+            .await;
+        let said: Vec<_> = audit_lines(&log)
+            .into_iter()
+            .filter(|l| l["kind"] == "fault" && l["result"] == "job_start")
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0]["action"], "not_judged_again");
+        let cause = said[0]["cause"].as_str().expect("a cause");
+        for part in [
+            "runner faber-7-1000",
+            "not judged again by the search deadline after a restart",
+            "GitHub did not answer: timed out",
+            "run 900, attempt 1",
+            "stands",
+        ] {
+            assert!(cause.contains(part), "{part:?} missing from: {cause}");
+        }
+        let view = after.view().await;
+        assert!(
+            view.faults
+                .iter()
+                .any(|f| f.scope == "job_start" && f.action == "not_judged_again"),
+            "{:?}",
+            view.faults
+        );
+
+        // The control: with nothing recorded, no verdict is no verdict.
+        let (acts, _) = acts_mid_run(&after, "faber-8-2000", None);
+        assert!(
+            acts.contains(&STOPPED_FOR_NO_HOOK) && acts.contains(&Act::Kill),
+            "a job in progress whose hook never ran is still stopped: {acts:?}"
+        );
+    }
+
+    /// The judgement says whether its allow is one only `record` gives
+    /// (ADR-0059 §5). A trust refusal, here a denied actor, is allowed at
+    /// start on a host that records and refused on one that enforces, and
+    /// only the first is marked.
+    #[tokio::test]
+    async fn a_trust_refusal_let_through_under_record_is_marked_as_such() {
+        use crate::job_start::{DeadlineOutcome, Reason, StartDecision, Watch};
+        for (mode, decision, record_only) in [
+            (OnBypass::Record, StartDecision::Allow, true),
+            (
+                OnBypass::Enforce,
+                StartDecision::Refuse(Reason::Actor),
+                false,
+            ),
+        ] {
+            let (base, _seen) = spawn_routed_api(|request| {
+                if request.contains("/actions/runs/50/jobs") {
+                    (
+                        "200 OK",
+                        r#"{"jobs":[{"id":7,"name":"build","status":"in_progress","runner_name":"faber-5-100","labels":["faber","docker"]}]}"#,
+                    )
+                } else if request.contains("/actions/runs/50") {
+                    (
+                        "200 OK",
+                        r#"{"id":50,"event":"push","name":"CI","status":"in_progress","head_branch":"main","actor":{"login":"dependabot[bot]"},"triggering_actor":{"login":"dependabot[bot]"},"repository":{"full_name":"owner/demo","private":true}}"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{"message":"stand-in"}"#)
+                }
+            })
+            .await;
+            let (orch, _tmp) = test_orch_on(bypass_profiles(mode), Github::at(base));
+            let w = Watch::new(
+                "owner/demo",
+                "faber-5-100",
+                5,
+                50,
+                0,
+                DeadlineOutcome::Refuse,
+            );
+            let judged = orch
+                .judge_started_job(&w, false)
+                .await
+                .expect("the job is in the run its runner was minted for");
+            assert_eq!(judged.verdict, "refuse:actor:dependabot[bot]", "{mode:?}");
+            assert_eq!(
+                (judged.decision, judged.record_only),
+                (decision, record_only),
+                "{mode:?}"
+            );
+        }
     }
 
     /// What is written when a job gets past its hook, and when nothing is. An
@@ -17900,21 +18080,53 @@ pub(crate) mod tests {
             written[1]
         );
 
-        // Both read back as what a watch begun on those runners is told.
+        // An allow that only `record` gives says so, in the line's `action`:
+        // a trust refusal the gate let through because this host records.
+        let mut lenient = Watch::new(
+            "owner/demo",
+            "faber-9-3000",
+            9,
+            900,
+            0,
+            DeadlineOutcome::Allow,
+        );
+        lenient.judge(crate::job_start::Judged {
+            verdict: "refuse:actor:octo-bot".into(),
+            record_only: true,
+            ..allowed_job(9)
+        });
+        orch.watch_job_start(lenient.clone());
+        orch.delivery_done(&lenient, allow, Ok(())).await;
+        let written = lines(&tmp);
+        assert_eq!(written.len(), 3, "{written:?}");
+        assert_eq!(written[2]["action"], "allowed_under_record");
+        assert_eq!(written[2]["verdict"], "refuse:actor:octo-bot");
+        assert_eq!(written[2]["runner"], "faber-9-3000");
+
+        // Each reads back as what a watch begun on that runner is told.
         let read = passed_hooks(&orch.audit.read_since(0));
         let told = |runner: &str| {
             read.get(&("owner/demo".to_string(), runner.to_string()))
                 .copied()
         };
-        assert_eq!(read.len(), 2, "{read:?}");
+        assert_eq!(read.len(), 3, "{read:?}");
         assert_eq!(
             told("faber-7-1000"),
             Some(Passed::Allowed {
                 run_id: 900,
-                run_attempt: 1
+                run_attempt: 1,
+                record_only: false
             })
         );
         assert_eq!(told("faber-8-2000"), Some(Passed::Unverified));
+        assert_eq!(
+            told("faber-9-3000"),
+            Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1,
+                record_only: true
+            })
+        );
     }
 
     /// A watch begun on an adopted runner is given the record that names that
@@ -17935,6 +18147,14 @@ pub(crate) mod tests {
                 Some("provision".to_string()),
             ),
             Record::job_start("owner/demo", 0, "faber-8-2000", "unverified", None, None),
+            Record::job_start(
+                "owner/demo",
+                13,
+                "faber-13-7000",
+                "allowed_under_record",
+                Some((900, 1)),
+                Some("refuse:actor:octo-bot".to_string()),
+            ),
             // This host's record of a runner on another repo.
             Record::job_start(
                 "owner/other",
@@ -17959,19 +18179,22 @@ pub(crate) mod tests {
                 adopted_with_hook("/faber-runner-10-4000", "owner/demo"),
                 adopted_with_hook("/faber-runner-11-5000", "owner/demo"),
                 adopted("/faber-runner-12-6000", "owner/demo"),
+                adopted_with_hook("/faber-runner-13-7000", "owner/demo"),
             ],
             opaque: Vec::new(),
         };
-        assert_eq!(orch.adopt_scan(scan, |_, _, _, _, _| {}).await, 6);
+        assert_eq!(orch.adopt_scan(scan, |_, _, _, _, _| {}).await, 7);
 
         let told = |runner: &str| orch.job_start_watch(runner).map(|w| w.passed());
-        assert_eq!(
-            told("faber-7-1000"),
+        let allowed = |record_only| {
             Some(Some(Passed::Allowed {
                 run_id: 900,
-                run_attempt: 1
+                run_attempt: 1,
+                record_only,
             }))
-        );
+        };
+        assert_eq!(told("faber-7-1000"), allowed(false));
+        assert_eq!(told("faber-13-7000"), allowed(true));
         assert_eq!(told("faber-8-2000"), Some(Some(Passed::Unverified)));
         assert_eq!(told("faber-9-3000"), Some(None), "another repo's record");
         assert_eq!(told("faber-10-4000"), Some(None), "not a readable record");

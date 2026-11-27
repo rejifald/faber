@@ -493,11 +493,19 @@ The new process also judges each adopted Docker job again, as it judges a job th
 starts ([ADR-0059](adrs/0059-the-gate-runs-again-when-a-job-starts.md)). A job in
 mid-run has no hook waiting, because its hook let it through before the restart. faber
 knows that from a `job_start` line it wrote to the audit log at the time, and leaves
-the job running if your gate still allows it. Three kinds of job are handled as a job
-whose hook never ran, which under `enforce` means stopped:
+the job running if your gate still allows it.
+
+If faber can't judge the job within `job_start_search_secs` of the restart, because
+GitHub isn't answering, the earlier decision stands and the job runs on. faber records
+that as a `job_start` fault, `not_judged_again`.
+
+Three kinds of job are handled as a job whose hook never ran, which under `enforce`
+means stopped:
 
 - a job the gate now refuses, which is stopped in either mode;
-- a job faber can't judge within `job_start_search_secs` of the restart;
+- a job faber can't judge again, on a Mac that now enforces, if only `record` allowed
+  the earlier decision. That is a job the gate refused on trust and let run because the
+  Mac only recorded, or one that ran with no verdict;
 - a job that got past its hook under a version of faber older than that line. Every
   job in mid-run is one of these the first time a Mac restarts onto a version that
   writes the line, so make that restart on a drained Mac.

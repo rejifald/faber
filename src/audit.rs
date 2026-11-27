@@ -567,11 +567,13 @@ impl Record {
 
     /// Build a `job_start` record (ADR-0059 §2): the job on `runner` got past
     /// its job-started hook while faber watched. `action` is how
-    /// ([`crate::job_start::Passed::word`]): `allowed`, when faber delivered
-    /// an allow for `run` (a run id and its attempt) to the hook it saw
-    /// waiting, or `unverified`, when the hook left at its own deadline under
-    /// an allow outcome. `job_id` and `verdict` are the job faber judged and
-    /// what the gate said of it; `0` and absent when it judged none.
+    /// ([`crate::job_start::Passed::word`]): `allowed` or
+    /// `allowed_under_record`, when faber delivered an allow for `run` (a run
+    /// id and its attempt) to the hook it saw waiting, the second for a trust
+    /// refusal let through because the host records; or `unverified`, when
+    /// the hook left at its own deadline under an allow outcome. `job_id` and
+    /// `verdict` are the job faber judged and what the gate said of it; `0`
+    /// and absent when it judged none.
     ///
     /// Written by the process that watched the hook, because that watch does
     /// not outlive it. A later process adopts the runner mid-job (ADR-0011)

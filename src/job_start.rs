@@ -23,7 +23,9 @@
 //! running and no hook waiting. That is what a job whose hook never ran looks
 //! like too. What tells them apart is faber's own record that the job got past
 //! its hook ([`Passed`]), written when it happened and given to the new watch
-//! ([`Watch::adopted`]).
+//! ([`Watch::adopted`]). That watch judges the job again. Where it cannot, the
+//! record stands in for its judgement, as far as it holds under the mode in
+//! force ([`Act::Stands`]).
 
 use std::time::Duration;
 
@@ -221,6 +223,16 @@ pub fn start_decision(verdict: &Verdict, on_bypass: OnBypass) -> StartDecision {
     }
 }
 
+/// Whether [`start_decision`] allows `verdict` under `on_bypass` only because
+/// the host records: a trust refusal, which `enforce` refuses at start. Every
+/// other allow is the same decision in either mode. Kept with the allow faber
+/// records ([`Passed::Allowed`]), so that one made under `record` is not
+/// carried into `enforce` by a restart.
+pub fn allowed_only_under_record(verdict: &Verdict, on_bypass: OnBypass) -> bool {
+    start_decision(verdict, on_bypass) == StartDecision::Allow
+        && start_decision(verdict, OnBypass::Enforce) != StartDecision::Allow
+}
+
 /// One verdict as faber writes it into a runner: the decision, and the run and
 /// attempt it is for. The hook acts on an allow only when both equal its own
 /// `GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT`.
@@ -262,15 +274,6 @@ impl Delivery {
         out.extend_from_slice(&[0u8; 1024]);
         out
     }
-
-    /// What this delivery, once it has landed, lets faber say of the job: an
-    /// allow let it past its hook. A refusal lets nothing past.
-    pub fn passed(&self) -> Option<Passed> {
-        (self.decision == StartDecision::Allow).then_some(Passed::Allowed {
-            run_id: self.run_id,
-            run_attempt: self.run_attempt,
-        })
-    }
 }
 
 /// How a job got past its job-started hook while faber watched: what a
@@ -278,13 +281,21 @@ impl Delivery {
 ///
 /// The orchestrator writes it down when it happens (`audit::Record::job_start`)
 /// and gives it to a watch a later process begins on the same runner
-/// ([`Watch::adopted`]). It says only why no hook is waiting there. It is not a
-/// verdict: that watch judges the job again.
+/// ([`Watch::adopted`]). It says why no hook is waiting there. That watch
+/// judges the job again, and its judgement decides. Only when it cannot judge
+/// by the search deadline does the record stand in for one, and then only as
+/// far as it would hold under the mode in force ([`Self::holds`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Passed {
     /// faber delivered an allow for this run and attempt to the hook it saw
-    /// waiting. The hook acts on an allow for no other.
-    Allowed { run_id: u64, run_attempt: u64 },
+    /// waiting. The hook acts on an allow for no other. `record_only` is
+    /// whether the allow was a trust refusal let through because the host
+    /// records ([`allowed_only_under_record`]).
+    Allowed {
+        run_id: u64,
+        run_attempt: u64,
+        record_only: bool,
+    },
     /// The hook, seen waiting, left at its own deadline under an allow
     /// outcome, and the job runs with no verdict (ADR-0059 §5).
     Unverified,
@@ -294,7 +305,12 @@ impl Passed {
     /// The audit `action` of this record.
     pub fn word(self) -> &'static str {
         match self {
-            Passed::Allowed { .. } => "allowed",
+            Passed::Allowed {
+                record_only: false, ..
+            } => "allowed",
+            Passed::Allowed {
+                record_only: true, ..
+            } => "allowed_under_record",
             Passed::Unverified => "unverified",
         }
     }
@@ -305,6 +321,7 @@ impl Passed {
             Passed::Allowed {
                 run_id,
                 run_attempt,
+                ..
             } => Some((run_id, run_attempt)),
             Passed::Unverified => None,
         }
@@ -314,13 +331,39 @@ impl Passed {
     /// allow that does not say which run and attempt it was for is `None`,
     /// and so is any other word: a record that cannot be read is no record.
     pub fn read(word: &str, run: Option<(u64, u64)>) -> Option<Self> {
-        match (word, run) {
-            ("allowed", Some((run_id, run_attempt))) => Some(Passed::Allowed {
+        let allowed = |record_only| {
+            run.map(|(run_id, run_attempt)| Passed::Allowed {
                 run_id,
                 run_attempt,
-            }),
-            ("unverified", _) => Some(Passed::Unverified),
+                record_only,
+            })
+        };
+        match word {
+            "allowed" => allowed(false),
+            "allowed_under_record" => allowed(true),
+            "unverified" => Some(Passed::Unverified),
             _ => None,
+        }
+    }
+
+    /// Whether what was decided before the restart is still what ADR-0059 §5
+    /// decides under `on_bypass`, the mode now in force. An allow the gate
+    /// gives in either mode holds in both. A trust refusal let through under
+    /// `record`, and a job that ran with no verdict, hold only under `record`:
+    /// `enforce` refuses both at start.
+    ///
+    /// The mode is the one change to the gate this can see. A gate changed in
+    /// another way since, or a fact GitHub has changed, takes a judgement to
+    /// find.
+    pub fn holds(self, on_bypass: OnBypass) -> bool {
+        match self {
+            Passed::Allowed {
+                record_only: false, ..
+            } => true,
+            Passed::Allowed {
+                record_only: true, ..
+            }
+            | Passed::Unverified => on_bypass == OnBypass::Record,
         }
     }
 }
@@ -417,6 +460,9 @@ pub struct Judged {
     /// The gate's verdict label, such as `refuse:job_token_dispatch`.
     pub verdict: String,
     pub decision: StartDecision,
+    /// Whether `decision` is an allow that only `record` gives
+    /// ([`allowed_only_under_record`]).
+    pub record_only: bool,
 }
 
 /// What [`Watch::step`] asks the orchestrator to do.
@@ -439,8 +485,12 @@ pub enum Act {
     /// Write down that the hook, seen waiting, left at its own deadline and
     /// the job runs on ([`Passed::Unverified`]), for a watch a later process
     /// begins on this runner. An allow's record is written once its
-    /// [`Act::Deliver`] has landed ([`Delivery::passed`]).
+    /// [`Act::Deliver`] has landed ([`Watch::passed_by`]).
     RanUnverified,
+    /// Record that a job past its hook before this watch began could not be
+    /// judged again by the search deadline, and that what faber recorded of
+    /// it then stands ([`Passed::holds`]). The job runs on.
+    Stands(Passed),
     /// Record a hook fault: a job in progress with no waiting hook (§2). `stop`
     /// says whether faber also stops it.
     HookFault { stop: bool, why: &'static str },
@@ -567,10 +617,11 @@ impl Watch {
     /// `passed` is what faber's own record says of that: the allow it
     /// delivered to the hook it saw waiting, or the hook leaving at its
     /// deadline as planned. With it, a job the gate still allows is not a hook
-    /// fault ([`Self::step`]). `None` is no such record, and then a job in
-    /// progress with no waiting hook is a hook fault, as on any other watch.
-    /// It takes the record as an argument so that every watch begun on a
-    /// running runner has to answer for it.
+    /// fault, and neither is one faber cannot judge again in time, as far as
+    /// the record holds under the mode in force ([`Self::step`]). `None` is no
+    /// such record, and then a job in progress with no waiting hook is a hook
+    /// fault, as on any other watch. It takes the record as an argument so
+    /// that every watch begun on a running runner has to answer for it.
     pub fn adopted(
         repo: &str,
         runner: &str,
@@ -589,6 +640,19 @@ impl Watch {
     /// What faber's own record said of this runner's job when the watch began.
     pub fn passed(&self) -> Option<Passed> {
         self.passed
+    }
+
+    /// What faber may write down once `d`, a verdict this watch asked to
+    /// deliver, has landed: an allow let the job past its hook. A refusal lets
+    /// nothing past.
+    pub fn passed_by(&self, d: &Delivery) -> Option<Passed> {
+        (d.decision == StartDecision::Allow).then(|| Passed::Allowed {
+            run_id: d.run_id,
+            run_attempt: d.run_attempt,
+            // An allow is delivered only for a judged job. Were there none,
+            // nothing would say the allow holds under `enforce`.
+            record_only: self.judged.as_ref().is_none_or(|j| j.record_only),
+        })
     }
 
     /// The job found and judged, once it is.
@@ -738,6 +802,16 @@ impl Watch {
                     }
                     acts.push(Act::Search { wide });
                 }
+            } else if let Some(stands) = self.stands(on_bypass) {
+                // No verdict by the search deadline, for a job that was past
+                // its hook before this watch began. Its hook did not fail, so
+                // this is no fault, and the job is not at its start, so there
+                // is no hook to hand the deadline's outcome to. What faber
+                // decided before the restart stands, as it would have with no
+                // restart, and is said aloud. Nothing is left to watch.
+                self.ended = true;
+                acts.push(Act::Stands(stands));
+                return acts;
             } else {
                 self.gave_up = true;
                 if self.outcome == DeadlineOutcome::Allow && !self.recorded {
@@ -780,10 +854,11 @@ impl Watch {
         // A job that was past its hook before this watch began: no hook was
         // seen waiting because it had already let the job through, which
         // faber's own record says. While the gate still allows that job, this
-        // is not a fault and there is nothing left to watch. The record only
-        // explains the missing hook: a refusal, a job in another run than the
-        // allow was for, or no verdict by the search deadline is handled below
-        // as on any other watch.
+        // is not a fault and there is nothing left to watch. The judgement
+        // decides, not the record: a refusal, or a job in another run than the
+        // allow was for, is handled below as on any other watch. So is a job
+        // faber could not judge whose record does not hold under the mode in
+        // force (above).
         if self.hook_since.is_none() && self.let_through() {
             self.ended = true;
             return acts;
@@ -824,6 +899,16 @@ impl Watch {
         acts
     }
 
+    /// The record that stands in for a judgement this watch could not get:
+    /// what faber's own record says of a job that was past its hook before the
+    /// watch began, when no hook was seen since and the record holds under the
+    /// mode in force ([`Passed::holds`]). A runner takes one job, so the
+    /// record is about the job now on it.
+    fn stands(&self, on_bypass: OnBypass) -> Option<Passed> {
+        self.passed
+            .filter(|p| self.hook_since.is_none() && p.holds(on_bypass))
+    }
+
     /// Whether faber's record from before this watch began ([`Passed`])
     /// accounts for the job it has now judged: the gate allows the job, and an
     /// allow faber delivered was for that job's run and attempt. A runner
@@ -840,6 +925,7 @@ impl Watch {
             Some(Passed::Allowed {
                 run_id,
                 run_attempt,
+                ..
             }) => (j.run_id, j.run_attempt) == (run_id, run_attempt),
             Some(Passed::Unverified) => true,
             None => false,
@@ -920,6 +1006,7 @@ mod tests {
             workflow: "CI".into(),
             verdict: "refuse:job_token_dispatch".into(),
             decision,
+            record_only: false,
         }
     }
 
@@ -958,6 +1045,16 @@ mod tests {
                 start_decision(&refuse(R::DisallowedEvent("release".into())), mode),
                 StartDecision::Allow
             );
+            // None of these depends on the mode: an allow here is one in both,
+            // and a refusal is no allow at all.
+            for v in [
+                Verdict::Provision,
+                refuse(R::ThirdParty("a-stranger".into())),
+                refuse(R::JobTokenDispatch),
+                refuse(R::DisallowedEvent("release".into())),
+            ] {
+                assert!(!allowed_only_under_record(&v, mode), "{v:?} {mode:?}");
+            }
         }
         // Trust: refused under enforce, allowed (and left to detection) under record.
         for (r, why) in [
@@ -974,9 +1071,15 @@ mod tests {
                 StartDecision::Refuse(why)
             );
             assert_eq!(
-                start_decision(&refuse(r), OnBypass::Record),
+                start_decision(&refuse(r.clone()), OnBypass::Record),
                 StartDecision::Allow
             );
+            // The one allow that only `record` gives.
+            assert!(allowed_only_under_record(
+                &refuse(r.clone()),
+                OnBypass::Record
+            ));
+            assert!(!allowed_only_under_record(&refuse(r), OnBypass::Enforce));
         }
     }
 
@@ -1274,21 +1377,27 @@ mod tests {
 
     // --- a watch begun mid-job (ADR-0011) ------------------------------------
 
-    /// Each way faber records a job as past its hook. The allow is for the run
-    /// and attempt [`judged`] finds.
-    fn past_its_hook() -> [Passed; 2] {
-        let all = [
-            Passed::Allowed {
-                run_id: 70,
-                run_attempt: 2,
-            },
-            Passed::Unverified,
-        ];
+    /// Each way faber records a job as past its hook: an allow the gate gives
+    /// in either mode, one only `record` gives, and the hook's own deadline.
+    /// The allows are for the run and attempt [`judged`] finds.
+    fn past_its_hook() -> [Passed; 3] {
+        let allowed = |record_only| Passed::Allowed {
+            run_id: 70,
+            run_attempt: 2,
+            record_only,
+        };
+        let all = [allowed(false), allowed(true), Passed::Unverified];
         // A new way past the hook belongs in the list above, so the tests of
         // the class cover it: this match stops compiling until it is named.
         for p in all {
             match p {
-                Passed::Allowed { .. } | Passed::Unverified => {}
+                Passed::Allowed {
+                    record_only: false, ..
+                }
+                | Passed::Allowed {
+                    record_only: true, ..
+                }
+                | Passed::Unverified => {}
             }
         }
         all
@@ -1339,13 +1448,12 @@ mod tests {
         }
     }
 
-    /// What the record does not do. It says why no hook is waiting and decides
-    /// nothing: a job the gate refuses is stopped in both modes, a job faber
-    /// could not judge by the search deadline is handled as on a watch begun
-    /// at the mint, and an allow delivered for another run or attempt is not
-    /// this job's.
+    /// Where faber can judge the job again, its judgement decides and the
+    /// record does not. A job the gate now refuses is stopped in both modes,
+    /// whatever was recorded of it, and an allow delivered for another run or
+    /// attempt is not this job's.
     #[test]
-    fn a_record_of_the_hook_explains_its_absence_and_decides_nothing() {
+    fn a_judgement_decides_whatever_the_record_says() {
         let stopped = Act::HookFault {
             stop: true,
             why: NEVER_SEEN,
@@ -1359,31 +1467,66 @@ mod tests {
                     assert!(acts.contains(&stopped), "{case}: {acts:?}");
                     assert!(acts.contains(&Act::Kill), "{case}: {acts:?}");
                     assert!(w.stopping(), "{case}");
-
-                    let mut w = adopted(outcome, Some(passed));
-                    let mut at_mint = watch(outcome);
-                    assert_eq!(
-                        mid_job(&mut w, None, mode),
-                        mid_job(&mut at_mint, None, mode),
-                        "{case}"
+                    assert!(
+                        !acts.iter().any(|a| matches!(a, Act::Stands(_))),
+                        "{case}: {acts:?}"
                     );
                 }
             }
         }
-        for other in [
-            Passed::Allowed {
-                run_id: 71,
-                run_attempt: 2,
-            },
-            Passed::Allowed {
-                run_id: 70,
-                run_attempt: 1,
-            },
-        ] {
+        for (run_id, run_attempt) in [(71, 2), (70, 1)] {
+            let other = Passed::Allowed {
+                run_id,
+                run_attempt,
+                record_only: false,
+            };
             let mut w = adopted(DeadlineOutcome::Refuse, Some(other));
             let acts = mid_job(&mut w, Some(StartDecision::Allow), OnBypass::Enforce);
             assert!(acts.contains(&stopped), "{other:?}: {acts:?}");
             assert!(acts.contains(&Act::Kill), "{other:?}: {acts:?}");
+        }
+    }
+
+    /// A restart while GitHub does not answer: the watch begun on a job that
+    /// was past its hook cannot judge it again by the search deadline. What
+    /// faber recorded before the restart stands, as far as ADR-0059 §5 would
+    /// still decide it under the mode now in force: no fault, nothing stopped,
+    /// and it is said aloud. A record that does not hold under that mode is
+    /// handled as if there were none.
+    #[test]
+    fn what_faber_recorded_stands_when_it_cannot_judge_again() {
+        let [either_mode, record_only, unverified] = past_its_hook();
+        for (passed, under_record, under_enforce) in [
+            (either_mode, true, true),
+            // A trust refusal `record` let through, and a job with no verdict:
+            // `enforce` refuses both at start.
+            (record_only, true, false),
+            (unverified, true, false),
+        ] {
+            assert_eq!(passed.holds(OnBypass::Record), under_record, "{passed:?}");
+            assert_eq!(passed.holds(OnBypass::Enforce), under_enforce, "{passed:?}");
+        }
+        for passed in past_its_hook() {
+            for mode in [OnBypass::Record, OnBypass::Enforce] {
+                for outcome in [DeadlineOutcome::Allow, DeadlineOutcome::Refuse] {
+                    let case = format!("{passed:?} {mode:?} {outcome:?}");
+                    let mut w = adopted(outcome, Some(passed));
+                    let acts = mid_job(&mut w, None, mode);
+                    if passed.holds(mode) {
+                        // It looked for the job until the deadline, then let
+                        // the record stand.
+                        assert_eq!(
+                            acts,
+                            vec![Act::Search { wide: false }, Act::Stands(passed)],
+                            "{case}"
+                        );
+                        assert!(w.ended() && !w.stopping(), "{case}");
+                    } else {
+                        let mut at_mint = watch(outcome);
+                        assert_eq!(acts, mid_job(&mut at_mint, None, mode), "{case}");
+                    }
+                }
+            }
         }
     }
 
@@ -1472,36 +1615,77 @@ mod tests {
                     .any(|a| matches!(a, Act::HookFault { stop: true, .. })),
                 "{passed:?}: {acts:?}"
             );
+
+            // No verdict by the search deadline while a hook waits: the hook
+            // gets the plan's outcome, as on any watch. A record stands in for
+            // a judgement only where no hook was seen, and under `record`
+            // every one of these would otherwise hold.
+            let mut w = adopted(DeadlineOutcome::Refuse, Some(passed));
+            w.step(0, top(true, true), &d, OnBypass::Record);
+            assert_eq!(
+                w.step(60_000, top(true, true), &d, OnBypass::Record),
+                vec![
+                    Act::Deliver(Delivery {
+                        decision: StartDecision::Refuse(Reason::NoVerdict),
+                        run_id: 0,
+                        run_attempt: 0
+                    }),
+                    Act::RefusedAtStart(Reason::NoVerdict),
+                    Act::Kill
+                ],
+                "{passed:?}"
+            );
         }
     }
 
-    /// Only an allow lets a job past its hook, and a record reads back as it
-    /// was written. One that does not say which run an allow was for, or says
+    /// Only an allow that landed lets a job past its hook. Its record says
+    /// whether the allow was one only `record` gives, and reads back as it was
+    /// written. A line that does not say which run an allow was for, or says
     /// anything else, is no record.
     #[test]
-    fn a_passed_record_is_an_allow_or_the_deadline_and_reads_back_whole() {
+    fn a_passed_record_says_what_let_the_job_through_and_reads_back_whole() {
         let allow = Delivery {
             decision: StartDecision::Allow,
             run_id: 70,
             run_attempt: 2,
         };
-        assert_eq!(
-            allow.passed(),
-            Some(Passed::Allowed {
-                run_id: 70,
-                run_attempt: 2
-            })
-        );
         let refuse = Delivery {
             decision: StartDecision::Refuse(Reason::Actor),
             ..allow
         };
-        assert_eq!(refuse.passed(), None);
+        let allowed = |record_only| {
+            Some(Passed::Allowed {
+                run_id: 70,
+                run_attempt: 2,
+                record_only,
+            })
+        };
+        for record_only in [false, true] {
+            let mut w = watch(DeadlineOutcome::Allow);
+            w.judge(Judged {
+                record_only,
+                ..judged(StartDecision::Allow)
+            });
+            assert_eq!(w.passed_by(&allow), allowed(record_only));
+            assert_eq!(w.passed_by(&refuse), None);
+        }
+        // An allow with no judgement behind it is not taken to hold under
+        // `enforce`.
+        assert_eq!(
+            watch(DeadlineOutcome::Allow).passed_by(&allow),
+            allowed(true)
+        );
 
+        assert_eq!(
+            past_its_hook().map(Passed::word),
+            ["allowed", "allowed_under_record", "unverified"]
+        );
         for p in past_its_hook() {
             assert_eq!(Passed::read(p.word(), p.run()), Some(p));
         }
-        assert_eq!(Passed::read("allowed", None), None);
+        for word in ["allowed", "allowed_under_record"] {
+            assert_eq!(Passed::read(word, None), None, "{word}");
+        }
         assert_eq!(Passed::read("refused", Some((70, 2))), None);
         assert_eq!(Passed::read("", None), None);
     }
