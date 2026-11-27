@@ -330,8 +330,9 @@ private func testDiagnosticLines(_ t: Harness) {
     for i in 0..<(Diagnostics.maxLines + 10) { sink.emit(diagnosticLine("n=\(i)")) }
     t.check("a verification writes at most its cap of lines", got.all.count == Diagnostics.maxLines, "\(got.all.count)")
     t.check("the first lines are the ones kept", got.all.first == "FABER-GOLDEN-VERIFY n=0")
-    // A start, a line per check, softwareupdate's evidence line, and the end.
-    t.check("a whole run fits under the cap", CheckCode.allCases.count + 3 <= Diagnostics.maxLines)
+    // A start, a line per check, software_update's rewrite line and two evidence lines
+    // (softwareupdate's schedule, the agent's watch), and the end.
+    t.check("a whole run fits under the cap", CheckCode.allCases.count + 5 <= Diagnostics.maxLines)
 }
 
 @MainActor
@@ -683,4 +684,21 @@ private func testToolchainScript(_ t: Harness, _ scratch: Scratch) {
                 && !xcodeCheckVerdict(version: .fail("x"), toolchain: ok).ok)
     t.check("a matching Xcode does not hide a toolchain runner cannot use",
             xcodeCheckVerdict(version: version, toolchain: v) == v)
+}
+
+/// arm.sh refuses a FileVault the verification would fail, on the same words, so an image it
+/// lets through is not failed for FileVault only after the build's hours.
+@MainActor
+func testArmFileVault(_ t: Harness, arm: String?) {
+    guard let arm, let text = try? String(contentsOfFile: arm, encoding: .utf8) else {
+        t.check("arm.sh is readable for the FileVault parity", false, arm ?? "no path")
+        return
+    }
+    t.check("arm.sh asks fdesetup status, as the verification does", text.contains("fv=$(fdesetup status 2>/dev/null)"))
+    t.check("arm.sh arms only on the verification's words",
+            text.contains("  *\"\(Checks.fileVaultOffPhrase)\"*) ;;\n  *) refuse "))
+    let commands = text.split(separator: "\n").filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("#") }
+    t.check("arm.sh no longer asks fdesetup isactive", !commands.contains { $0.contains("isactive") })
+    t.check("the words are fdesetup's for off", fileVaultOff("FileVault is Off.\n") && !fileVaultOff("FileVault is On.\n")
+                && !fileVaultOff("FileVault is On.\nDecryption in progress: Percent completed = 40\n"))
 }
