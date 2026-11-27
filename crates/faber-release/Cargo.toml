@@ -19,15 +19,15 @@ tracing = "0.1"
 # decides what a follower installs. A version bump is a reviewed change, subject
 # to the owner's origin check for new dependencies (approved for 0.14.0 on
 # 2026-10-11, #119).
-sigstore-verify = { version = "=0.15.1", features = ["tuf"] }
-sigstore-trust-root = { version = "=0.15.1", features = ["tuf"] }
-sigstore-tuf = "=0.15.1"
-sigstore-types = "=0.15.1"
-sigstore-bundle = "=0.15.1"
-sigstore-crypto = "=0.15.1"
-sigstore-merkle = "=0.15.1"
-sigstore-rekor = "=0.15.1"
-sigstore-tsa = "=0.15.1"
+sigstore-verify = { version = "=0.16.0", features = ["tuf"] }
+sigstore-trust-root = { version = "=0.16.0", features = ["tuf"] }
+sigstore-tuf = "=0.16.0"
+sigstore-types = "=0.16.0"
+sigstore-bundle = "=0.16.0"
+sigstore-crypto = "=0.16.0"
+sigstore-merkle = "=0.16.0"
+sigstore-rekor = "=0.16.0"
+sigstore-tsa = "=0.16.0"
 
 [features]
 # Swaps the compiled-in release-verification policy for the throwaway sandbox
