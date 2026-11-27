@@ -63,8 +63,9 @@ trap finish EXIT
 
 # --- a. Software Update off, before any network use ---------------------------------------
 # `softwareupdate --schedule off` does not take effect on macOS 27; these keys do.
-# A clone's boot can drop one, so the guest agent writes this same list again at every boot
-# and before every job (launcher/agent/Sources/Updates.swift). launcher/Tests/UpdatesTests.swift
+# A clone drops AutomaticCheckEnabled after boot, so the guest agent writes this same list
+# again at every boot, before every job, and whenever its watch finds a key lost
+# (launcher/agent/Sources/Updates.swift). launcher/Tests/UpdatesTests.swift
 # reads this step and holds the two equal: change one, change both.
 begin sw-update
 for k in AutomaticDownload CriticalUpdateInstall ConfigDataInstall AutomaticCheckEnabled; do
