@@ -197,7 +197,8 @@ says so in a neutral row ([the speed-up hints ADR](adrs/0068-faber-says-when-a-f
 Today there is one: the git mirror, when no Docker profile turns it on or when it is held
 off beside dind. The row says how long checkout took on this host's runs in the last
 7 days, why the mirror is not in use, whether the dind grant holding it off is still
-used, and what the way back takes.
+used, and what the way back takes. For a grant no run used in those 7 days it adds that
+denying it (`dind = false`) is not a trust widening.
 
 - **The figure is your host's own.** It comes from the step timings faber records for
   each run. faber does not record whether a run used the mirror, so the row states what

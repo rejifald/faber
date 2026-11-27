@@ -122,7 +122,9 @@ neutral, dismissable row is not one. The key applies on restart.
 - **Whether the grant is used.** Held off beside dind, the row says how many
   docker runs in the window were handed a Docker daemon, and when the last one
   was. A grant nothing has used for weeks is then visible as what holds the
-  mirror off. The count compares the `outcome` line's `dind` field with
+  mirror off, and for a grant no run in the window used the row adds that
+  denying it is not a trust widening (owner, 2026-11-28): setting
+  `dind = false` narrows what jobs reach. The count compares the `outcome` line's `dind` field with
   `granted`: the field is `granted` or `denied`, and absent only for a run with
   no container.
 - **The way back.** `off`: `git_mirror = true`, a trust widening that puts

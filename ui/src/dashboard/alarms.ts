@@ -282,13 +282,18 @@ function checkoutCost(h: SpeedHint): string {
   return `Checkout took a median of ${fmtUptime(h.median_ms / 1000)} on ${plural(h.runs, 'run')} in ${lastDays(h)}${total}.`;
 }
 
-/** Whether the dind grant that holds a mirror off is in use: the runs handed a daemon, or how long ago the last one was. */
+/**
+ * Whether the dind grant that holds a mirror off is in use: the runs handed a daemon, or how long
+ * ago the last one was, and for an unused grant that denying it widens nothing.
+ */
 function dindUse(h: SpeedHint, now: number): string {
   if (h.dind_runs > 0) {
     return `${h.dind_runs} of ${plural(h.docker_runs, 'run')} on docker profiles in ${lastDays(h)} ${h.dind_runs === 1 ? 'was' : 'were'} given a Docker daemon. `;
   }
   const last = h.last_dind_ms != null ? `; the last was ${fmtAgo((now - h.last_dind_ms) / 1000)} ago` : '';
-  return `No run in ${lastDays(h)} was given a Docker daemon${last}. `;
+  // A grant still on a profile and used by nothing: taking it away narrows trust, and the row says so.
+  const deny = h.cause === 'dind_granted' ? 'Denying the unused grant is not a trust widening. ' : '';
+  return `No run in ${lastDays(h)} was given a Docker daemon${last}. ${deny}`;
 }
 
 /**

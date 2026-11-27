@@ -329,10 +329,11 @@ test('held beside dind, the hint says whether the grant is used and what the way
   assert.match(unused, /held off here: profile 'linux-dind' grants dind\. No run in the last 7 days was given a Docker daemon; the last was 21d ago\./);
   assert.match(unused, /dind = false on every docker profile and a fresh Linux VM disk/);
   assert.match(unused, /an operator step with risks of its own/);
+  assert.match(unused, /the last was 21d ago\. Denying the unused grant is not a trust widening\. The way back is/);
   assert.doesNotMatch(unused, /widens trust/, 'denying dind widens nothing');
 
   const never = text(run(hint('dind_granted', { profiles: ['a', 'b'] }))[0]);
-  assert.match(never, /profiles 'a' and 'b' grant dind\. No run in the last 7 days was given a Docker daemon\. The way back/);
+  assert.match(never, /profiles 'a' and 'b' grant dind\. No run in the last 7 days was given a Docker daemon\. Denying the unused grant is not a trust widening\. The way back/);
 
   const used = text(run(hint('dind_granted', { profiles: ['linux-dind'], dind_runs: 40 }))[0]);
   assert.match(used, /40 of 300 runs on docker profiles in the last 7 days were given a Docker daemon\./);
@@ -341,6 +342,8 @@ test('held beside dind, the hint says whether the grant is used and what the way
   const marked = text(run(hint('engine_marked'))[0]);
   assert.match(marked, /held off here: this host’s Docker engine has granted dind\./);
   assert.match(marked, /fresh Linux VM disk/);
+  // Only a grant that is still there and unused: a used one costs its jobs, and a marked engine has none left to deny.
+  for (const t of [used, marked]) assert.doesNotMatch(t, /not a trust widening/);
 });
 
 test('a dismissed hint stays dismissed while its figures move, and shows again when its cause changes', () => {
