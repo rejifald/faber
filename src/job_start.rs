@@ -17,6 +17,13 @@
 //! waiting hook is a hook fault ([`Act::HookFault`]). The orchestrator does the
 //! I/O each act names; [`Watch::step`] only decides, so every rule here is a
 //! plain function of what was seen.
+//!
+//! A watch lives in one process, and a runner can outlive it: the next process
+//! adopts the runner (ADR-0011) and begins a new watch mid-job, with the worker
+//! running and no hook waiting. That is what a job whose hook never ran looks
+//! like too. What tells them apart is faber's own record that the job got past
+//! its hook ([`Passed`]), written when it happened and given to the new watch
+//! ([`Watch::adopted`]).
 
 use std::time::Duration;
 
@@ -255,6 +262,67 @@ impl Delivery {
         out.extend_from_slice(&[0u8; 1024]);
         out
     }
+
+    /// What this delivery, once it has landed, lets faber say of the job: an
+    /// allow let it past its hook. A refusal lets nothing past.
+    pub fn passed(&self) -> Option<Passed> {
+        (self.decision == StartDecision::Allow).then_some(Passed::Allowed {
+            run_id: self.run_id,
+            run_attempt: self.run_attempt,
+        })
+    }
+}
+
+/// How a job got past its job-started hook while faber watched: what a
+/// [`Watch`] knew when it ended with its job running on.
+///
+/// The orchestrator writes it down when it happens (`audit::Record::job_start`)
+/// and gives it to a watch a later process begins on the same runner
+/// ([`Watch::adopted`]). It says only why no hook is waiting there. It is not a
+/// verdict: that watch judges the job again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Passed {
+    /// faber delivered an allow for this run and attempt to the hook it saw
+    /// waiting. The hook acts on an allow for no other.
+    Allowed { run_id: u64, run_attempt: u64 },
+    /// The hook, seen waiting, left at its own deadline under an allow
+    /// outcome, and the job runs with no verdict (ADR-0059 §5).
+    Unverified,
+}
+
+impl Passed {
+    /// The audit `action` of this record.
+    pub fn word(self) -> &'static str {
+        match self {
+            Passed::Allowed { .. } => "allowed",
+            Passed::Unverified => "unverified",
+        }
+    }
+
+    /// The run and attempt a delivered allow was for.
+    pub fn run(self) -> Option<(u64, u64)> {
+        match self {
+            Passed::Allowed {
+                run_id,
+                run_attempt,
+            } => Some((run_id, run_attempt)),
+            Passed::Unverified => None,
+        }
+    }
+
+    /// The inverse of [`Self::word`] and [`Self::run`], for an audit line. An
+    /// allow that does not say which run and attempt it was for is `None`,
+    /// and so is any other word: a record that cannot be read is no record.
+    pub fn read(word: &str, run: Option<(u64, u64)>) -> Option<Self> {
+        match (word, run) {
+            ("allowed", Some((run_id, run_attempt))) => Some(Passed::Allowed {
+                run_id,
+                run_attempt,
+            }),
+            ("unverified", _) => Some(Passed::Unverified),
+            _ => None,
+        }
+    }
 }
 
 /// Append one regular file to a ustar archive: a 512-byte header, then the
@@ -368,6 +436,11 @@ pub enum Act {
     /// Record that the job ran at the deadline with no verdict, as the plan
     /// allowed on a private repository under `record` (§5).
     Unverified,
+    /// Write down that the hook, seen waiting, left at its own deadline and
+    /// the job runs on ([`Passed::Unverified`]), for a watch a later process
+    /// begins on this runner. An allow's record is written once its
+    /// [`Act::Deliver`] has landed ([`Delivery::passed`]).
+    RanUnverified,
     /// Record a hook fault: a job in progress with no waiting hook (§2). `stop`
     /// says whether faber also stops it.
     HookFault { stop: bool, why: &'static str },
@@ -445,9 +518,16 @@ pub struct Watch {
     /// its mint, before its container exists, so until then "not there" means
     /// "not yet", not "gone".
     started: bool,
+    /// What faber's own record says of this runner's job and its hook from
+    /// before this watch began ([`Self::adopted`]). `None` on a watch begun at
+    /// the mint, which sees for itself.
+    passed: Option<Passed>,
 }
 
 impl Watch {
+    /// Watch a runner from its mint, before its container exists: this watch
+    /// sees the worker and the hook appear. A runner found already running is
+    /// watched with [`Self::adopted`].
     pub fn new(
         repo: &str,
         runner: &str,
@@ -476,7 +556,39 @@ impl Watch {
             recorded: false,
             ended: false,
             started: false,
+            passed: None,
         }
+    }
+
+    /// Watch a runner this process did not start, found running after a
+    /// restart (ADR-0011). Its job may already be past its hook, so this watch
+    /// may never see one wait.
+    ///
+    /// `passed` is what faber's own record says of that: the allow it
+    /// delivered to the hook it saw waiting, or the hook leaving at its
+    /// deadline as planned. With it, a job the gate still allows is not a hook
+    /// fault ([`Self::step`]). `None` is no such record, and then a job in
+    /// progress with no waiting hook is a hook fault, as on any other watch.
+    /// It takes the record as an argument so that every watch begun on a
+    /// running runner has to answer for it.
+    pub fn adopted(
+        repo: &str,
+        runner: &str,
+        minted_for: u64,
+        minted_run: u64,
+        profile_idx: usize,
+        outcome: DeadlineOutcome,
+        passed: Option<Passed>,
+    ) -> Self {
+        Self {
+            passed,
+            ..Self::new(repo, runner, minted_for, minted_run, profile_idx, outcome)
+        }
+    }
+
+    /// What faber's own record said of this runner's job when the watch began.
+    pub fn passed(&self) -> Option<Passed> {
+        self.passed
     }
 
     /// The job found and judged, once it is.
@@ -665,6 +777,18 @@ impl Watch {
             }
         }
 
+        // A job that was past its hook before this watch began: no hook was
+        // seen waiting because it had already let the job through, which
+        // faber's own record says. While the gate still allows that job, this
+        // is not a fault and there is nothing left to watch. The record only
+        // explains the missing hook: a refusal, a job in another run than the
+        // allow was for, or no verdict by the search deadline is handled below
+        // as on any other watch.
+        if self.hook_since.is_none() && self.let_through() {
+            self.ended = true;
+            return acts;
+        }
+
         // A job in progress with no waiting hook: never seen by the search
         // deadline, or gone with the worker still running and no allow given.
         let never_seen =
@@ -672,8 +796,10 @@ impl Watch {
         if self.hook_gone && self.delivered.is_none() && self.allowed_at_deadline(now, deadlines) {
             // The hook left at its own deadline under an allow outcome: the
             // job runs as planned, so there is nothing left to watch and the
-            // bypass check judges it as before.
+            // bypass check judges it as before. Written down, because a watch
+            // begun on this runner later sees only that no hook is waiting.
             self.ended = true;
+            acts.push(Act::RanUnverified);
             return acts;
         }
         let vanished = self.hook_gone && !self.allowed_at_deadline(now, deadlines);
@@ -696,6 +822,28 @@ impl Watch {
             }
         }
         acts
+    }
+
+    /// Whether faber's record from before this watch began ([`Passed`])
+    /// accounts for the job it has now judged: the gate allows the job, and an
+    /// allow faber delivered was for that job's run and attempt. A runner
+    /// takes one job, so a record with no run to compare, of a hook that left
+    /// at its deadline, is about the job found on it.
+    fn let_through(&self) -> bool {
+        let Some(j) = &self.judged else {
+            return false;
+        };
+        if j.decision != StartDecision::Allow {
+            return false;
+        }
+        match self.passed {
+            Some(Passed::Allowed {
+                run_id,
+                run_attempt,
+            }) => (j.run_id, j.run_attempt) == (run_id, run_attempt),
+            Some(Passed::Unverified) => true,
+            None => false,
+        }
     }
 
     /// Whether the hook's own deadline has passed under an allow outcome, so a
@@ -1038,10 +1186,13 @@ mod tests {
             w.step(60_000, top(true, true), &d, OnBypass::Record),
             vec![Act::Unverified]
         );
-        // The hook leaves at its deadline and the job runs: not a fault.
-        assert!(w
-            .step(91_000, top(true, false), &d, OnBypass::Record)
-            .is_empty());
+        // The hook leaves at its deadline and the job runs: not a fault, and
+        // written down for a watch begun on this runner later.
+        assert_eq!(
+            w.step(91_000, top(true, false), &d, OnBypass::Record),
+            vec![Act::RanUnverified]
+        );
+        assert!(w.ended());
     }
 
     #[test]
@@ -1119,6 +1270,240 @@ mod tests {
             .step(5_000, top(false, false), &d, OnBypass::Record)
             .is_empty());
         assert!(w.ended());
+    }
+
+    // --- a watch begun mid-job (ADR-0011) ------------------------------------
+
+    /// Each way faber records a job as past its hook. The allow is for the run
+    /// and attempt [`judged`] finds.
+    fn past_its_hook() -> [Passed; 2] {
+        let all = [
+            Passed::Allowed {
+                run_id: 70,
+                run_attempt: 2,
+            },
+            Passed::Unverified,
+        ];
+        // A new way past the hook belongs in the list above, so the tests of
+        // the class cover it: this match stops compiling until it is named.
+        for p in all {
+            match p {
+                Passed::Allowed { .. } | Passed::Unverified => {}
+            }
+        }
+        all
+    }
+
+    fn adopted(outcome: DeadlineOutcome, passed: Option<Passed>) -> Watch {
+        Watch::adopted("owner/demo", RUNNER, 5, 50, 0, outcome, passed)
+    }
+
+    /// Every act `w` asks for when it is begun on a job in mid-run: the worker
+    /// running and no hook waiting, from its first pass until after the search
+    /// deadline. `verdict` is what its first search finds, if anything.
+    fn mid_job(w: &mut Watch, verdict: Option<StartDecision>, mode: OnBypass) -> Vec<Act> {
+        let d = deadlines();
+        let mut acts = w.step(0, top(true, false), &d, mode);
+        if let Some(decision) = verdict {
+            w.judge(judged(decision));
+        }
+        for now in [2_000, 60_000, 62_000] {
+            acts.extend(w.step(now, top(true, false), &d, mode));
+        }
+        acts
+    }
+
+    const NEVER_SEEN: &str = "no job-started hook was seen waiting";
+
+    /// The class, not one path: any watch begun on a runner whose job faber
+    /// recorded as past its hook, however it got past. Its worker runs and no
+    /// hook waits, because the hook already let the job through. While the
+    /// gate still allows the job that is no fault, and nothing is stopped, in
+    /// either mode and under either deadline outcome.
+    #[test]
+    fn a_watch_begun_on_a_job_already_past_its_hook_is_not_a_hook_fault() {
+        for passed in past_its_hook() {
+            for mode in [OnBypass::Record, OnBypass::Enforce] {
+                for outcome in [DeadlineOutcome::Allow, DeadlineOutcome::Refuse] {
+                    let mut w = adopted(outcome, Some(passed));
+                    let acts = mid_job(&mut w, Some(StartDecision::Allow), mode);
+                    // It judged the job again, and that is all it did.
+                    assert_eq!(
+                        acts,
+                        vec![Act::Search { wide: false }],
+                        "{passed:?} {mode:?} {outcome:?}"
+                    );
+                    assert!(w.ended(), "{passed:?} {mode:?} {outcome:?}");
+                }
+            }
+        }
+    }
+
+    /// What the record does not do. It says why no hook is waiting and decides
+    /// nothing: a job the gate refuses is stopped in both modes, a job faber
+    /// could not judge by the search deadline is handled as on a watch begun
+    /// at the mint, and an allow delivered for another run or attempt is not
+    /// this job's.
+    #[test]
+    fn a_record_of_the_hook_explains_its_absence_and_decides_nothing() {
+        let stopped = Act::HookFault {
+            stop: true,
+            why: NEVER_SEEN,
+        };
+        for passed in past_its_hook() {
+            for mode in [OnBypass::Record, OnBypass::Enforce] {
+                for outcome in [DeadlineOutcome::Allow, DeadlineOutcome::Refuse] {
+                    let case = format!("{passed:?} {mode:?} {outcome:?}");
+                    let mut w = adopted(outcome, Some(passed));
+                    let acts = mid_job(&mut w, Some(StartDecision::Refuse(Reason::Author)), mode);
+                    assert!(acts.contains(&stopped), "{case}: {acts:?}");
+                    assert!(acts.contains(&Act::Kill), "{case}: {acts:?}");
+                    assert!(w.stopping(), "{case}");
+
+                    let mut w = adopted(outcome, Some(passed));
+                    let mut at_mint = watch(outcome);
+                    assert_eq!(
+                        mid_job(&mut w, None, mode),
+                        mid_job(&mut at_mint, None, mode),
+                        "{case}"
+                    );
+                }
+            }
+        }
+        for other in [
+            Passed::Allowed {
+                run_id: 71,
+                run_attempt: 2,
+            },
+            Passed::Allowed {
+                run_id: 70,
+                run_attempt: 1,
+            },
+        ] {
+            let mut w = adopted(DeadlineOutcome::Refuse, Some(other));
+            let acts = mid_job(&mut w, Some(StartDecision::Allow), OnBypass::Enforce);
+            assert!(acts.contains(&stopped), "{other:?}: {acts:?}");
+            assert!(acts.contains(&Act::Kill), "{other:?}: {acts:?}");
+        }
+    }
+
+    /// The gate is as it was where there is no record: a job in progress whose
+    /// hook never ran is a hook fault on an adopted runner too, and is stopped
+    /// under `enforce`. With no record, a watch begun on a running runner
+    /// behaves, act for act, as one begun at the mint.
+    #[test]
+    fn a_job_whose_hook_never_ran_is_a_hook_fault_on_an_adopted_runner_too() {
+        let mut w = adopted(DeadlineOutcome::Refuse, None);
+        assert_eq!(
+            mid_job(&mut w, Some(StartDecision::Allow), OnBypass::Enforce),
+            vec![
+                Act::Search { wide: false },
+                Act::HookFault {
+                    stop: true,
+                    why: NEVER_SEEN
+                },
+                Act::Kill,
+                // Asked again until the container is gone.
+                Act::Kill,
+            ]
+        );
+        for mode in [OnBypass::Record, OnBypass::Enforce] {
+            for outcome in [DeadlineOutcome::Allow, DeadlineOutcome::Refuse] {
+                for verdict in [
+                    None,
+                    Some(StartDecision::Allow),
+                    Some(StartDecision::Refuse(Reason::Author)),
+                ] {
+                    let mut w = adopted(outcome, None);
+                    let mut at_mint = watch(outcome);
+                    assert_eq!(
+                        mid_job(&mut w, verdict, mode),
+                        mid_job(&mut at_mint, verdict, mode),
+                        "{mode:?} {outcome:?} {verdict:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A hook this watch sees waiting is served as on any watch, whatever the
+    /// record says: the record only ever accounts for a hook that is not there.
+    #[test]
+    fn a_hook_seen_waiting_is_served_whatever_the_record_says() {
+        let d = deadlines();
+        for passed in past_its_hook() {
+            let mut w = adopted(DeadlineOutcome::Refuse, Some(passed));
+            w.step(0, top(true, true), &d, OnBypass::Enforce);
+            w.judge(judged(StartDecision::Allow));
+            assert_eq!(
+                w.step(2_000, top(true, true), &d, OnBypass::Enforce),
+                vec![Act::Deliver(Delivery {
+                    decision: StartDecision::Allow,
+                    run_id: 70,
+                    run_attempt: 2
+                })],
+                "{passed:?}"
+            );
+
+            let mut w = adopted(DeadlineOutcome::Refuse, Some(passed));
+            w.step(0, top(true, true), &d, OnBypass::Enforce);
+            w.judge(judged(StartDecision::Refuse(Reason::Actor)));
+            assert_eq!(
+                w.step(2_000, top(true, true), &d, OnBypass::Enforce),
+                vec![
+                    Act::Deliver(Delivery {
+                        decision: StartDecision::Refuse(Reason::Actor),
+                        run_id: 70,
+                        run_attempt: 2
+                    }),
+                    Act::RefusedAtStart(Reason::Actor),
+                    Act::Kill
+                ],
+                "{passed:?}"
+            );
+
+            // A hook seen waiting that leaves with no verdict while the worker
+            // runs on is a fault, record or not.
+            let mut w = adopted(DeadlineOutcome::Refuse, Some(passed));
+            w.step(0, top(true, true), &d, OnBypass::Enforce);
+            let acts = w.step(5_000, top(true, false), &d, OnBypass::Enforce);
+            assert!(
+                acts.iter()
+                    .any(|a| matches!(a, Act::HookFault { stop: true, .. })),
+                "{passed:?}: {acts:?}"
+            );
+        }
+    }
+
+    /// Only an allow lets a job past its hook, and a record reads back as it
+    /// was written. One that does not say which run an allow was for, or says
+    /// anything else, is no record.
+    #[test]
+    fn a_passed_record_is_an_allow_or_the_deadline_and_reads_back_whole() {
+        let allow = Delivery {
+            decision: StartDecision::Allow,
+            run_id: 70,
+            run_attempt: 2,
+        };
+        assert_eq!(
+            allow.passed(),
+            Some(Passed::Allowed {
+                run_id: 70,
+                run_attempt: 2
+            })
+        );
+        let refuse = Delivery {
+            decision: StartDecision::Refuse(Reason::Actor),
+            ..allow
+        };
+        assert_eq!(refuse.passed(), None);
+
+        for p in past_its_hook() {
+            assert_eq!(Passed::read(p.word(), p.run()), Some(p));
+        }
+        assert_eq!(Passed::read("allowed", None), None);
+        assert_eq!(Passed::read("refused", Some((70, 2))), None);
+        assert_eq!(Passed::read("", None), None);
     }
 
     /// The hook itself, run on Node when this machine has it: under a shell

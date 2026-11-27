@@ -203,6 +203,20 @@ Docker-API exception, which #107 and #108 close.
 - **Two deadlines.** faber gives up its search before the hook's deadline. Both come
   from config, and both outlast one poll interval plus a daemon restart. Runners
   adopted after a restart get their verdicts.
+- **A job already past its hook at a restart is not a hook fault.** The process that
+  adopts its runner (ADR-0011) finds the worker running and no hook waiting, which
+  is also all it could see of a job whose hook never ran. faber's own record tells
+  them apart, never GitHub's record of the job's steps, since a workflow can name a
+  step *Set up runner* (§6). faber writes a `job_start` line to its audit log when
+  an allow it delivered to a waiting hook has landed, and when a hook it saw
+  waiting leaves at its own deadline under an allow outcome. The adopting process
+  reads the line that names the runner and its repository, and judges the job
+  again. If the gate still allows the job, and an allow that was delivered was for
+  that job's run and attempt, the missing hook is no fault and the job runs on.
+  Nothing else changes. With no such line the job is a hook fault. A job the gate
+  now refuses is stopped. A job faber cannot judge by the search deadline is
+  handled as if there were no line. A job that got past its hook under a version
+  that wrote no such line has none.
 
 The mint-time verdict stays as the first filter: faber still mints only for jobs it
 would run. The job-start verdict is the one that decides what executes.
@@ -453,6 +467,7 @@ macOS VM:
 | The hook file missing; the hook failing with an error of its own | faber does not start the runner; the hook kills its parent, and no step runs |
 | What GitHub shows after a refusal | the job's conclusion and log recorded |
 | A refusal at start, and a runner that ignores the hook | faber records refused at start for the first, and a hook fault for the second |
+| A daemon restart under `enforce` while a job is past its hook and still running | the job runs to its end, and no hook fault is recorded |
 | A job taken by a runner minted for another job | judged at start as the job it is, found by `runner_name` |
 | A job past the 100th in its run | found |
 | A stranger's fork PR, and a merge group carrying it, on a test repository | both refused before their first step |

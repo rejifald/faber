@@ -27,7 +27,8 @@ pub fn now_ms() -> u64 {
 /// `"freeze"` (the critical disk floor or the memory freeze
 /// freezing or thawing a running job — see [`Record::freeze`]), `"reserve"` (the
 /// ADR-0033 p75 fallback tripping or re-arming — see [`Record::reserve`]), `"mint"` (the
-/// name of a runner faber is about to register — see [`Record::mint`]), `"control"`
+/// name of a runner faber is about to register — see [`Record::mint`]), `"job_start"`
+/// (a job got past its job-started hook — see [`Record::job_start`]), `"control"`
 /// (a trust-widening settings change through the control API, allowed or refused —
 /// see [`Record::control`]), `"grant"` (a change to the VM wall's grants, made
 /// as root — see [`Record::grant`]), or `"waste"` (a claim found likely wasted —
@@ -44,6 +45,11 @@ pub struct Record {
     pub repo: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<u64>,
+    /// GitHub's attempt number of `run_id` (`job_start` records only): with
+    /// the run, what a delivered allow was for. Not `attempt`, which counts
+    /// faber's own provision attempts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_attempt: Option<u64>,
     pub job_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
@@ -318,6 +324,7 @@ impl Record {
             kind,
             repo: repo.to_string(),
             run_id: None,
+            run_attempt: None,
             job_id,
             event: None,
             actor: None,
@@ -557,6 +564,38 @@ impl Record {
             ..Self::new(MINT, repo, job_id)
         }
     }
+
+    /// Build a `job_start` record (ADR-0059 §2): the job on `runner` got past
+    /// its job-started hook while faber watched. `action` is how
+    /// ([`crate::job_start::Passed::word`]): `allowed`, when faber delivered
+    /// an allow for `run` (a run id and its attempt) to the hook it saw
+    /// waiting, or `unverified`, when the hook left at its own deadline under
+    /// an allow outcome. `job_id` and `verdict` are the job faber judged and
+    /// what the gate said of it; `0` and absent when it judged none.
+    ///
+    /// Written by the process that watched the hook, because that watch does
+    /// not outlive it. A later process adopts the runner mid-job (ADR-0011)
+    /// and finds its worker running with no hook waiting, which is also all it
+    /// could see of a job whose hook never ran. This line is what tells the
+    /// two apart, and like a `mint` line it is faber's own: see
+    /// [`Record::mint`] for what that rests on.
+    pub fn job_start(
+        repo: &str,
+        job_id: u64,
+        runner: &str,
+        action: &str,
+        run: Option<(u64, u64)>,
+        verdict: Option<String>,
+    ) -> Self {
+        Self {
+            runner: Some(runner.to_string()),
+            action: Some(action.to_string()),
+            run_id: run.map(|(id, _)| id),
+            run_attempt: run.map(|(_, attempt)| attempt),
+            verdict,
+            ..Self::new(JOB_START, repo, job_id)
+        }
+    }
 }
 
 impl Record {
@@ -650,6 +689,9 @@ pub const HOST_OOM: &str = "host_oom";
 
 /// The `kind` of a [`Record::mint`] line.
 pub const MINT: &str = "mint";
+
+/// The `kind` of a [`Record::job_start`] line.
+pub const JOB_START: &str = "job_start";
 
 /// One replayed `outcome` record carrying autolimiter learning data. Rebuilt into
 /// the per-class rolling windows on startup so caps survive a restart.
@@ -751,6 +793,8 @@ pub struct Entry {
     pub job_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_attempt: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -2538,7 +2538,11 @@ impl Orchestrator {
             .min()
             .unwrap_or(0)
             .saturating_sub(MINT_RECORD_SLACK_MS);
-        let records = mint_records(&self.audit.read_since(since));
+        let entries = self.audit.read_since(since);
+        let records = mint_records(&entries);
+        // ADR-0059 §2: which of them faber's own records say are already past
+        // their job-started hook. Written after the mint, so in the same window.
+        let passed = passed_hooks(&entries);
         let mut adopted = 0usize;
         for a in scan.adoptable {
             let Some(profile_idx) = self.cfg.profiles.iter().position(|p| p.name == a.profile)
@@ -2672,14 +2676,28 @@ impl Orchestrator {
             self.note_minted(&a.registration(), a.job_id, profile_idx);
             // ADR-0059 §2: a runner adopted after a restart gets its verdict. One
             // started before the hook existed has none, and is left to detection.
+            // One whose job got past its hook before the restart has no hook
+            // waiting either, and only faber's own record of that tells it from
+            // a job whose hook never ran: the watch is given the record, and
+            // judges the job again.
             if let Some(outcome) = a.hook {
-                self.watch_job_start(crate::job_start::Watch::new(
+                let passed = passed.get(&(a.repo.clone(), a.registration())).copied();
+                if let Some(p) = passed {
+                    info!(
+                        "adopt: {}'s job was past its job-started hook before this start ({}) — \
+                         judging it again",
+                        a.runner(),
+                        p.word()
+                    );
+                }
+                self.watch_job_start(crate::job_start::Watch::adopted(
                     &a.repo,
                     &a.registration(),
                     a.job_id,
                     a.run_id,
                     profile_idx,
                     outcome,
+                    passed,
                 ));
             }
             spawn(self.clone(), a, minted, profile_idx, guard);
@@ -5884,6 +5902,31 @@ fn mint_records(entries: &[crate::audit::Entry]) -> HashSet<(String, String)> {
         .iter()
         .filter(|e| e.kind == crate::audit::MINT)
         .filter_map(|e| Some((e.repo.clone(), e.runner.clone()?)))
+        .collect()
+}
+
+/// How the job on each runner got past its job-started hook, by `(repo, runner
+/// name)`, from the `job_start` lines in `entries` (ADR-0059 §2): what a watch
+/// begun on an adopted runner is told ([`crate::job_start::Watch::adopted`]).
+///
+/// The line is faber's own, written by the process that saw the hook waiting,
+/// and it is matched as a `mint` line is: on the repo and the name together, so
+/// a container claiming another repo, or named after a runner nobody recorded,
+/// matches nothing and is watched as one whose hook was never seen. It is as
+/// trustworthy as the audit log it is read from: see [`mint_records`]. A line
+/// that does not read as a record is left out, and a runner takes one job, so
+/// its last line is the one that stands.
+fn passed_hooks(
+    entries: &[crate::audit::Entry],
+) -> HashMap<(String, String), crate::job_start::Passed> {
+    entries
+        .iter()
+        .filter(|e| e.kind == crate::audit::JOB_START)
+        .filter_map(|e| {
+            let passed =
+                crate::job_start::Passed::read(e.action.as_deref()?, e.run_id.zip(e.run_attempt))?;
+            Some(((e.repo.clone(), e.runner.clone()?), passed))
+        })
         .collect()
 }
 
@@ -9357,7 +9400,7 @@ impl Orchestrator {
 
     /// Do one thing [`crate::job_start::Watch::step`] decided.
     async fn job_start_act(&self, runner: &str, act: crate::job_start::Act) {
-        use crate::job_start::{Act, StartDecision};
+        use crate::job_start::{Act, Passed};
         let Some(w) = self.job_start_watch(runner) else {
             return;
         };
@@ -9395,19 +9438,8 @@ impl Orchestrator {
                 }
             },
             Act::Deliver(d) => {
-                if let Err(e) = crate::docker::deliver_verdict(runner, d.archive()).await {
-                    warn!(
-                        "{}: delivering the verdict to runner {runner}: {e:#}",
-                        w.repo
-                    );
-                    // A refusal is enforced by the kill that follows it. An allow
-                    // that did not land is tried again while the hook waits.
-                    if d.decision == StartDecision::Allow {
-                        if let Some(w) = self.job_starts.lock().unwrap().get_mut(runner) {
-                            w.redeliver();
-                        }
-                    }
-                }
+                let landed = crate::docker::deliver_verdict(runner, d.archive()).await;
+                self.delivery_done(&w, &d, landed).await;
             }
             Act::Kill => match crate::docker::force_kill_runner(runner).await {
                 Ok(()) => {
@@ -9442,6 +9474,7 @@ impl Orchestrator {
                 )
                 .await;
             }
+            Act::RanUnverified => self.record_passed_hook(&w, Passed::Unverified).await,
             Act::HookFault { stop, why } => {
                 let judged = w.judged().cloned();
                 if stop {
@@ -9470,6 +9503,76 @@ impl Orchestrator {
                 )
                 .await;
             }
+        }
+    }
+
+    /// What follows the delivery of verdict `d` to `w`'s runner, by whether it
+    /// `landed`.
+    ///
+    /// An allow that landed let the job past its hook, and that is written
+    /// down ([`Self::record_passed_hook`]). A refusal is enforced by the kill
+    /// that follows it, landed or not. An allow that did not land is tried
+    /// again while the hook waits, and nothing is written for it.
+    async fn delivery_done(
+        &self,
+        w: &crate::job_start::Watch,
+        d: &crate::job_start::Delivery,
+        landed: anyhow::Result<()>,
+    ) {
+        match landed {
+            Ok(()) => {
+                if let Some(passed) = d.passed() {
+                    self.record_passed_hook(w, passed).await;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "{}: delivering the verdict to runner {}: {e:#}",
+                    w.repo, w.runner
+                );
+                if d.decision == crate::job_start::StartDecision::Allow {
+                    if let Some(w) = self.job_starts.lock().unwrap().get_mut(&w.runner) {
+                        w.redeliver();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write down that the job on `w`'s runner got past its job-started hook,
+    /// and how (ADR-0059 §2): one `job_start` line in the audit log.
+    ///
+    /// The watch that saw it ends here and does not outlive this process. A
+    /// restart adopts the runner mid-job (ADR-0011) and finds its worker
+    /// running with no hook waiting, which is also all it could see of a job
+    /// whose hook never ran. This line is what [`Self::adopt_scan`] gives the
+    /// new watch to tell the two apart ([`passed_hooks`]).
+    async fn record_passed_hook(
+        &self,
+        w: &crate::job_start::Watch,
+        passed: crate::job_start::Passed,
+    ) {
+        let j = w.judged();
+        let rec = Record {
+            label: j.map(|j| job_label(&w.repo, Some(&j.workflow), &j.job_name)),
+            ..Record::job_start(
+                &w.repo,
+                j.map_or(0, |j| j.job_id),
+                &w.runner,
+                passed.word(),
+                passed.run(),
+                j.map(|j| j.verdict.clone()),
+            )
+        };
+        if let Err(e) = self.audit.append(&rec).await {
+            warn!(
+                "{}: the record that runner {}'s job got past its hook ({}) was not written: \
+                 {e} — a restart before that job ends will find it in progress with no waiting \
+                 hook, and no record of why",
+                w.repo,
+                w.runner,
+                passed.word()
+            );
         }
     }
 
@@ -17539,6 +17642,341 @@ pub(crate) mod tests {
         orch.detect_bypasses("owner/demo", &runs, &Codes::new())
             .await;
         assert!(orch.was_bypass(7).await);
+    }
+
+    /// [`adopted`], with the label a runner started with a job-started hook
+    /// carries (ADR-0059 §1).
+    fn adopted_with_hook(container: &str, repo: &str) -> crate::docker::Adopted {
+        let line = serde_json::json!({
+            "Name": container,
+            "Running": true,
+            "StartedAt": "2026-08-28T10:00:00Z",
+            "Memory": 1073741824i64,
+            "NanoCpus": 0,
+            "Image": "ghcr.io/owner/my-runner:latest",
+            "Labels": {
+                "org.faber.repo": repo,
+                "org.faber.run-id": "900",
+                "org.faber.provision-attempt": "1",
+                "org.faber.profile": "linux-docker",
+                "org.faber.class": format!("{repo}::900::build"),
+                "org.faber.reserved-mib": "1024",
+                "org.faber.serves": "",
+                "org.faber.hook": "refuse",
+            }
+        });
+        crate::docker::parse_adopted(&line.to_string()).expect("adoptable")
+    }
+
+    /// The job on `faber-<job_id>-…`, in run 900, as the job-start check
+    /// judges it: allowed.
+    fn allowed_job(job_id: u64) -> crate::job_start::Judged {
+        crate::job_start::Judged {
+            job_id,
+            run_id: 900,
+            run_attempt: 1,
+            job_name: "build".into(),
+            workflow: "CI".into(),
+            verdict: "provision".into(),
+            decision: crate::job_start::StartDecision::Allow,
+        }
+    }
+
+    /// Every act an adopted runner's watch asks for while its job is in
+    /// mid-run, with the worker running and no hook waiting, from its first
+    /// pass until after the search deadline. Its first search finds `judged`.
+    fn acts_mid_run(
+        orch: &Orchestrator,
+        runner: &str,
+        judged: crate::job_start::Judged,
+    ) -> (Vec<crate::job_start::Act>, crate::job_start::Watch) {
+        use crate::job_start::{Seen, Top};
+        let mut w = orch
+            .job_start_watch(runner)
+            .expect("an adopted runner with a hook is watched");
+        let d = orch.cfg.job_start;
+        let search = d.search.as_millis() as u64;
+        let mid_run = Seen::Running(Top {
+            worker: true,
+            hook_waiting: false,
+        });
+        let mut acts = w.step(0, mid_run, &d, orch.on_bypass());
+        w.judge(judged);
+        for now in [2_000, search, search + 2_000] {
+            acts.extend(w.step(now, mid_run, &d, orch.on_bypass()));
+        }
+        (acts, w)
+    }
+
+    /// ADR-0059 §2 across a restart (ADR-0011): a job that got past its hook
+    /// before the restart is in mid-run when the next process adopts its
+    /// runner. Its worker is running and no hook is waiting, because the hook
+    /// already let it through. Under `enforce` that job used to be stopped as
+    /// a hook fault once the search deadline passed.
+    ///
+    /// It is told from a job whose hook never ran by faber's own record of the
+    /// allow it delivered, and by nothing else: the second runner here is in
+    /// the same state with no such record, and is still a hook fault.
+    #[tokio::test]
+    async fn an_adopted_job_already_past_its_hook_is_not_a_hook_fault() {
+        use crate::job_start::{Act, DeadlineOutcome, Passed, Seen, Top, Watch};
+
+        // Before the restart. The process that minted the runner sees its
+        // hook waiting, judges the job it took, and delivers the allow.
+        let (before, log) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        let d = before.cfg.job_start;
+        let waiting = Seen::Running(Top {
+            worker: true,
+            hook_waiting: true,
+        });
+        let mut w = Watch::new(
+            "owner/demo",
+            "faber-7-1000",
+            7,
+            900,
+            0,
+            DeadlineOutcome::Refuse,
+        );
+        w.step(0, waiting, &d, OnBypass::Enforce);
+        w.judge(allowed_job(7));
+        let acts = w.step(2_000, waiting, &d, OnBypass::Enforce);
+        let [Act::Deliver(delivery)] = acts.as_slice() else {
+            panic!("an allow is delivered to the waiting hook: {acts:?}");
+        };
+        before.delivery_done(&w, delivery, Ok(())).await;
+
+        // The restart: a new process, with the log the last one wrote and the
+        // containers it left running, both in mid-run.
+        let (after, log_after) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        std::fs::copy(
+            log.path.join("audit.jsonl"),
+            log_after.path.join("audit.jsonl"),
+        )
+        .expect("the log the first process wrote");
+        let scan = crate::docker::Scan {
+            adoptable: vec![
+                adopted_with_hook("/faber-runner-7-1000", "owner/demo"),
+                adopted_with_hook("/faber-runner-8-2000", "owner/demo"),
+            ],
+            opaque: Vec::new(),
+        };
+        assert_eq!(after.adopt_scan(scan, |_, _, _, _, _| {}).await, 2);
+
+        let (acts, w) = acts_mid_run(&after, "faber-7-1000", allowed_job(7));
+        assert_eq!(
+            w.passed(),
+            Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1
+            })
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Act::HookFault { .. } | Act::Kill)),
+            "a job its hook let through before the restart was stopped: {acts:?}"
+        );
+        assert!(w.ended(), "and there is nothing left to watch");
+
+        // The control: nothing recorded that this runner's hook ever ran.
+        let (acts, w) = acts_mid_run(&after, "faber-8-2000", allowed_job(8));
+        assert_eq!(w.passed(), None);
+        assert!(
+            acts.contains(&Act::HookFault {
+                stop: true,
+                why: "no job-started hook was seen waiting"
+            }) && acts.contains(&Act::Kill),
+            "a job in progress whose hook never ran is still stopped: {acts:?}"
+        );
+    }
+
+    /// What is written when a job gets past its hook, and when nothing is. An
+    /// allow that landed and a hook that left at its deadline each leave one
+    /// `job_start` line. An allow that did not land leaves none, and is tried
+    /// again; a refusal lets nothing past.
+    #[tokio::test]
+    async fn a_job_past_its_hook_is_written_down_once_it_is() {
+        use crate::job_start::{
+            Act, DeadlineOutcome, Delivery, Passed, Reason, Seen, StartDecision, Top, Watch,
+        };
+        let (orch, tmp) = test_orch_with(profiles());
+        let lines = |tmp: &TempDir| -> Vec<serde_json::Value> {
+            audit_lines(tmp)
+                .into_iter()
+                .filter(|l| l["kind"] == "job_start")
+                .collect()
+        };
+        let d = orch.cfg.job_start;
+        let waiting = Seen::Running(Top {
+            worker: true,
+            hook_waiting: true,
+        });
+        let mut w = Watch::new(
+            "owner/demo",
+            "faber-7-1000",
+            7,
+            900,
+            0,
+            DeadlineOutcome::Allow,
+        );
+        w.step(0, waiting, &d, OnBypass::Record);
+        w.judge(allowed_job(7));
+        let acts = w.step(2_000, waiting, &d, OnBypass::Record);
+        let [Act::Deliver(allow)] = acts.as_slice() else {
+            panic!("an allow is delivered to the waiting hook: {acts:?}");
+        };
+        assert!(w.ended(), "the watch counts the allow as delivered");
+        orch.watch_job_start(w.clone());
+
+        // Not landed: nothing is written, and the allow is owed again.
+        orch.delivery_done(&w, allow, Err(anyhow::anyhow!("no such container")))
+            .await;
+        assert!(lines(&tmp).is_empty(), "{:?}", lines(&tmp));
+        assert!(
+            !orch.job_start_watch("faber-7-1000").unwrap().ended(),
+            "an allow that did not land is delivered again while the hook waits"
+        );
+        // A refusal, landed or not, lets nothing past.
+        let refuse = Delivery {
+            decision: StartDecision::Refuse(Reason::Actor),
+            ..*allow
+        };
+        orch.delivery_done(&w, &refuse, Ok(())).await;
+        assert!(lines(&tmp).is_empty(), "{:?}", lines(&tmp));
+
+        // Landed.
+        orch.delivery_done(&w, allow, Ok(())).await;
+        let written = lines(&tmp);
+        assert_eq!(written.len(), 1, "{written:?}");
+        let mut keys: Vec<&str> = written[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "job_id",
+                "kind",
+                "label",
+                "repo",
+                "run_attempt",
+                "run_id",
+                "runner",
+                "ts_ms",
+                "verdict"
+            ]
+        );
+        assert_eq!(written[0]["action"], "allowed");
+        assert_eq!(written[0]["repo"], "owner/demo");
+        assert_eq!(written[0]["runner"], "faber-7-1000");
+        assert_eq!(written[0]["job_id"], 7);
+        assert_eq!(written[0]["run_id"], 900);
+        assert_eq!(written[0]["run_attempt"], 1);
+        assert_eq!(written[0]["verdict"], "provision");
+
+        // The hook leaving at its own deadline, for a job faber never judged.
+        let unjudged = Watch::new(
+            "owner/demo",
+            "faber-8-2000",
+            8,
+            900,
+            0,
+            DeadlineOutcome::Allow,
+        );
+        orch.watch_job_start(unjudged);
+        orch.job_start_act("faber-8-2000", Act::RanUnverified).await;
+        let written = lines(&tmp);
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert_eq!(written[1]["action"], "unverified");
+        assert_eq!(written[1]["runner"], "faber-8-2000");
+        assert_eq!(written[1]["job_id"], 0);
+        assert!(
+            written[1].get("run_id").is_none() && written[1].get("verdict").is_none(),
+            "{}",
+            written[1]
+        );
+
+        // Both read back as what a watch begun on those runners is told.
+        let read = passed_hooks(&orch.audit.read_since(0));
+        let told = |runner: &str| {
+            read.get(&("owner/demo".to_string(), runner.to_string()))
+                .copied()
+        };
+        assert_eq!(read.len(), 2, "{read:?}");
+        assert_eq!(
+            told("faber-7-1000"),
+            Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1
+            })
+        );
+        assert_eq!(told("faber-8-2000"), Some(Passed::Unverified));
+    }
+
+    /// A watch begun on an adopted runner is given the record that names that
+    /// runner on that repo, and no other: matched as a `mint` line is. A line
+    /// that does not read as a record is none, and a runner started before the
+    /// hook existed is not watched at all.
+    #[tokio::test]
+    async fn adoption_gives_each_watch_only_the_hook_record_that_names_its_runner() {
+        use crate::job_start::Passed;
+        let (orch, _tmp) = test_orch_with(profiles());
+        for rec in [
+            Record::job_start(
+                "owner/demo",
+                7,
+                "faber-7-1000",
+                "allowed",
+                Some((900, 1)),
+                Some("provision".to_string()),
+            ),
+            Record::job_start("owner/demo", 0, "faber-8-2000", "unverified", None, None),
+            // This host's record of a runner on another repo.
+            Record::job_start(
+                "owner/other",
+                9,
+                "faber-9-3000",
+                "allowed",
+                Some((900, 1)),
+                None,
+            ),
+            // An allow that does not say which run it was for.
+            Record::job_start("owner/demo", 10, "faber-10-4000", "allowed", None, None),
+            // The same runner's name on a line of another kind.
+            Record::mint("owner/demo", 11, "faber-11-5000", "linux-docker"),
+        ] {
+            orch.audit.append(&rec).await.expect("audit append");
+        }
+        let scan = crate::docker::Scan {
+            adoptable: vec![
+                adopted_with_hook("/faber-runner-7-1000", "owner/demo"),
+                adopted_with_hook("/faber-runner-8-2000", "owner/demo"),
+                adopted_with_hook("/faber-runner-9-3000", "owner/demo"),
+                adopted_with_hook("/faber-runner-10-4000", "owner/demo"),
+                adopted_with_hook("/faber-runner-11-5000", "owner/demo"),
+                adopted("/faber-runner-12-6000", "owner/demo"),
+            ],
+            opaque: Vec::new(),
+        };
+        assert_eq!(orch.adopt_scan(scan, |_, _, _, _, _| {}).await, 6);
+
+        let told = |runner: &str| orch.job_start_watch(runner).map(|w| w.passed());
+        assert_eq!(
+            told("faber-7-1000"),
+            Some(Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1
+            }))
+        );
+        assert_eq!(told("faber-8-2000"), Some(Some(Passed::Unverified)));
+        assert_eq!(told("faber-9-3000"), Some(None), "another repo's record");
+        assert_eq!(told("faber-10-4000"), Some(None), "not a readable record");
+        assert_eq!(told("faber-11-5000"), Some(None), "a mint is not a record");
+        assert_eq!(told("faber-12-6000"), None, "no hook, so no watch");
     }
 
     #[test]
