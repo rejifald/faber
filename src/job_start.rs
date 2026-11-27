@@ -492,7 +492,9 @@ pub enum Act {
     /// it then stands ([`Passed::holds`]). The job runs on.
     Stands(Passed),
     /// Record a hook fault: a job in progress with no waiting hook (§2). `stop`
-    /// says whether faber also stops it.
+    /// says whether faber also stops it. A watch asks once. The watch a later
+    /// process begins on the same runner asks again, and the orchestrator
+    /// keeps the fault to one for the runner.
     HookFault { stop: bool, why: &'static str },
 }
 

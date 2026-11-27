@@ -230,6 +230,16 @@ Docker-API exception, which #107 and #108 close.
   GitHub's facts with it, only a judgement would find that: faber's own, when it
   gets one, or bypass detection (ADR-0030), which judges every job on a runner
   this host minted except the one the runner was minted for.
+- **A hook fault is one for its runner.** A runner takes one job, so a job that ran
+  with no waiting hook is one fault, whoever finds it and however often: the check
+  that watches the runner, the process that adopts the runner after a restart and
+  sees the same worker and no hook, and bypass detection (§6) on every cycle that
+  a refused job is still running. faber counts it once in the week, and writes a
+  line once for each thing it did about it. A fault a host only recorded, which a
+  later process stops because it enforces, leaves two lines and counts once. What
+  faber knows of the week's faults it reads back from its own audit log at boot,
+  as it does for bypasses (ADR-0030). Stopping the job never waits on that memory:
+  it decides only what is written and counted.
 
 The mint-time verdict stays as the first filter: faber still mints only for jobs it
 would run. The job-start verdict is the one that decides what executes.
@@ -482,6 +492,7 @@ macOS VM:
 | A refusal at start, and a runner that ignores the hook | faber records refused at start for the first, and a hook fault for the second |
 | A daemon restart under `enforce` while a job is past its hook and still running | the job runs to its end, and no hook fault is recorded |
 | The same restart with GitHub unreachable for the whole search deadline | the job runs to its end, and faber records that it could not judge it again |
+| A daemon restart under `record` while a job whose hook never ran is still running | one hook fault in the audit log and in the 7-day count, not two |
 | A job taken by a runner minted for another job | judged at start as the job it is, found by `runner_name` |
 | A job past the 100th in its run | found |
 | A stranger's fork PR, and a merge group carrying it, on a test repository | both refused before their first step |

@@ -510,6 +510,11 @@ means stopped:
   job in mid-run is one of these the first time a Mac restarts onto a version that
   writes the line, so make that restart on a drained Mac.
 
+A hook fault is written and counted once for a runner. If the audit log already holds
+one for a job that is still running, the new process adds nothing for it, unless it
+does something new about it: on a Mac that now enforces it stops the job, and writes
+that.
+
 Some keys tighten what faber does, and a release must not tighten a Mac that didn't ask.
 Those have a third state, *unstated*: left out, faber behaves as it did before the key
 existed, warns at every boot, and shows the key as unstated. A profile's `dind`,
