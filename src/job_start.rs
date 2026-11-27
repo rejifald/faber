@@ -355,8 +355,9 @@ pub struct Judged {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
     /// Find the job whose `runner_name` is this runner, judge it, and hand the
-    /// result to [`Watch::judge`].
-    Search,
+    /// result to [`Watch::judge`], or why there is none to [`Watch::missed`].
+    /// `wide` also looks past the runs GitHub lists as queued or in progress.
+    Search { wide: bool },
     /// Write this verdict into the runner, whose hook was seen waiting.
     Deliver(Delivery),
     /// Kill the runner's containers without asking it (ADR-0059 §4). Asked
@@ -375,6 +376,39 @@ pub enum Act {
 /// How often one runner's job is looked for while it is not yet found: every
 /// lookup is a few GitHub calls.
 pub const SEARCH_EVERY: Duration = Duration::from_secs(4);
+
+/// How long the ordinary search may miss before a search goes wide, and how
+/// often one does after that. A job's run is nearly always listed as queued or
+/// in progress within seconds of its start, so the wide search, which reads
+/// every recent run GitHub has not completed, is for the run those two listings
+/// leave out.
+pub const WIDE_SEARCH_AFTER: Duration = Duration::from_secs(20);
+pub const WIDE_SEARCH_EVERY: Duration = Duration::from_secs(20);
+
+/// Why a search came back without a judged job. Kept on the [`Watch`] so a
+/// refusal for want of a verdict says what stood in the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Miss {
+    /// No run GitHub listed holds a job naming this runner.
+    NotListed,
+    /// The job was found, and GitHub did not say whose code its run carries.
+    Unread { job_id: u64, why: String },
+    /// GitHub did not answer a read the search needs.
+    Github(String),
+}
+
+impl Miss {
+    /// The miss in words, for the log and the fault.
+    pub fn words(&self) -> String {
+        match self {
+            Miss::NotListed => "no run GitHub listed holds a job on this runner".to_string(),
+            Miss::Unread { job_id, why } => {
+                format!("job {job_id} was found, and GitHub did not say whose code it runs: {why}")
+            }
+            Miss::Github(why) => format!("GitHub did not answer: {why}"),
+        }
+    }
+}
 
 /// How late faber may first see a hook that is already waiting: one pass of the
 /// job-start loop (2 s, `JOB_START_TICK` in reconcile.rs), a second for the pass
@@ -399,6 +433,8 @@ pub struct Watch {
     hook_since: Option<u64>,
     hook_gone: bool,
     last_search: Option<u64>,
+    last_wide: Option<u64>,
+    last_miss: Option<Miss>,
     gave_up: bool,
     judged: Option<Judged>,
     delivered: Option<StartDecision>,
@@ -431,6 +467,8 @@ impl Watch {
             hook_since: None,
             hook_gone: false,
             last_search: None,
+            last_wide: None,
+            last_miss: None,
             gave_up: false,
             judged: None,
             delivered: None,
@@ -451,6 +489,16 @@ impl Watch {
         if self.judged.is_none() {
             self.judged = Some(judged);
         }
+    }
+
+    /// Hand over why a [`Act::Search`] found no job to judge.
+    pub fn missed(&mut self, miss: Miss) {
+        self.last_miss = Some(miss);
+    }
+
+    /// Why the latest search found no job to judge, if one has missed.
+    pub fn last_miss(&self) -> Option<&Miss> {
+        self.last_miss.as_ref()
     }
 
     /// Whether there is nothing left to watch: the container is gone, or the
@@ -569,7 +617,14 @@ impl Watch {
                     .is_none_or(|t| now.saturating_sub(t) >= ms(SEARCH_EVERY));
                 if due {
                     self.last_search = Some(now);
-                    acts.push(Act::Search);
+                    let wide = now.saturating_sub(since) >= ms(WIDE_SEARCH_AFTER)
+                        && self
+                            .last_wide
+                            .is_none_or(|t| now.saturating_sub(t) >= ms(WIDE_SEARCH_EVERY));
+                    if wide {
+                        self.last_wide = Some(now);
+                    }
+                    acts.push(Act::Search { wide });
                 }
             } else {
                 self.gave_up = true;
@@ -870,13 +925,40 @@ mod tests {
         assert!(w.ended());
     }
 
+    /// The run GitHub's two active listings leave out: after WIDE_SEARCH_AFTER
+    /// of misses a search goes wide, then only every WIDE_SEARCH_EVERY, and
+    /// the latest miss is kept for the fault.
+    #[test]
+    fn a_search_that_keeps_missing_goes_wide_on_its_own_cadence() {
+        let mut w = watch(DeadlineOutcome::Refuse);
+        let d = deadlines();
+        let search = |w: &mut Watch, now: u64| {
+            w.step(now, top(true, true), &d, OnBypass::Enforce)
+                .into_iter()
+                .find(|a| matches!(a, Act::Search { .. }))
+        };
+        assert_eq!(search(&mut w, 0), Some(Act::Search { wide: false }));
+        assert_eq!(w.last_miss(), None);
+        w.missed(Miss::NotListed);
+        assert_eq!(search(&mut w, 16_000), Some(Act::Search { wide: false }));
+        assert_eq!(search(&mut w, 20_000), Some(Act::Search { wide: true }));
+        assert_eq!(search(&mut w, 24_000), Some(Act::Search { wide: false }));
+        assert_eq!(search(&mut w, 36_000), Some(Act::Search { wide: false }));
+        assert_eq!(search(&mut w, 40_000), Some(Act::Search { wide: true }));
+        w.missed(Miss::Github("timed out".to_string()));
+        assert_eq!(
+            w.last_miss().map(Miss::words),
+            Some("GitHub did not answer: timed out".to_string())
+        );
+    }
+
     #[test]
     fn an_allow_reaches_a_waiting_hook_and_ends_the_watch() {
         let mut w = watch(DeadlineOutcome::Refuse);
         let d = deadlines();
         assert_eq!(
             w.step(1_000, top(true, false), &d, OnBypass::Record),
-            vec![Act::Search]
+            vec![Act::Search { wide: false }]
         );
         // Searching again waits SEARCH_EVERY.
         assert!(w

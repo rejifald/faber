@@ -1904,6 +1904,41 @@ impl Github {
         Ok(out)
     }
 
+    /// Workflow runs for `owner/repo` created at or after `since_ms`, whatever
+    /// their status, newest first.
+    ///
+    /// The job-start search's wide listing (ADR-0059 §2): a run GitHub lists
+    /// under neither `queued` nor `in_progress` can still hold a job that has
+    /// just started, and [`Self::runs_with_status`] cannot find it. `since_ms`
+    /// is cut to the hour, so searches minutes apart ask the same URL and the
+    /// ETag cache answers the repeats.
+    pub async fn runs_created_since(
+        &self,
+        owner_repo: &str,
+        since_ms: u64,
+    ) -> Result<Vec<WorkflowRun>, GithubError> {
+        const HOUR_MS: u64 = 3_600_000;
+        let since = crate::config::rfc3339_utc(since_ms - since_ms % HOUR_MS);
+        // `>=`, percent-encoded, as GitHub's `created` filter spells a floor.
+        let first =
+            format!("repos/{owner_repo}/actions/runs?created=%3E%3D{since}&per_page={PAGE_SIZE}");
+        let mut out = Vec::new();
+        for n in 1..=LIST_PAGES {
+            let page: RunsPage = self
+                .get(
+                    &page_path(&first, n),
+                    Scope::of(owner_repo, Permission::ActionsRead),
+                )
+                .await?;
+            let last = last_page(page.workflow_runs.len());
+            out.extend(page.workflow_runs);
+            if last {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// The login of the authenticated user (faber's account owner) — used to
     /// scope topic discovery to repos this user owns.
     pub async fn current_login(&self) -> Result<String, GithubError> {

@@ -177,7 +177,14 @@ Docker-API exception, which #107 and #108 close.
   (`faber-<job>-<time>-<instance>`). faber finds the job whose `runner_name` is that
   name: first among the jobs of the runs it minted for, then among the repository's
   queued and in-progress runs. Every listing it reads is paginated. A runner often takes a different job than the one it was minted
-  for, and this is how faber finds it.
+  for, and this is how faber finds it. A search that has missed for 20 seconds also
+  reads, every 20 seconds, the runs created in the last day that GitHub has not
+  completed, whatever status it gives them: jobs have been refused for want of a
+  verdict after a search of the queued and in-progress listings found nothing for
+  its whole deadline, and the status GitHub gave their runs was not recorded. A
+  run the wide search finds is logged with its status. A refusal for want of a
+  verdict records what the last search met: no run listed, a read GitHub deferred,
+  or no answer.
 - **It judges with its own reads and its one gate.** faber reads that job's facts
   with its own token: the event, the head branch and head SHA, the repository and
   its visibility, the head repository, the actor and triggering actor, the pull
