@@ -18,14 +18,19 @@ case ["serve"]:
         exit(1)
     }
     let console = guestConsoleWriter()
+    // Watches the Software Update keys for the life of the clone and writes them again
+    // whenever macOS drops one (Updates.swift). It starts once `serve` has written them.
+    let watch = UpdateWatch(read: { NSDictionary(contentsOfFile: Checks.softwareUpdatePlist) as? [String: Any] },
+                            run: { runCheckCommand($0, timeout: $1) }, console: console)
     let core = AgentCore(consoleIsRunner: consoleUserIsRunner, probe: sendProbeDatagrams,
                          startRunner: { jit, core in startRunnerInSession(jit, core, console: console) },
-                         runChecks: runGuestChecks,
+                         runChecks: { runGuestChecks($0, watch: watch) },
                          reapplyUpdates: { at in
                              console(reapplyUpdatesOff(at: at, run: { runCheckCommand($0, timeout: $1) }))
                          })
     // ADR-0049's Software Update keys, written again before the agent listens (Updates.swift).
     core.serveStarting()
+    watch.start()
     do {
         try serveAgent(core)
     } catch {
