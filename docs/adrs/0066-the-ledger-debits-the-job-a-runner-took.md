@@ -23,8 +23,8 @@ that are the owner's:
 - both keys ship off, and neither becomes a default here (*Rollout*).
 
 Revised the same day after an independent check of its statements against `728ab93`,
-a second check of the revision, and an independent recomputation of its figures from
-the host's logs. They found:
+a second check of the revision, a third of the edits made after it, and an independent
+recomputation of its figures from the host's logs. They found:
 
 - that the job-start judgement keeps a workflow's name and drops its id, which a class
   key needs (§1);
@@ -37,6 +37,8 @@ the host's logs. They found:
   container's limit, already mean other things here;
 - that the three jobs took 85% of the runner time and not 95%, and that the swap
   moves the ledger by 1% and not 2%;
+- that a job already running at a restart is judged a second time by its runner's new
+  watch, and at this commit is then called a hook fault (§1, §2);
 - passages in other documents that this ADR contradicts, now listed below.
 
 It amends, for a host that turns the keys on:
@@ -254,6 +256,12 @@ judged, keeps its mint-time debit, as today: faber stops the job, or on a privat
 repository under `record` it runs unverified. A refused job is stopped, and its debit
 does not move either.
 
+**A debit moves at most once.** A runner is registered for a single job (README.md,
+*What a job can reach*), and a watch keeps the first judgement it is handed
+(`Watch::judge`, `src/job_start.rs`). A second judgement of the same job comes only
+after a restart, from the new watch an adopted runner is given. It moves nothing if
+the runner's debit has already moved (§2).
+
 **`"observe"` moves nothing.** It writes the same audit line with what would have
 moved, so a host can see how often, how far, and how far above its budget, before it
 turns the move on.
@@ -274,10 +282,19 @@ Adoption re-debits the ledger from a container's `org.faber.reserved-mib` label
   ledger went.
 - **Adoption reads the runner's last `debit` line that records a move** and re-debits
   that. A runner with none is re-debited from its labels, as today. A line written
-  under `"observe"` records no move and is not read. The reason a job was frozen is
-  already kept this way, for the same cause (`src/freeze.rs`).
+  under `"observe"` records no move, and nothing is re-debited from it. The reason a
+  job was frozen is already kept this way, for the same cause (`src/freeze.rs`).
 - **A runner adopted before its job started** is watched again, as every adopted
   runner with a hook is (ADR-0059 §2), and its debit moves when the job starts.
+- **A runner adopted after its job started** is watched again too, and its new watch
+  finds and judges the job it is running. If the runner's last `debit` line records
+  a move, nothing moves again and no line is written. If that line was written under
+  `"observe"`, nothing has moved yet: under `"taken"` the debit moves now, and under
+  `"observe"` no second line is written. At `728ab93` that watch then calls such a
+  job a hook fault once its search deadline has passed, and under `enforce` stops it.
+  That is a defect, which
+  [pull request 107](https://github.com/rejifald/faber/pull/107), still open,
+  corrects.
 
 ### 3. The learner takes the same answer
 
@@ -365,11 +382,11 @@ its own class. The second is the lockstep that *Elasticity* names, at its worst.
 - **The `debit` audit line** of §2.
 - **The outcome line** gains what the ledger held for the run when it ended, in memory
   and in CPU, and the memory limits its containers ran under. Today it carries the CPU
-  share debited at admission and the runner's quota (`cpu_reserved_mcpu`,
-  `cpu_quota_runner_mcpu`;
-  [ADR-0056](0056-a-run-records-where-its-time-and-resources-went.md)) and nothing of
-  the kind for memory, which is why *Context* had to read the daemon's log.
-  `cpu_reserved_mcpu` keeps its meaning: the new fields are beside it.
+  share debited at admission (`cpu_reserved_mcpu`,
+  [ADR-0056](0056-a-run-records-where-its-time-and-resources-went.md)) and the
+  runner's quota (`cpu_quota_runner_mcpu`, ADR-0019), and nothing of the kind for
+  memory, which is why *Context* had to read the daemon's log. `cpu_reserved_mcpu`
+  keeps its meaning: the new fields are beside it.
 - **The shadow figures.** Each class's p90 reservation is computed and shown beside
   its cap and its p75 reservation, on every host and in every mode, with the count of
   runs that outgrew it, as `p75_runs` and `p75_trips` are today.
