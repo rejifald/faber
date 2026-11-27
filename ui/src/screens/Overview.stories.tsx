@@ -78,8 +78,14 @@ const checkout = { kind: 'git_mirror', window_days: 7, runs: 300, median_ms: 24_
 export const SpeedHintHeld: Story = { args: { state: { ...quiet, hints: [{ ...checkout, cause: 'engine_marked' }] } } };
 /** The same capability simply off: no profile asks for it. The fix widens trust, and the row says so. */
 export const SpeedHintOff: Story = { args: { state: { ...quiet, hints: [{ ...checkout, cause: 'off' }] } } };
-/** A profile grants dind now. */
-export const SpeedHintDindGranted: Story = { args: { state: { ...quiet, hints: [{ ...checkout, cause: 'dind_granted', profiles: ['linux'] }] } } };
+/** A profile grants dind and nothing has used it for weeks: the unused grant is what holds the mirror off. */
+export const SpeedHintDindUnused: Story = {
+  args: { state: { ...quiet, hints: [{ ...checkout, cause: 'dind_granted', profiles: ['linux-dind'], docker_runs: 300, dind_runs: 0, last_dind_ms: NOW - 21 * 86_400_000 }] } },
+};
+/** A profile grants dind and jobs still take it: the row counts them. */
+export const SpeedHintDindUsed: Story = {
+  args: { state: { ...quiet, hints: [{ ...checkout, cause: 'dind_granted', profiles: ['linux-dind'], docker_runs: 300, dind_runs: 40 }] } },
+};
 /** No timed run yet: the row says so and states no figure. */
 export const SpeedHintNoRecord: Story = { args: { state: { ...quiet, hints: [{ kind: 'git_mirror', cause: 'off', window_days: 7 }] } } };
 /** Among real alarms the hint sorts last: neutral, after red and amber. */

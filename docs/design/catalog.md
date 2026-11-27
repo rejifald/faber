@@ -101,7 +101,7 @@ How many stories show each entry. Counted per story file.
 | LimitsView | Screens | 10 |
 | Maintenance | Screens | 11 |
 | Memory | Screens | 9 |
-| Overview | Screens | 12 |
+| Overview | Screens | 13 |
 | Popover | Screens | 46 |
 | PopoverFallback | Screens | 46 |
 | Settings | Screens | 56 |
@@ -1606,7 +1606,7 @@ The dashboard's home view (screens.md § 4): is the host healthy, what is it doi
 - **Use when:** the dashboard's `/` view. A pure function of the state it is handed; actions go through `run`.
 - **States:** busy, healthy, fresh host (empty panels), stale, alarm action failed, alarms dismissed, dismissed open, trust changes acknowledged
 - **Source:** `src/screens/Overview.tsx`
-- **Stories:** 12
+- **Stories:** 13
 
 | Prop | Type | Description |
 | --- | --- | --- |

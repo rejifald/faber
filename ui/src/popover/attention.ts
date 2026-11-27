@@ -512,12 +512,24 @@ function hintCost(h: SpeedHint, step: string): string {
 }
 
 /**
+ * Whether the grant that holds a mirror off is in use, from the runs' own records: how many were
+ * given a Docker daemon, or how long ago the last one was. Nothing without those records.
+ */
+function dindUse(h: SpeedHint, now: number): string {
+  if (h.dind_runs == null || !h.docker_runs) return '';
+  const window = `the last ${plural(h.window_days, 'day')}`;
+  if (h.dind_runs > 0) return `${h.dind_runs} of ${plural(h.docker_runs, 'run')} in ${window} were given a Docker daemon. `;
+  const last = h.last_dind_ms != null ? `; the last was ${fmtAgo((now - h.last_dind_ms) / 1000)} ago` : '';
+  return `None of the ${plural(h.docker_runs, 'run')} in ${window} was given a Docker daemon${last}. `;
+}
+
+/**
  * Speed-up hints: a faster way to run jobs that this host has and leaves off. Neutral rows that
  * stop nothing and carry no button: every fix here is a config change, and the ones that widen
  * trust name what they put at risk. The saving is never estimated; the row states what the step
  * costs here today, from this host's records.
  */
-export function hintRows(s: DaemonState): AttentionRow[] {
+export function hintRows(s: DaemonState, now: number): AttentionRow[] {
   const rows: AttentionRow[] = [];
   for (const h of s.hints || []) {
     if (h.kind !== 'git_mirror') continue;
@@ -532,10 +544,9 @@ export function hintRows(s: DaemonState): AttentionRow[] {
       );
     } else {
       const why = h.cause === 'dind_granted' ? `${profilesGrant(h.profiles || [])} dind` : 'this host’s Docker engine has granted dind';
+      parts.push(`The git mirror shortens it, and is held off here: ${why}. ${dindUse(h, now)}The way back is `, { mono: 'dind = false' });
       parts.push(
-        `The git mirror shortens it, and is held off here: ${why}. The way back is a fresh Linux VM disk with `,
-        { mono: 'dind = false' },
-        ' on every docker profile, an operator step with risks of its own: ',
+        ' on every docker profile and a fresh Linux VM disk, since a job has been root on this one. That is an operator step with risks of its own: ',
         { mono: 'docs/git-mirror.md' },
         ', “Turning them back on”.',
       );

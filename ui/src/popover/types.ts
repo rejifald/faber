@@ -656,6 +656,11 @@ export interface SpeedHint {
   /** The median such step time per run, and the sum over the window. */
   median_ms?: number;
   total_ms?: number;
+  /** Docker runs in the window, and how many of them were given a Docker daemon (`dind` is `granted` on the run's record). */
+  docker_runs?: number;
+  dind_runs?: number;
+  /** When the last run given a Docker daemon finished, in any window; absent when the records hold none. */
+  last_dind_ms?: number;
 }
 
 /** One dismissed attention row (ADR-0064 § 2): its key and the identity it had when dismissed. */

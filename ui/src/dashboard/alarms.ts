@@ -301,7 +301,7 @@ export function dashboardAlarms(s: DaemonState, now: number): Alarm[] {
     ...noticeAlarms(s),
     ...awakeAlarms(s),
     ...peerAlarms(s),
-    ...hintRows(s),
+    ...hintRows(s, now),
     ...trustRows(s, undefined, now),
   ]);
 }
