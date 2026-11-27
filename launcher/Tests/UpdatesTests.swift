@@ -1,6 +1,8 @@
-// ADR-0049, Software Update is off in the guest (amended 2026-10-26): the agent writes the
-// build's keys again when `serve` starts and before a job's `begin`, the writes are exactly
-// provision.sh's step a, and a write that fails is a console line, never a dead agent.
+// ADR-0049, Software Update is off in the guest (amended 2026-10-26 and 2026-11-20): the agent
+// writes the build's keys again when `serve` starts, before a job's `begin`, and whenever its
+// watch finds one no longer false; the writes are exactly provision.sh's step a; a write that
+// fails is a console line, never a dead agent; and the verification's check writes them once
+// more and reads again before it fails, but still fails a Software Update that stays on.
 
 import Darwin
 import Foundation
@@ -51,6 +53,10 @@ func testUpdates(_ t: Harness, provision: String?) {
     testReapply(t)
     testReapplyInTheCore(t)
     testScheduleEvidence(t)
+    testKeyLost(t)
+    testWatch(t)
+    testRemoverEvidence(t)
+    testSoftwareUpdateCheck(t)
 }
 
 @MainActor
@@ -141,7 +147,8 @@ private func testReapplyInTheCore(_ t: Harness) {
             "\(events.all)")
     t.check("each failed re-apply was a line", lines.all.count == 2 && lines.all.allSatisfy { $0.contains("ok=false") })
 
-    // A verification writes nothing: it judges the plist as the clone left it.
+    // A verification adds no write through the core: its check writes the keys only when the
+    // plist fails it (testSoftwareUpdateCheck).
     let verifying = Recorded<String>()
     let vcore = AgentCore(consoleIsRunner: { true }, probe: { _, _, n in n }, startRunner: { _, _ in },
                           runChecks: { _ in [] }, reapplyUpdates: { at in verifying.add(at.rawValue) })
@@ -165,4 +172,195 @@ private func testScheduleEvidence(_ t: Harness) {
     let long = scheduleEvidenceLine((0, Data((String(repeating: "x", count: 500) + "\u{1b}").utf8)))
     t.check("the evidence line is bounded and printable",
             long.utf8.count <= Diagnostics.maxLine && long.utf8.allSatisfy { (0x20...0x7e).contains($0) })
+}
+
+private var allOff: [String: Any] {
+    ["AutomaticDownload": false, "CriticalUpdateInstall": false, "ConfigDataInstall": false, "AutomaticCheckEnabled": false]
+}
+
+@MainActor
+private func testKeyLost(_ t: Harness) {
+    t.check("all four false is nothing lost", updateKeyLost(allOff) == nil)
+    var gone = allOff
+    gone["AutomaticCheckEnabled"] = nil
+    t.check("an absent key is lost", updateKeyLost(gone) == "AutomaticCheckEnabled absent", updateKeyLost(gone) ?? "nil")
+    var on = allOff
+    on["ConfigDataInstall"] = true
+    t.check("a true key is lost", updateKeyLost(on) == "ConfigDataInstall=1", updateKeyLost(on) ?? "nil")
+    t.check("an unreadable plist is lost", updateKeyLost(nil) == "plist unreadable")
+    // The verification also judges AutomaticallyInstallMacOSUpdates, which the agent never
+    // writes: the watch leaves it to the verification instead of rewriting forever.
+    var macOS = allOff
+    macOS["AutomaticallyInstallMacOSUpdates"] = true
+    t.check("a key the agent does not write is not the watch's", updateKeyLost(macOS) == nil)
+    t.check("but the verification still fails it", !softwareUpdateVerdict(macOS).ok)
+}
+
+/// A plist that a test changes, as macOS does under the agent.
+private final class FakePlist: @unchecked Sendable {
+    private let lock = NSLock()
+    private var prefs: [String: Any]?
+    init(_ prefs: [String: Any]?) { self.prefs = prefs }
+    func read() -> [String: Any]? { lock.lock(); defer { lock.unlock() }; return prefs }
+    func set(_ p: [String: Any]?) { lock.lock(); prefs = p; lock.unlock() }
+    /// A `defaults write ... -bool false` lands in the fake, as cfprefsd would write it.
+    func command(_ argv: [String]) -> (Int32, Data)? {
+        if argv.first == UpdatePolicy.defaults, argv.count == 6, argv[2] == UpdatePolicy.softwareUpdateDomain {
+            lock.lock()
+            var p = prefs ?? [:]
+            p[argv[3]] = false
+            prefs = p
+            lock.unlock()
+        }
+        return (0, Data())
+    }
+}
+
+@MainActor
+private func testWatch(_ t: Harness) {
+    let plist = FakePlist(allOff)
+    let commands = Recorded<[String]>()
+    let lines = Recorded<String>()
+    let log = Data(#"{"processImagePath":"/usr/libexec/x/softwareupdated","eventMessage":"Automatic check reset"}"#.utf8)
+    let watch = UpdateWatch(read: { plist.read() }, run: { argv, _ in
+        commands.add(argv)
+        return argv.first == UpdatePolicy.log ? (0, log) : plist.command(argv)
+    }, console: { lines.add($0) })
+
+    watch.tick()
+    t.check("keys that are off are left alone", commands.all.isEmpty && lines.all.isEmpty)
+    t.check("no restore yet", watch.restores.count == 0 && watch.restores.first == nil)
+
+    // macOS removes AutomaticCheckEnabled after the agent's write, as on the builder host.
+    var gone = allOff
+    gone["AutomaticCheckEnabled"] = nil
+    plist.set(gone)
+    watch.tick()
+    t.check("a lost key gets every write again, then the log is read",
+            commands.all.dropLast().map { $0 } == updatesOffWrites() && commands.all.last?.first == UpdatePolicy.log,
+            "\(commands.all)")
+    t.check("the log read asks for the guest's own recent log as ndjson",
+            commands.all.last.map { $0.contains("--last") && $0.contains("ndjson") && $0.contains(UpdatePolicy.logPredicate) } == true)
+    t.check("the key is back", updateKeyLost(plist.read()) == nil)
+    t.check("the restore names its key",
+            lines.all.first?.hasPrefix("FABER-AGENT updates_lost after=") == true
+                && lines.all.first?.hasSuffix("restores=1 why=AutomaticCheckEnabled absent") == true, "\(lines.all)")
+    t.check("then the writes' own line", lines.all.dropFirst().first == "FABER-AGENT updates_off at=watch ok=true wrote=5/5")
+    t.check("then who logged about it",
+            lines.all.dropFirst(2).first == "FABER-AGENT evidence updates_lost=AutomaticCheckEnabled absent log=exit 0 logged=softwareupdated:1",
+            "\(lines.all)")
+    t.check("the restore is counted", watch.restores.count == 1 && watch.restores.first?.why == "AutomaticCheckEnabled absent")
+
+    let before = lines.all.count
+    watch.tick()
+    t.check("a key that stays put needs nothing more", lines.all.count == before)
+
+    // A second loss writes again, but the log is read the first time only.
+    plist.set(gone)
+    let logs = commands.all.filter { $0.first == UpdatePolicy.log }.count
+    watch.tick()
+    t.check("a later loss is restored too", updateKeyLost(plist.read()) == nil && watch.restores.count == 2)
+    t.check("the log is read once", commands.all.filter { $0.first == UpdatePolicy.log }.count == logs)
+    t.check("the first loss stays the first", watch.restores.first?.why == "AutomaticCheckEnabled absent")
+
+    // A remover that never stops: every restore happens, but the console is not flooded.
+    for _ in 0..<(UpdatePolicy.quietEvery * 2) {
+        plist.set(gone)
+        watch.tick()
+    }
+    let restores = watch.restores.count
+    let lost = lines.all.filter { $0.contains("updates_lost after=") }.count
+    t.check("every loss is restored", restores == 2 + UpdatePolicy.quietEvery * 2)
+    t.check("only the first restores and every quietEvery-th are written out",
+            lost == UpdatePolicy.loudRestores + restores / UpdatePolicy.quietEvery, "\(lost) of \(restores)")
+    t.check("every watch line is bounded and printable",
+            lines.all.allSatisfy { $0.utf8.count <= Diagnostics.maxLine && $0.utf8.allSatisfy { (0x20...0x7e).contains($0) } })
+
+    // A write that fails is a line, and the watch keeps going.
+    let stuck = FakePlist(gone)
+    let broken = UpdateWatch(read: { stuck.read() }, run: { _, _ in nil }, console: { lines.add($0) })
+    broken.tick()
+    broken.tick()
+    t.check("a watch whose writes fail keeps counting", broken.restores.count == 2)
+    t.check("and says the writes failed",
+            lines.all.contains("FABER-AGENT updates_off at=watch ok=false wrote=0/5 failed=AutomaticDownload did not run or timed out"))
+    t.check("and that the log did not run",
+            lines.all.contains("FABER-AGENT evidence updates_lost=AutomaticCheckEnabled absent log=did not run or timed out"))
+}
+
+@MainActor
+private func testRemoverEvidence(_ t: Harness) {
+    let ndjson = [
+        #"{"processImagePath":"/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated","eventMessage":"BackgroundActions: Automatic check parameters: autoDownload=NO"}"#,
+        #"{"processImagePath":"/usr/sbin/cfprefsd","eventMessage":"wrote <private>"}"#,
+        "not json at all",
+        #"{"processImagePath":"/usr/sbin/cfprefsd","eventMessage":"wrote <private>"}"#,
+        #"{"processImagePath":"/usr/libexec/mdmclient","eventMessage":"AutomaticCheckEnabled reset"}"#,
+        #"{"processImagePath":"/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated","eventMessage":"\#(String(repeating: "automatic ", count: 40))\u001b"}"#,
+        #"{"processImagePath":"/usr/sbin/cfprefsd","eventMessage":"Automatic \nsecond line"}"#,
+    ].joined(separator: "\n")
+    let out = removerEvidenceLines(lost: "AutomaticCheckEnabled absent", (0, Data(ndjson.utf8)))
+    t.check("the first line counts each process, most first, ties in the log's order",
+            out.first == "FABER-AGENT evidence updates_lost=AutomaticCheckEnabled absent log=exit 0 logged=cfprefsd:3,softwareupdated:2,mdmclient:1",
+            out.first ?? "none")
+    t.check("then the newest messages about automatic checks, at most three",
+            out.count == 1 + UpdatePolicy.quotedMessages
+                && out[1].hasSuffix("said=mdmclient: AutomaticCheckEnabled reset")
+                && out[3].hasSuffix("said=cfprefsd: Automatic "), "\(out)")
+    t.check("every evidence line is bounded and printable",
+            out.allSatisfy { $0.utf8.count <= Diagnostics.maxLine && $0.utf8.allSatisfy { (0x20...0x7e).contains($0) } })
+    t.check("a quoted message is cut to its own bound",
+            out[2].hasSuffix("said=softwareupdated: " + String(repeating: "automatic ", count: 10)), out[2])
+    t.check("an empty log says none",
+            removerEvidenceLines(lost: "x", (0, Data())) == ["FABER-AGENT evidence updates_lost=x log=exit 0 logged=none"])
+
+    t.check("the watch evidence without a watch says so",
+            watchEvidenceLine(nil) == "FABER-GOLDEN-VERIFY evidence check=software_update watch=not running")
+    t.check("a quiet watch says none", watchEvidenceLine((0, nil)) == "FABER-GOLDEN-VERIFY evidence check=software_update watch_restores=0")
+    t.check("a watch that restored says how often and what it first found",
+            watchEvidenceLine((3, ("AutomaticCheckEnabled absent", 61)))
+                == "FABER-GOLDEN-VERIFY evidence check=software_update watch_restores=3 first=AutomaticCheckEnabled absent after=61s")
+}
+
+@MainActor
+private func testSoftwareUpdateCheck(_ t: Harness) {
+    var gone = allOff
+    gone["AutomaticCheckEnabled"] = nil
+    let wrote = "FABER-AGENT updates_off at=check ok=true wrote=5/5"
+
+    // Off at the first read: nothing written, nothing waited for.
+    var steps: [String] = []
+    let (pass, none) = softwareUpdateCheck(judge: { steps.append("judge"); return softwareUpdateVerdict(allOff) },
+                                           reapply: { steps.append("reapply"); return wrote },
+                                           settle: { steps.append("settle") })
+    t.check("a plist that is off passes at once", pass.ok && none == nil && steps == ["judge"], "\(steps)")
+    t.check("and the verdict is the plist's", pass == softwareUpdateVerdict(allOff))
+
+    // The race: macOS removed the key, the watch had not put it back yet.
+    let plist = FakePlist(gone)
+    steps = []
+    let (raced, line) = softwareUpdateCheck(
+        judge: { steps.append("judge"); return softwareUpdateVerdict(plist.read()) },
+        reapply: { steps.append("reapply"); return reapplyUpdatesOff(at: .check, run: { argv, _ in plist.command(argv) }) },
+        settle: { steps.append("settle") })
+    t.check("a lost key is written again, waited on, and read again", steps == ["judge", "reapply", "settle", "judge"], "\(steps)")
+    t.check("then passes, naming what the first read found",
+            raced == .pass("written again at the check, then off (first read: AutomaticCheckEnabled absent (it defaults to on))"),
+            raced.why)
+    t.check("and its writes are a line of their own", line == wrote, line ?? "nil")
+
+    // Really on: whatever turned it on does so again before the second read.
+    let (on, _) = softwareUpdateCheck(judge: { softwareUpdateVerdict(gone) }, reapply: { wrote }, settle: {})
+    t.check("a key that stays lost still fails", on == .fail("AutomaticCheckEnabled absent (it defaults to on) (written again at the check)"),
+            on.why)
+    // Writes that fail cannot pass it either.
+    let (failed, failedLine) = softwareUpdateCheck(judge: { softwareUpdateVerdict(gone) },
+                                                   reapply: { reapplyUpdatesOff(at: .check, run: { _, _ in (1, Data()) }) },
+                                                   settle: {})
+    t.check("failed writes fail the check", !failed.ok && failedLine?.contains("ok=false") == true)
+    // A key the agent never writes is not cured by writing.
+    var macOS = allOff
+    macOS["AutomaticallyInstallMacOSUpdates"] = true
+    t.check("automatic macOS installs on still fail",
+            !softwareUpdateCheck(judge: { softwareUpdateVerdict(macOS) }, reapply: { wrote }, settle: {}).0.ok)
 }

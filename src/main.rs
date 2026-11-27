@@ -2234,6 +2234,25 @@ mod tests {
         }
         // The bundle is required; --no-host-runtimes excludes --runtime.
         assert!(Cli::try_parse_from(["faber", "golden", "prepare"]).is_err());
+        // The rebuild a failed verification suggests parses once its placeholder is filled in,
+        // and does not without the bundle: the command the operator copies is a real one.
+        let suggested = faber::vm::verify::rebuild_command("xcode-27.1");
+        let filled = suggested.replace(faber::vm::verify::REBUILD_BUNDLE_PLACEHOLDER, "/b/new");
+        let words: Vec<&str> = filled.split_whitespace().collect();
+        let cli = Cli::try_parse_from(&words).unwrap();
+        match cli.command {
+            Command::Golden {
+                action: faber::setup::golden_build::GoldenCommand::Prepare(a),
+            } => {
+                assert_eq!(a.bundle, std::path::PathBuf::from("/b/new"));
+                assert_eq!(a.from.as_deref(), Some("xcode-27.1"));
+            }
+            _ => panic!("not golden prepare: {suggested}"),
+        }
+        // The suggestion before it named the bundle, which prepare refuses.
+        assert!(
+            Cli::try_parse_from(["faber", "golden", "prepare", "--from", "xcode-27.1"]).is_err()
+        );
         assert!(Cli::try_parse_from([
             "faber",
             "golden",

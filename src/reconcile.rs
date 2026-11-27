@@ -213,6 +213,11 @@ const EXECUTED_LOOKUP_RUNS: usize = 10;
 /// `updated_at` and this host's clock need not agree to the second.
 const EXECUTED_LOOKUP_SLACK: Duration = Duration::from_secs(60);
 
+/// How far back the job-start search's wide listing reads runs by creation
+/// time (ADR-0059 §2). A job can wait hours for a runner; a run older than
+/// this that is in neither active listing is not found.
+const WIDE_SEARCH_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// How long a class stays in a repo's sizing cohort after it was last seen queued.
 ///
 /// Long enough to cover this repo's slowest cadence — a weekly workflow shares the
@@ -9357,8 +9362,8 @@ impl Orchestrator {
             return;
         };
         match act {
-            Act::Search => match self.judge_started_job(&w).await {
-                Ok(Some(judged)) => {
+            Act::Search { wide } => match self.judge_started_job(&w, wide).await {
+                Ok(judged) => {
                     info!(
                         "{}: runner {} took job {} ({}); at start the gate says {}",
                         w.repo, w.runner, judged.job_id, judged.job_name, judged.verdict
@@ -9367,8 +9372,27 @@ impl Orchestrator {
                         w.judge(judged);
                     }
                 }
-                Ok(None) => debug!("{}: runner {}'s job not found yet", w.repo, w.runner),
-                Err(e) => debug!("{}: looking for runner {}'s job: {e}", w.repo, w.runner),
+                Err(miss) => {
+                    // Said once per reason, not once per search: a job is
+                    // looked for every few seconds until it is found. The
+                    // first searches usually come before GitHub names the
+                    // runner on the job, so "not listed" is only worth a line
+                    // once a wide search has missed too.
+                    let quiet = miss == crate::job_start::Miss::NotListed && !wide;
+                    if quiet {
+                        debug!("{}: runner {}'s job not found yet", w.repo, w.runner);
+                    } else if w.last_miss() != Some(&miss) || wide {
+                        info!(
+                            "{}: runner {}'s job is not judged yet: {}",
+                            w.repo,
+                            w.runner,
+                            miss.words()
+                        );
+                    }
+                    if let Some(w) = self.job_starts.lock().unwrap().get_mut(runner) {
+                        w.missed(miss);
+                    }
+                }
             },
             Act::Deliver(d) => {
                 if let Err(e) = crate::docker::deliver_verdict(runner, d.archive()).await {
@@ -9450,16 +9474,25 @@ impl Orchestrator {
     }
 
     /// Find the job GitHub gave `w`'s runner, by its `runner_name`, and judge it
-    /// (ADR-0059 §2): first among the jobs of the run it was minted for, then
     /// among the repository's in-progress and queued runs, every listing read
-    /// to its last page. `Ok(None)` while it is not found, or while GitHub
-    /// defers saying whose code it runs.
+    /// to its last page; `wide` also reads the recent runs GitHub lists under
+    /// neither. The [`Miss`](crate::job_start::Miss) says what stood in the way
+    /// while there is no verdict: the job is not listed, GitHub defers saying
+    /// whose code it runs, or GitHub did not answer.
     async fn judge_started_job(
         &self,
         w: &crate::job_start::Watch,
-    ) -> Result<Option<crate::job_start::Judged>, GithubError> {
-        let Some((run, job)) = self.find_started_job(w).await? else {
-            return Ok(None);
+        wide: bool,
+    ) -> Result<crate::job_start::Judged, crate::job_start::Miss> {
+        use crate::job_start::Miss;
+        let (run, job) = self
+            .find_started_job(w, wide)
+            .await
+            .map_err(|e| Miss::Github(e.to_string()))?
+            .ok_or(Miss::NotListed)?;
+        let unread = |why: String| Miss::Unread {
+            job_id: job.id,
+            why,
         };
         let code = match authorship::without_reads(&run) {
             Some(code) => code,
@@ -9468,18 +9501,15 @@ impl Orchestrator {
                 .remove(&run.id)
             {
                 Some(Ok(code)) => code,
-                Some(Err(Deferred(why))) => {
-                    debug!("{}: run {} deferred: {why}", w.repo, run.id);
-                    return Ok(None);
-                }
-                None => return Ok(None),
+                Some(Err(Deferred(why))) => return Err(unread(why)),
+                None => return Err(unread("the read gave no answer".to_string())),
             },
         };
         let Some(profile) = self.cfg.profiles.get(w.profile_idx) else {
-            return Ok(None);
+            return Err(unread("the runner's profile is gone".to_string()));
         };
         let verdict = gate::trust_verdict(&job_context(&run, &job, code), &profile.policy);
-        Ok(Some(crate::job_start::Judged {
+        Ok(crate::job_start::Judged {
             job_id: job.id,
             run_id: run.id,
             run_attempt: run.run_attempt,
@@ -9487,19 +9517,33 @@ impl Orchestrator {
             workflow: run.name.clone().unwrap_or_default(),
             verdict: verdict_str(&verdict),
             decision: crate::job_start::start_decision(&verdict, self.on_bypass()),
-        }))
+        })
     }
 
     /// The run and job whose `runner_name` is `w`'s runner, if GitHub has it yet.
+    ///
+    /// The run the runner was minted for is read first, then every run GitHub
+    /// lists as in progress or queued. A `wide` search goes on to the runs
+    /// created in the last [`WIDE_SEARCH_WINDOW`] that GitHub has not completed,
+    /// whatever status it gives them. Jobs of an ordinary pull request have
+    /// been refused for want of a verdict after a search of the two active
+    /// listings found nothing for its whole deadline, each in a run whose
+    /// jobs had waited the better part of an hour; which status GitHub gave
+    /// those runs was not recorded, so the wide search does not depend on
+    /// one, and it logs the status of a run it finds. A completed run is left
+    /// out because its job cannot be the one waiting in the hook.
     async fn find_started_job(
         &self,
         w: &crate::job_start::Watch,
+        wide: bool,
     ) -> Result<Option<(WorkflowRun, Job)>, GithubError> {
         let mine = |jobs: Vec<Job>| {
             jobs.into_iter()
                 .find(|j| j.runner_name.as_deref() == Some(w.runner.as_str()))
         };
+        let mut read: HashSet<u64> = HashSet::new();
         if w.minted_run != 0 {
+            read.insert(w.minted_run);
             if let Some(job) = mine(self.gh.run_jobs(&w.repo, w.minted_run).await?) {
                 let run = self.gh.run(&w.repo, w.minted_run).await?;
                 return Ok(Some((run, job)));
@@ -9507,12 +9551,33 @@ impl Orchestrator {
         }
         for status in ["in_progress", "queued"] {
             for run in self.gh.runs_with_status(&w.repo, status).await? {
-                if run.id == w.minted_run {
+                if !read.insert(run.id) {
                     continue;
                 }
                 if let Some(job) = mine(self.gh.run_jobs(&w.repo, run.id).await?) {
                     return Ok(Some((run, job)));
                 }
+            }
+        }
+        if !wide {
+            return Ok(None);
+        }
+        let since = now_ms().saturating_sub(WIDE_SEARCH_WINDOW.as_millis() as u64);
+        for run in self.gh.runs_created_since(&w.repo, since).await? {
+            if run.status.as_deref() == Some("completed") || !read.insert(run.id) {
+                continue;
+            }
+            if let Some(job) = mine(self.gh.run_jobs(&w.repo, run.id).await?) {
+                info!(
+                    "{}: runner {}'s job {} is in run {}, which GitHub lists as {} and \
+                     under neither queued nor in_progress",
+                    w.repo,
+                    w.runner,
+                    job.id,
+                    run.id,
+                    run.status.as_deref().unwrap_or("no status"),
+                );
+                return Ok(Some((run, job)));
             }
         }
         Ok(None)
@@ -9564,7 +9629,10 @@ impl Orchestrator {
             }
         }
         let job = if view.job_id == 0 {
-            "a job faber did not find".to_string()
+            match w.last_miss() {
+                Some(miss) => format!("a job faber did not judge ({})", miss.words()),
+                None => "a job faber did not find".to_string(),
+            }
         } else {
             format!(
                 "job {} ({} · {})",
@@ -17101,6 +17169,71 @@ pub(crate) mod tests {
     // --- gate bypasses (ADR-0030) --------------------------------------------
 
     /// `profiles()` with its gate's bypass response set to `on_bypass`.
+    /// The case the wide search is for: a job starts on a faber runner in a run
+    /// GitHub lists under neither `queued` nor `in_progress`. The ordinary
+    /// search misses such a run, and says why; the wide one reads the recent
+    /// runs GitHub has not completed and judges the job. A completed run is
+    /// never read.
+    #[tokio::test]
+    async fn a_job_in_a_run_outside_both_active_listings_is_found_by_the_wide_search() {
+        use crate::job_start::{DeadlineOutcome, Miss, StartDecision, Watch};
+        let (base, seen) = spawn_routed_api(|request| {
+            let run = |id: u64, status: &str| {
+                format!(
+                    r#"{{"id":{id},"event":"push","name":"CI","status":"{status}","head_branch":"main","repository":{{"full_name":"owner/demo","private":true}}}}"#
+                )
+            };
+            let body = if request.contains("/actions/runs?status=") {
+                r#"{"workflow_runs":[]}"#.to_string()
+            } else if request.contains("/actions/runs?created=") {
+                format!(
+                    r#"{{"workflow_runs":[{},{}]}}"#,
+                    run(70, "pending"),
+                    run(80, "completed")
+                )
+            } else if request.contains("/actions/runs/70/jobs") {
+                r#"{"jobs":[{"id":7,"name":"build","status":"in_progress","runner_name":"faber-5-100","labels":["faber","docker"]}]}"#.to_string()
+            } else {
+                // The minted run holds no job on this runner.
+                r#"{"jobs":[]}"#.to_string()
+            };
+            ("200 OK", Box::leak(body.into_boxed_str()))
+        })
+        .await;
+        let (orch, _tmp) = test_orch_on(profiles(), Github::at(base));
+        let w = Watch::new(
+            "owner/demo",
+            "faber-5-100",
+            5,
+            50,
+            0,
+            DeadlineOutcome::Refuse,
+        );
+
+        assert_eq!(
+            orch.judge_started_job(&w, false).await,
+            Err(Miss::NotListed),
+            "the two active listings do not hold the run"
+        );
+        let judged = orch
+            .judge_started_job(&w, true)
+            .await
+            .expect("the wide search finds it");
+        assert_eq!((judged.job_id, judged.run_id), (7, 70));
+        assert_eq!(judged.decision, StartDecision::Allow);
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|r| r.contains("/actions/runs?created=%3E%3D") && r.contains("per_page=100")),
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|r| r.contains("/actions/runs/80/jobs")),
+            "a completed run's job cannot be waiting in the hook: {seen:?}"
+        );
+    }
+
     fn bypass_profiles(on_bypass: OnBypass) -> Vec<Profile> {
         let mut p = profiles();
         p[0].policy = p[0].policy.clone().with_on_bypass(on_bypass);

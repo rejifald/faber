@@ -29,6 +29,8 @@ enum Checks {
     /// The one that may also be absent, since macOS leaves it unset until asked.
     static let updateOptionalKeys = ["AutomaticallyInstallMacOSUpdates"]
     static let softwareUpdatePlist = "/Library/Preferences/com.apple.SoftwareUpdate.plist"
+    /// What `fdesetup status` says when FileVault is off.
+    static let fileVaultOffPhrase = "FileVault is Off"
     static let homebrewPrefix = "/opt/homebrew"
     /// The admin group's name and gid on macOS.
     static let adminGroup = "admin"
@@ -260,15 +262,37 @@ func softwareUpdateVerdict(_ prefs: [String: Any]?) -> CheckVerdict {
     return .pass((Checks.updateKeys.map { "\($0)=0" } + optional).joined(separator: " "))
 }
 
+/// The software_update check, as the clone has Software Update when the check runs. `judge`
+/// reads the plist and judges it (softwareUpdateVerdict). A first verdict that passes is the
+/// answer. One that fails may be the race the agent's watch exists for (Updates.swift): macOS
+/// removed a key a moment ago and the watch has not put it back yet. So the keys are written
+/// once more (`reapply`, whose line is returned to go on the console), and after `settle` the
+/// plist is judged again, and that second verdict is the answer: a pass names what the first
+/// read found, a failure says the keys were written again and still are not off. A Software
+/// Update that is really on (a write that fails, a profile or daemon that turns it straight
+/// back on) therefore still fails. The settle path adds at most 5 writes x 10 s plus
+/// UpdatePolicy.settle to the checks.
+func softwareUpdateCheck(judge: () -> CheckVerdict, reapply: () -> String,
+                         settle: () -> Void) -> (CheckVerdict, String?) {
+    let first = judge()
+    guard !first.ok else { return (first, nil) }
+    let wrote = reapply()
+    settle()
+    let second = judge()
+    guard second.ok else { return (.fail("\(second.why) (written again at the check)"), wrote) }
+    return (.pass("written again at the check, then off (first read: \(first.why))"), wrote)
+}
+
 /// A user's MobileMeAccounts preferences name a signed-in Apple ID.
 func appleIDSignedIn(_ prefs: [String: Any]?) -> Bool {
     guard let accounts = prefs?["Accounts"] as? [Any] else { return false }
     return !accounts.isEmpty
 }
 
-/// `fdesetup status` says FileVault is off.
+/// `fdesetup status` says FileVault is off. launcher/golden/arm.sh refuses to arm on the same
+/// words, so an image it lets through cannot fail this check after the build.
 func fileVaultOff(_ output: String) -> Bool {
-    output.contains("FileVault is Off")
+    output.contains(Checks.fileVaultOffPhrase)
 }
 
 /// An admin account cannot log in: its shell is `/usr/bin/false`. Root is judged apart.
@@ -595,11 +619,11 @@ func guestConsoleWriter(path: String = Diagnostics.console) -> @Sendable (String
 
 /// Run every check against `expect`, each line to the guest's console. Slow: it runs
 /// xcodebuild and simctl.
-func runGuestChecks(_ expect: VerifyExpect) -> [CheckCode] {
-    checkGuest(expect, sink: DiagnosticSink(write: guestConsoleWriter()))
+func runGuestChecks(_ expect: VerifyExpect, watch: UpdateWatch?) -> [CheckCode] {
+    checkGuest(expect, sink: DiagnosticSink(write: guestConsoleWriter()), watch: watch)
 }
 
-func checkGuest(_ expect: VerifyExpect, sink: DiagnosticSink) -> [CheckCode] {
+func checkGuest(_ expect: VerifyExpect, sink: DiagnosticSink, watch: UpdateWatch? = nil) -> [CheckCode] {
     var r: [CheckCode: Bool] = [:]
     func record(_ code: CheckCode, _ verdict: CheckVerdict) {
         r[code] = verdict.ok
@@ -683,15 +707,21 @@ func checkGuest(_ expect: VerifyExpect, sink: DiagnosticSink) -> [CheckCode] {
         record(.appleID, .pass("no Apple ID in \(homes.count) home(s)"))
     }
 
-    if let prefs = plist(Checks.softwareUpdatePlist) {
-        record(.softwareUpdate, softwareUpdateVerdict(prefs))
-    } else {
-        record(.softwareUpdate, .fail(plistFailure(Checks.softwareUpdatePlist)))
-    }
-    // Evidence only, on a line of its own (the check's line has no room left for it): what
-    // softwareupdate itself says about the schedule. The verdict above is the plist's alone.
+    let (updates, rewrote) = softwareUpdateCheck(
+        judge: {
+            plist(Checks.softwareUpdatePlist).map(softwareUpdateVerdict)
+                ?? .fail(plistFailure(Checks.softwareUpdatePlist))
+        },
+        reapply: { reapplyUpdatesOff(at: .check, run: { runCheckCommand($0, timeout: $1) }) },
+        settle: { Thread.sleep(forTimeInterval: UpdatePolicy.settle) })
+    if let rewrote { sink.emit(rewrote) }
+    record(.softwareUpdate, updates)
+    // Evidence only, on lines of their own (the check's line has no room left for it): what
+    // softwareupdate itself says about the schedule, then how often the agent's watch has had
+    // to write the keys again. The verdict above is the plist's alone.
     sink.emit(scheduleEvidenceLine(runCheckCommand([UpdatePolicy.softwareupdate, "--schedule"],
                                                    timeout: UpdatePolicy.scheduleTimeout, withStderr: true)))
+    sink.emit(watchEvidenceLine(watch?.restores))
 
     // As runner, the account a job runs as: root reads an Xcode runner may not (Toolchain).
     if runner != nil {
