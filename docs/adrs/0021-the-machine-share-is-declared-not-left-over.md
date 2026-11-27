@@ -17,6 +17,11 @@ admission while swap use is growing: by at least 1 GiB within 5 minutes. As of
 §1, §2 and the swap signal are built in #109; §3, the measured co-tenant reserve,
 in [#85](https://github.com/rejifald/faber-legacy/issues/85).
 
+**Amended 2026-11-27** (see the amendment of that date at the foot of this file):
+the swap signal keeps the pressure gate's floor of one job, gives way to the
+pressure level under `warn` or `critical`, scales with the machine's memory,
+counts net growth, and resumes after 2 flat minutes instead of 5.
+
 accepted (2026-09-24). Recorded before implementation, as
 [ADR-0007](0007-faber-owns-the-docker-host.md) was. It adds a term for the
 machine faber runs on to two existing budgets: the autolimiter's Gate 1
@@ -299,3 +304,74 @@ jobs running, and said nothing about why.
   still protects the machine.
 
 Absent or `0` `keep_*` keys build no gate, so they behave as before.
+
+## Amendment (2026-11-27): growing swap keeps the floor and speaks only alone
+
+The swap signal ADR-0032 §3 added to §2c held admission far more than it was
+meant to. On a builder host that is also its operator's development machine (a
+dev machine running interactive sessions and Docker stacks beside CI), its log
+over about five weeks showed, in round figures:
+
+- **It held often.** About 600 swap holds, for a tenth of wall-clock time, and
+  a fifth of the most recent day.
+- **It repeated the pressure gate.** About 99% of swap holds began while macOS
+  already reported `warn`, so the pressure gate was holding as well. Only a
+  handful began under `normal`.
+- **Its only effect was to remove the floor.** Under both holds the machine
+  reported swap, which had no floor, so the amendment of 2026-10-17's one job
+  became none, for at least five minutes.
+- **Stopping CI did not clear it.** A third of swap-hold time had no CI job
+  running at all, and two thirds of holds began with no admission in the five
+  minutes before. The growth came from the machine's other tenants. The reason
+  given above for having no floor, that swap "clears once nothing adds to it",
+  does not hold on a machine CI shares.
+- **The stalls were long.** Holds lasted about 6 minutes at the median and 15 at
+  the 90th percentile, and over an hour at worst; parked jobs waited about 12
+  minutes each on average.
+
+Changes to §2c and ADR-0032 §3:
+
+1. **One floor for both holds.** Growing swap keeps the one-job floor that
+   memory pressure keeps: while no job is running, one is admitted, Docker or
+   macOS VM, counted together as before. With a job running both hold as before.
+   The reasoning that applied to pressure applies here too: a gate that holds at
+   zero waits on growth that nothing CI does can stop.
+2. **Pressure is named first.** While macOS reports `warn` or `critical`, the
+   hold is `machine-pressure`, whatever swap does. Swap growing under pressure is
+   the same shortage seen twice. The swap gate now speaks only where it is the
+   one signal: under `normal`, and on Linux, which reports no level.
+3. **The threshold is the machine's own, and growth is net.** Growth that pauses
+   is 5% of the machine's physical memory, and never less than ADR-0032's 1 GiB,
+   so a machine of 20 GiB or less is unchanged. On a 64 GiB machine (an example)
+   it is about 3.2 GiB. Growth is the latest reading less the oldest one in the
+   5-minute window. It was the largest rise from any reading to a later one, so a
+   dip and a climb back to where swap started counted as growth.
+4. **Resume after 2 flat minutes.** Growth is still measured over 5 minutes, and
+   the hold now ends once the net rise over the last 2 minutes is below an
+   eighth of the threshold. When it ends, the readings from before those 2
+   minutes are forgotten, so the growth that started a hold cannot start the
+   next one: a new hold needs a whole threshold of growth after the old one
+   ended. A test drives ten-second readings with noise and slow creep after a
+   hold and expects one hold and one resume.
+
+**Constants, not keys.** The thresholds stay constants beside the pressure
+level, which §2c already treats as a signal with nothing to tune. A key would
+ask operators to tune a heuristic this amendment is still correcting; if a host
+needs a different figure, that is evidence for the follow-up below, not for a
+knob.
+
+**Estimated effect** on the log above, not measured: change 2 alone moves about
+99% of swap holds to `machine-pressure`. With change 1, every hold that found
+nothing running (about a third of swap-hold time) admits one job at once, so no
+hold leaves the host idle. Change 4 ends the holds that remain about 3 minutes
+sooner each, since resuming waited 5 flat minutes and now waits 2.
+
+**Not chosen:**
+
+- **Removing the swap gate.** It is the only machine signal on Linux, and under
+  `normal` it still sees a machine paging before the kernel's level moves.
+- **A different signal now.** Swap *used* is a weak signal on macOS, which
+  rarely gives swap files back. Gating on the rate of pageouts and swapouts, with
+  `kern.memorystatus_level`, needs a new probe; it is tracked as its own issue.
+
+Absent or `0` `keep_*` keys still build no gate, so they behave as before.

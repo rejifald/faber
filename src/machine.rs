@@ -14,9 +14,10 @@
 //!   warning worded as its fix, because on macOS the VM never gives memory back
 //!   and its size is the only memory reservation the machine has.
 //! - **Yielding to the machine's memory pressure** (§2c). Admission pauses while
-//!   macOS reports `warn` or `critical`, and while swap use has grown by 1 GiB in
-//!   the last 5 minutes. It covers macOS VM jobs as well, since their VMs take
-//!   the machine's own memory.
+//!   macOS reports `warn` or `critical`, and while swap use has grown, net, by
+//!   5% of the machine's memory (1 GiB at least) in the last 5 minutes. Either
+//!   way one job still runs while nothing else does. It covers macOS VM jobs as
+//!   well, since their VMs take the machine's own memory.
 //!
 //! - **Measuring the co-tenant reserve** (§3). Gate 1 holds back the larger of
 //!   `reserve_mib` and the 24-hour peak of what the VM uses beyond faber's own
@@ -44,21 +45,46 @@ use serde::Serialize;
 use crate::cotenant::{self, CoTenantPeak, CoTenantView};
 use crate::host::fmt_gib;
 
-/// How much swap growth inside [`SWAP_WINDOW_MS`] pauses admission
-/// (ADR-0032 §3): 1 GiB.
-pub const SWAP_GROWTH_MIB: u64 = 1024;
+/// The share of the machine's physical memory that swap must grow by, net,
+/// inside [`SWAP_GROWTH_WINDOW_MS`] to pause admission (ADR-0021, amendment of
+/// 2026-11-27): 5%, about 3.2 GiB on a 64 GiB machine.
+///
+/// A fixed figure fits one machine size. 1 GiB is a lot of paging for a 16 GiB
+/// machine and ordinary churn for a 64 GiB one running interactive sessions and
+/// Docker stacks beside CI.
+pub const SWAP_GROWTH_PERCENT: u64 = 5;
 
-/// The window swap growth is measured over, and how long it must then stay flat
-/// before admission resumes (ADR-0032 §3): 5 minutes.
-pub const SWAP_WINDOW_MS: u64 = 5 * 60 * 1000;
+/// The least swap growth that pauses admission, whatever the machine's size:
+/// 1 GiB, the figure ADR-0032 §3 chose for every machine. A machine of 20 GiB or
+/// less keeps it.
+pub const SWAP_GROWTH_MIN_MIB: u64 = 1024;
 
-/// The most swap may still rise inside the window and count as flat.
+/// The window swap growth is measured over (ADR-0032 §3): 5 minutes.
+pub const SWAP_GROWTH_WINDOW_MS: u64 = 5 * 60 * 1000;
+
+/// How long swap must stay flat before admission resumes: 2 minutes. Shorter
+/// than the growth window, so a hold ends soon after the growth does, and long
+/// enough that thirty seconds of quiet between two bursts does not count.
+pub const SWAP_FLAT_WINDOW_MS: u64 = 2 * 60 * 1000;
+
+/// How much swap growth pauses admission on a machine of `mem_mib`:
+/// [`SWAP_GROWTH_PERCENT`] of it, and never less than [`SWAP_GROWTH_MIN_MIB`]. A
+/// machine not yet measured (`0`) gets the minimum.
+pub fn swap_growth_mib(mem_mib: u64) -> u64 {
+    (mem_mib.saturating_mul(SWAP_GROWTH_PERCENT) / 100).max(SWAP_GROWTH_MIN_MIB)
+}
+
+/// The most swap may still rise, net, inside [`SWAP_FLAT_WINDOW_MS`] and count
+/// as flat, for a growth threshold of `growth_mib`: an eighth of it.
 ///
 /// Swap use under memory pressure is never perfectly still: macOS pages a few
 /// megabytes in and out every tick. A threshold of zero would hold admission
-/// indefinitely on that noise, so "flat" allows a quarter of the growth that
-/// pauses — far below what a machine short of memory adds in five minutes.
-pub const SWAP_FLAT_MIB: u64 = 256;
+/// indefinitely on that noise. An eighth in two minutes is about a third of the
+/// rate that pauses, so a hold does not end while the growth that started it is
+/// merely slowing.
+pub fn swap_flat_mib(growth_mib: u64) -> u64 {
+    growth_mib / 8
+}
 
 /// How old a reading of the machine may be and still be evidence. Past this the
 /// pressure gate opens, as every other gate does on a reading that has stopped:
@@ -372,8 +398,10 @@ pub fn unstated_warnings(
 pub enum MachineHold {
     /// macOS reports `warn` or `critical`.
     Pressure(PressureLevel),
-    /// Swap use rose by `rise_mib` inside the window, and has not yet been flat
-    /// for a whole one.
+    /// Swap use rose, net, by `rise_mib` inside the growth window, and has not
+    /// yet been flat for a whole flat window. Reported only while macOS's
+    /// pressure level is `normal` or unknown: under `warn` or `critical` the hold
+    /// is [`MachineHold::Pressure`], whatever swap does.
     Swap { rise_mib: u64 },
 }
 
@@ -392,8 +420,8 @@ impl MachineHold {
             MachineHold::Swap { rise_mib } => (
                 "swap",
                 format!(
-                    "swap grew {} GiB in the last 5 minutes — nothing new starts until it has \
-                     been flat for 5",
+                    "swap grew {} GiB in the last 5 minutes — no more than one job runs until it \
+                     has been flat for 2",
                     fmt_gib(*rise_mib)
                 ),
             ),
@@ -401,14 +429,19 @@ impl MachineHold {
     }
 }
 
-/// Swap use over the last [`SWAP_WINDOW_MS`], and whether it counts as growing
-/// (ADR-0032 §3).
+/// Swap use over the last [`SWAP_GROWTH_WINDOW_MS`], and whether it counts as
+/// growing (ADR-0032 §3, ADR-0021's amendment of 2026-11-27).
 ///
-/// Growth is the largest rise from any reading to a later one inside the window,
-/// so a dip followed by a climb counts and a steady fall does not. It starts at
-/// [`SWAP_GROWTH_MIB`] and ends below [`SWAP_FLAT_MIB`], holding in between.
-/// Because the rise that started it stays in the window for the window's length,
-/// the end comes no sooner than five flat minutes after it.
+/// Growth is net: the latest reading less the oldest one inside the window. A
+/// dip followed by a climb back counts only for what ends above where the window
+/// started, and a fall counts as nothing. It starts once the net growth over
+/// five minutes reaches the threshold ([`swap_growth_mib`]) and the last two
+/// minutes are not flat; it ends once the net rise over the last two minutes is
+/// below [`swap_flat_mib`].
+///
+/// When it ends, the readings from before the flat window are forgotten, so the
+/// growth that started the hold cannot start the next one: a new hold needs a
+/// whole threshold of growth after the old one ended.
 #[derive(Debug, Clone, Default)]
 pub struct SwapWindow {
     /// `(at_ms, used_mib)`, oldest first.
@@ -417,34 +450,42 @@ pub struct SwapWindow {
 }
 
 impl SwapWindow {
-    /// Add one reading taken at `at_ms`, forget those older than the window, and
-    /// step the hysteresis.
-    pub fn observe(&mut self, at_ms: u64, used_mib: u64) {
+    /// Add one reading taken at `at_ms`, forget those older than the growth
+    /// window, and step the hysteresis against a threshold of `growth_mib`.
+    pub fn observe(&mut self, at_ms: u64, used_mib: u64, growth_mib: u64) {
         self.samples.push_back((at_ms, used_mib));
-        while self
-            .samples
-            .front()
-            .is_some_and(|&(t, _)| at_ms.saturating_sub(t) > SWAP_WINDOW_MS)
-        {
-            self.samples.pop_front();
-        }
-        let rise = self.rise_mib();
-        if rise >= SWAP_GROWTH_MIB {
+        self.forget_before(at_ms.saturating_sub(SWAP_GROWTH_WINDOW_MS));
+        let flat_from = at_ms.saturating_sub(SWAP_FLAT_WINDOW_MS);
+        if self.rise_since(flat_from) < swap_flat_mib(growth_mib) {
+            if self.growing {
+                self.growing = false;
+                self.forget_before(flat_from);
+            }
+        } else if self.rise_mib() >= growth_mib {
             self.growing = true;
-        } else if rise < SWAP_FLAT_MIB {
-            self.growing = false;
         }
     }
 
-    /// The largest rise inside the window (MiB).
-    pub fn rise_mib(&self) -> u64 {
-        let mut low = u64::MAX;
-        let mut rise = 0;
-        for &(_, mib) in &self.samples {
-            low = low.min(mib);
-            rise = rise.max(mib - low);
+    /// Forget the readings taken before `from_ms`.
+    fn forget_before(&mut self, from_ms: u64) {
+        while self.samples.front().is_some_and(|&(t, _)| t < from_ms) {
+            self.samples.pop_front();
         }
-        rise
+    }
+
+    /// The net rise over the readings taken at or after `from_ms` (MiB): the
+    /// latest less the oldest, or `0` if it fell.
+    fn rise_since(&self, from_ms: u64) -> u64 {
+        let mut since = self.samples.iter().filter(|&&(t, _)| t >= from_ms);
+        match (since.next(), self.samples.back()) {
+            (Some(&(_, first)), Some(&(_, last))) => last.saturating_sub(first),
+            _ => 0,
+        }
+    }
+
+    /// The net rise inside the growth window (MiB).
+    pub fn rise_mib(&self) -> u64 {
+        self.rise_since(0)
     }
 
     pub fn growing(&self) -> bool {
@@ -485,7 +526,8 @@ impl MachineState {
             return;
         };
         if let Some(used) = reading.swap_used_mib {
-            self.swap.observe(at_ms, used);
+            self.swap
+                .observe(at_ms, used, swap_growth_mib(reading.mem_mib));
         }
         self.reading = Some((reading, at_ms));
     }
@@ -511,17 +553,16 @@ impl MachineState {
             return None;
         }
         let reading = self.fresh(now_ms)?;
-        // Growing swap is named first: it holds even where memory pressure's
-        // floor of one job lets work through (#160), so the reason must be it.
-        if self.swap.growing() {
-            return Some(MachineHold::Swap {
-                rise_mib: self.swap.rise_mib(),
-            });
+        // Pressure is named first: under `warn` or `critical` swap growing is the
+        // same shortage seen twice, and both holds keep the same floor of one job
+        // (#160). The swap gate speaks only where it is the one signal: under
+        // `normal`, and on Linux, which reports no level.
+        if let Some(level) = reading.pressure.filter(|l| l.pauses()) {
+            return Some(MachineHold::Pressure(level));
         }
-        reading
-            .pressure
-            .filter(|l| l.pauses())
-            .map(MachineHold::Pressure)
+        self.swap.growing().then(|| MachineHold::Swap {
+            rise_mib: self.swap.rise_mib(),
+        })
     }
 
     /// Put back a window kept from before a restart (§3), so the reserve starts
@@ -660,7 +701,7 @@ pub struct MachineView {
     pub psi_some_avg60: Option<f64>,
     pub swap_used_mib: Option<u64>,
     pub swap_total_mib: Option<u64>,
-    /// The largest rise in swap use over the last 5 minutes (MiB).
+    /// The net rise in swap use over the last 5 minutes (MiB).
     pub swap_rise_mib: u64,
     pub compressor_mib: Option<u64>,
     /// The gate holding admission, `"machine-pressure"` or `"swap"`, or `null`.
@@ -857,50 +898,111 @@ mod tests {
     }
 
     #[test]
-    fn swap_growth_of_a_gib_in_five_minutes_pauses_and_five_flat_minutes_resume() {
-        let mut w = SwapWindow::default();
-        let t0 = 1_000_000;
-        // Some swap in use before a heavy job starts, then climbing.
-        w.observe(t0, 2_000);
-        w.observe(t0 + 60_000, 2_500);
-        assert!(!w.growing());
-        w.observe(t0 + 120_000, 3_100);
-        assert!(w.growing(), "1.1 GiB inside the window");
-        assert_eq!(w.rise_mib(), 1_100);
-        // Flat from here: still paused while the rise is inside the window…
-        for minute in 3..7 {
-            w.observe(t0 + minute * 60_000, 3_100);
-            assert!(w.growing(), "minute {minute}");
-        }
-        // …and resumed once five flat minutes have pushed it out.
-        w.observe(t0 + 7 * 60_000 + 1, 3_100);
-        assert!(!w.growing());
-        assert_eq!(w.rise_mib(), 0);
+    fn the_swap_threshold_scales_with_the_machine_and_keeps_a_floor() {
+        assert_eq!(swap_growth_mib(64 * GIB), 3_276, "5% of 64 GiB");
+        assert_eq!(swap_growth_mib(32 * GIB), 1_638);
+        // A small machine, and one not yet measured, keep ADR-0032's 1 GiB.
+        assert_eq!(swap_growth_mib(16 * GIB), 1_024);
+        assert_eq!(swap_growth_mib(0), 1_024);
+        assert_eq!(swap_flat_mib(1_024), 128);
     }
 
     #[test]
-    fn swap_noise_is_flat_and_a_slow_rise_holds_the_pause() {
+    fn swap_growth_of_a_gib_in_five_minutes_pauses_and_two_flat_minutes_resume() {
+        let mut w = SwapWindow::default();
+        let t0 = 1_000_000;
+        // Some swap in use before a heavy job starts, then climbing.
+        w.observe(t0, 2_000, GIB);
+        w.observe(t0 + 60_000, 2_500, GIB);
+        assert!(!w.growing());
+        w.observe(t0 + 120_000, 3_100, GIB);
+        assert!(w.growing(), "1.1 GiB inside the window");
+        assert_eq!(w.rise_mib(), 1_100);
+        // Flat from here: still paused while the last two minutes hold a rise…
+        w.observe(t0 + 180_000, 3_100, GIB);
+        assert!(w.growing());
+        // …and resumed once two flat minutes have passed, not five.
+        w.observe(t0 + 240_000, 3_100, GIB);
+        assert!(!w.growing());
+        assert_eq!(w.rise_mib(), 0, "the growth that held is forgotten");
+    }
+
+    #[test]
+    fn swap_growth_is_net_so_noise_and_a_dip_then_a_climb_do_not_count() {
         let mut w = SwapWindow::default();
         let t0 = 1_000_000;
         for (i, mib) in [4_000, 4_100, 4_050, 4_150, 4_100].iter().enumerate() {
-            w.observe(t0 + i as u64 * 60_000, *mib);
+            w.observe(t0 + i as u64 * 60_000, *mib, GIB);
         }
         assert!(!w.growing(), "a few MiB of paging is not growth");
-        // A falling reading never counts as growth.
-        w.observe(t0 + 5 * 60_000, 1_000);
+        // A falling reading never counts as growth…
+        w.observe(t0 + 5 * 60_000, 1_000, GIB);
         assert!(!w.growing());
-        // A dip then a climb does.
-        w.observe(t0 + 6 * 60_000, 2_100);
+        // …and a climb back from the dip counts only for what ends above where
+        // the window started: 1.1 GiB up from the dip, but below it net.
+        w.observe(t0 + 6 * 60_000, 2_100, GIB);
+        assert!(!w.growing());
+        assert_eq!(w.rise_mib(), 0);
+        // A climb that ends well above where the window started is growth.
+        w.observe(t0 + 7 * 60_000, 5_200, GIB);
         assert!(w.growing());
+        // A climb that falls back inside the window is not.
+        let mut back = SwapWindow::default();
+        back.observe(t0, 2_000, GIB);
+        back.observe(t0 + 60_000, 2_900, GIB);
+        back.observe(t0 + 120_000, 2_500, GIB);
+        assert!(!back.growing());
         // A rise between flat and growth holds the state it is in.
         let mut held = SwapWindow::default();
-        held.observe(t0, 0);
-        held.observe(t0 + 60_000, 1_024);
+        held.observe(t0, 0, GIB);
+        held.observe(t0 + 60_000, 1_024, GIB);
         assert!(held.growing());
         for minute in 2..=7 {
-            held.observe(t0 + minute * 60_000, 1_024 + 100 * minute);
+            held.observe(t0 + minute * 60_000, 1_024 + 100 * minute, GIB);
         }
-        assert!(held.growing(), "still rising 500 MiB per window: not flat");
+        assert!(
+            held.growing(),
+            "still rising 200 MiB per two minutes: not flat"
+        );
+    }
+
+    #[test]
+    fn a_swap_hold_does_not_flap_on_noise_or_creep_after_it_resumes() {
+        // Readings every 10 seconds, as the limiter takes them.
+        let tick = 10_000;
+        let mut w = SwapWindow::default();
+        let mut transitions = Vec::new();
+        let mut was = false;
+        let mut at = 1_000_000;
+        let mut step = |w: &mut SwapWindow, at: u64, mib: u64| {
+            w.observe(at, mib, GIB);
+            if w.growing() != was {
+                was = w.growing();
+                transitions.push((at, was));
+            }
+        };
+        // A minute flat at 2 GiB, then 1.2 GiB in a minute: one hold.
+        for _ in 0..6 {
+            step(&mut w, at, 2_048);
+            at += tick;
+        }
+        for i in 1..=6 {
+            step(&mut w, at, 2_048 + 200 * i);
+            at += tick;
+        }
+        // Then twenty minutes of noise of up to ±100 MiB and a slow creep of
+        // 50 MiB a minute: more than the flat allowance's noise, never a second
+        // gigabyte. One hold, one resume, nothing after.
+        for i in 0..120u64 {
+            let noise = [0, 100, 40, 90, 10, 60][(i % 6) as usize];
+            step(&mut w, at, 3_248 + i * 50 / 6 + noise);
+            at += tick;
+        }
+        assert_eq!(transitions.len(), 2, "{transitions:?}");
+        assert!(transitions[0].1 && !transitions[1].1);
+        // The resume came two flat minutes after the climb, not five.
+        let climbed = 1_000_000 + 11 * tick;
+        assert!(transitions[1].0 - climbed <= SWAP_FLAT_WINDOW_MS + tick);
     }
 
     #[test]
@@ -930,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn growing_swap_holds_ahead_of_pressure_and_a_stale_reading_holds_nothing() {
+    fn pressure_is_named_ahead_of_growing_swap_and_a_stale_reading_holds_nothing() {
         let t0 = 10_000_000;
         let mut m = MachineState::default();
         m.set_share(share(Some(16), Some(2)));
@@ -939,25 +1041,56 @@ mod tests {
             Some(reading(Some(PressureLevel::Normal), Some(2 * GIB))),
             t0 + 60_000,
         );
+        // 2 GiB is past 5% of the example's 32 GiB.
         assert_eq!(
             m.hold(t0 + 60_000),
             Some(MachineHold::Swap { rise_mib: 2 * GIB })
         );
-        // Swap is named first when both hold: it has no floor (#160).
+        // Under `warn` the hold is pressure, whatever swap does: it is the same
+        // shortage, and the swap gate speaks only where it is the one signal.
         m.observe(
             Some(reading(Some(PressureLevel::Warn), Some(2 * GIB))),
             t0 + 70_000,
         );
         assert_eq!(
             m.hold(t0 + 70_000),
+            Some(MachineHold::Pressure(PressureLevel::Warn))
+        );
+        // Back at `normal` with swap still inside its hold: swap again.
+        m.observe(
+            Some(reading(Some(PressureLevel::Normal), Some(2 * GIB))),
+            t0 + 80_000,
+        );
+        assert_eq!(
+            m.hold(t0 + 80_000),
             Some(MachineHold::Swap { rise_mib: 2 * GIB })
         );
         // A failed reading keeps the last; one too old to be evidence opens the gate.
-        m.observe(None, t0 + 80_000);
-        assert!(m.hold(t0 + 80_000).is_some());
-        assert_eq!(m.hold(t0 + 70_000 + MACHINE_READING_MAX_AGE_MS + 1), None);
+        m.observe(None, t0 + 90_000);
+        assert!(m.hold(t0 + 90_000).is_some());
+        assert_eq!(m.hold(t0 + 80_000 + MACHINE_READING_MAX_AGE_MS + 1), None);
         // The plan keeps the machine's size from a stale reading.
         assert_eq!(m.plan_mem_mib(24 * GIB), 16 * GIB);
+    }
+
+    #[test]
+    fn the_swap_threshold_is_the_machine_s_own() {
+        let t0 = 10_000_000;
+        let big = |swap| MachineReading {
+            mem_mib: 64 * GIB,
+            ..reading(Some(PressureLevel::Normal), Some(swap))
+        };
+        let mut m = MachineState::default();
+        m.set_share(share(Some(16), Some(2)));
+        // 2 GiB on a 64 GiB machine is under its 3.2 GiB threshold.
+        m.observe(Some(big(10 * GIB)), t0);
+        m.observe(Some(big(12 * GIB)), t0 + 60_000);
+        assert_eq!(m.hold(t0 + 60_000), None);
+        m.observe(Some(big(14 * GIB)), t0 + 120_000);
+        assert_eq!(
+            m.hold(t0 + 120_000),
+            Some(MachineHold::Swap { rise_mib: 4 * GIB })
+        );
     }
 
     #[test]
@@ -975,8 +1108,8 @@ mod tests {
             MachineHold::Swap { rise_mib: 1_536 }.view(),
             (
                 "swap",
-                "swap grew 1.5 GiB in the last 5 minutes — nothing new starts until it has been \
-                 flat for 5"
+                "swap grew 1.5 GiB in the last 5 minutes — no more than one job runs until it has \
+                 been flat for 2"
                     .to_string()
             )
         );

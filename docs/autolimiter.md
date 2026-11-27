@@ -512,7 +512,7 @@ refreshed at every retry. Admission's gates, in the order they are checked:
 | `held` | The operator's hold, with its reason. |
 | `paused` | faber is paused — by the operator, or by the janitor for the length of a reclamation; the detail says which. |
 | `machine-pressure` | The machine itself reports memory pressure `warn` or `critical` (ADR-0021 §2c; macOS, once `[host] keep_memory_gib` is above 0). With no Docker job admitted, one is let through anyway (#160), and the detail names a Docker VM larger than the share. |
-| `swap` | The machine's swap use grew by 1 GiB within 5 minutes, and has not yet been flat for 5 (ADR-0032 §3; same condition). |
+| `swap` | The machine's swap use grew, net, by 5% of its memory (1 GiB at least) within 5 minutes, and has not yet been flat for 2, while macOS pressure is `normal` (under `warn` or `critical` the gate is `machine-pressure`) (ADR-0032 §3, ADR-0021's amendment of 2026-11-27; same condition). It keeps the same floor of one job. |
 | `docker` | Gate 0: the availability probe has missed enough times that Docker counts as down. |
 | `disk` | The disk gate: free space on the Docker volume, less what the Docker jobs still held (admitted in the last ten minutes and not yet ended) were charged and less this job's own charge (10 GiB with dind, 3 GiB without), is under `[host] disk_admission_floor_gib` (ADR-0024, ADR-0032; only when that floor is set). The detail names the job's charge. |
 | `ceiling` | The hard ceiling: *N of N Docker jobs running*. |
@@ -701,10 +701,13 @@ machine itself. Here is the short version.
   and on every re-probe, shown on the dashboard and in the tray, and worded as
   its fix, for example "set [linux_vm] memory_mib to 16384 or less". faber never
   resizes the VM.
-- **The pressure gate.** With `keep_memory_gib` above 0, nothing new starts —
-  Docker or native — while macOS reports `warn` or `critical`, or while swap use
-  has grown by 1 GiB within 5 minutes (ADR-0032 §3). It resumes at `normal`, and
-  once swap has been flat (risen less than 256 MiB) for 5 minutes. On Linux the
+- **The pressure gate.** With `keep_memory_gib` above 0, no more than one job
+  runs — Docker or native, counted together — while macOS reports `warn` or
+  `critical`, or while swap use has grown, net, by 5% of the machine's memory
+  (1 GiB at least) within 5 minutes (ADR-0032 §3, ADR-0021's amendment of
+  2026-11-27). Under `warn` or `critical` the hold is reported as pressure
+  whatever swap does. It resumes at `normal`, and once swap has been flat (risen,
+  net, less than an eighth of the growth threshold) for 2 minutes. On Linux the
   level is not gated on until thresholds are chosen from a Linux host; growing
   swap is. A reading over 2 minutes old holds nothing shut.
 - **Three states.** Absent is *unstated*: no share and no pressure gate, the
