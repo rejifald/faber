@@ -33,6 +33,8 @@ The owner set the direction and then settled the points below in a session on
 - The first caller runs its slow gates through faber and keeps its cheap ones in the
   pre-push hook. A whole gate, as a sweep runs it, is one more named check (§2, §12).
 - v1 has no token, no secrets, no LFS content, no dind and no macOS VM checks (§5).
+- On 2026-11-28: which tree a workflow compares, the pull request head's or the merge
+  result's, is the repository's choice (§10).
 
 Revised the same day after two independent checks of its statements against `31c952c`.
 The first found:
@@ -372,8 +374,8 @@ A record is **postable** only while all of these hold:
   source store and a running local job all live, and could make a check exit 0. On such
   an engine the check still runs and the caller still gets its result. The record is
   kept and shown as not posted.
-- **It is younger than `attest_ttl_hours`,** because a service version or the calendar
-  can change what the same tree does.
+- **It is younger than `attest_ttl_hours`** (24 unless set), because a service version
+  or the calendar can change what the same tree does.
 - **Its image is unchanged.** faber posts only if the image id that ran the check is
   still the id of the image it would start that check in now.
 - **`attest` is on** (§11).
@@ -418,13 +420,22 @@ what a check stands for. So the repository skips, in whichever shape fits the ch
 
 The comparison is the same in both:
 
-1. the tree id in the status equals `git rev-parse HEAD^{tree}` of what the run checked
-   out;
+1. the tree id in the status equals the tree the repository chose to compare;
 2. the status says `full`, or its base equals the base this run would use.
 
-A `pull_request` run tests the merge of the branch into its base. Its tree equals the
-checked tree only when the branch already contains the base's tip. Otherwise the trees
-differ and the work runs, which is correct: the merge result was never checked.
+**Which tree is the repository's choice** (the owner, 2026-11-28):
+
+- **The pull request head's tree.** The status then answers "were this change's own
+  files checked". The skip survives the base branch moving after the check. It says
+  nothing about the merge result, which fits a repository that verifies integration
+  somewhere else, such as a scheduled run on the integration branch.
+- **The tree the run checked out.** A `pull_request` run tests the merge of the branch
+  into its base, and that tree equals the checked tree only when the branch already
+  contains the base's tip. Otherwise the work runs, because the merge result was never
+  checked. This is the strict reading, and on a repository whose base moves often the
+  skip is rare.
+
+The status carries the tree id and the base, which is what either comparison needs.
 
 faber ships no action for this. The steps are a few lines of shell in the repo's own
 workflow, and [docs/operating.md](../operating.md) will carry an example of each shape.
@@ -448,6 +459,7 @@ attest = true             # false keeps the record and posts nothing
 attest_ttl_hours = 24
 ```
 
+- The values shown are the defaults, except `enabled`, which is off when absent.
 - A host without `[local]` is unchanged, and `faber check` there says the host does not
   offer it. This turns a feature on and tightens nothing, so AGENTS.md's three-state
   shape is not needed.
@@ -479,9 +491,9 @@ attest_ttl_hours = 24
 - **A pre-push check gets what a CI job gets:** the runner image, admission, a learned
   cap, declared services and a cache. The operator's desktop stops being where it runs.
 - **The pool pays for it.** A local job takes budget a CI job could have had. With the
-  skip of §10 working, the work is done once, earlier. Without it, on a pull request
-  whose branch is behind its base, or on an engine that has granted dind, it is done
-  twice.
+  skip of §10 working, the work is done once, earlier. It is done twice without it,
+  on an engine that has granted dind, and, where a repository compares the merge
+  result, whenever the base moved after the check.
 - **The status proves less than it seems to.** It is posted with faber's token, which is
   the operator's own identity on GitHub (ADR-0027). Anything running as the operator
   with a token of its own can post the same context. So the status says "the operator's
