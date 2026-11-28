@@ -144,7 +144,9 @@ impl Plan {
     pub fn hints(&self, runs: &[RunLine], now_ms: u64) -> Vec<Hint> {
         self.git_mirror
             .iter()
-            .filter_map(|(cause, profiles)| git_mirror_hint(cause, profiles, self.asked, runs, now_ms))
+            .filter_map(|(cause, profiles)| {
+                git_mirror_hint(cause, profiles, self.asked, runs, now_ms)
+            })
             .collect()
     }
 }
