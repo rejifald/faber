@@ -190,6 +190,28 @@ dashboard. Once the engine has granted dind, they stay off on it. If either mirr
 ran beside dind on your Mac, regenerate the token and review what it could have changed:
 [docs/git-mirror.md](git-mirror.md#not-beside-dind) has the steps.
 
+### Speed-up hints
+
+When a faster way to run jobs exists on this host and is off, the dashboard's Overview
+says so in a neutral row ([the speed-up hints ADR](adrs/0068-faber-says-when-a-faster-way-to-run-jobs-is-off.md)).
+Today there is one: the git mirror, when no Docker profile turns it on or when it is held
+off beside dind. The row says how long checkout took on this host's runs in the last
+7 days, why the mirror is not in use, whether the dind grant holding it off is still
+used, and what the way back takes. For a grant no run used in those 7 days it adds that
+denying it (`dind = false`) is not a trust widening.
+
+- **The figure is your host's own.** It comes from the step timings faber records for
+  each run. faber does not record whether a run used the mirror, so the row states what
+  checkout costs today and never what the mirror would save. With no timed checkout step
+  on record it says so.
+- **A hint changes nothing.** It stops no job, has no button, and is never sent as a
+  notification. Its fix is a config change, and where that change widens trust the row
+  says what it accepts.
+- **Dismiss it, or turn hints off.** Dismiss hides the row while its cause stays the
+  same. `[host] speed_hints = false` turns every hint off; it applies on restart.
+- **A host with nothing to gain shows none:** no Docker profile, the mirror already on,
+  or no Docker run in the last 7 days.
+
 ## Declared services instead of dind
 
 A job that only needs a database, a cache or a mail catcher doesn't need a Docker daemon.

@@ -287,10 +287,80 @@ test('the full fixture raises every dashboard alarm once, worst first', () => {
     'draining',
     'bypass',
     'refused',
+    'hint:git_mirror',
   ];
   for (const e of expected) assert.ok(k.includes(e), `missing ${e}`);
   const rank = { bad: 0, warn: 1, info: 2 };
   assert.deepEqual(list.map((a) => rank[a.sev]), list.map((a) => rank[a.sev]).sort((a, b) => a - b));
+});
+
+// --- speed-up hints (ADR faber-says-when-a-faster-way-to-run-jobs-is-off) ------------------------
+
+const hint = (cause, over) => with_({ hints: [fx.checkoutHint(cause, over)] });
+
+test('a hint is one neutral row with no action, and a host with none shows none', () => {
+  assert.deepEqual(keys(with_({})), []);
+  assert.deepEqual(keys(with_({ hints: [] })), []);
+  const list = run(hint('off'));
+  assert.deepEqual(list.map((a) => [a.key, a.sev, a.icon]), [['hint:git_mirror', 'info', 'info']]);
+  assert.equal(list[0].actions, undefined, 'the fix is a config change that widens trust: no button');
+  assert.ok(!list[0].blocking, 'it stops no job, so it carries Dismiss');
+  // A kind this dashboard does not know is not a row.
+  assert.deepEqual(keys(with_({ hints: [{ ...fx.checkoutHint('off'), kind: 'from_a_newer_daemon' }] })), []);
+});
+
+test('a hint states what checkout costs here, and never a saving', () => {
+  const t = text(run(hint('off'))[0]);
+  assert.match(t, /^Checkout could be faster — Checkout took a median of 24s on 280 runs in the last 7 days, 2h 5m in all\./);
+  assert.match(t, /no run here has used one, so faber cannot say by how much/);
+  assert.match(t, /Turning it on widens trust: each refresh puts faber’s GitHub token on the Docker engine\./, 'the row names what the fix accepts');
+  assert.match(t, /git_mirror/);
+  assert.match(t, /docs\/git-mirror\.md/);
+});
+
+test('with no timed checkout step the hint says so and states no figure', () => {
+  const t = text(run(hint('off', { runs: undefined, median_ms: undefined, total_ms: undefined }))[0]);
+  assert.match(t, /faber has no checkout timings from the last 7 days, so it cannot say what checkout costs here\./);
+  assert.doesNotMatch(t, /median/);
+});
+
+test('held beside dind, the hint says whether the grant is used and what the way back takes', () => {
+  const unused = text(run(hint('dind_granted', { profiles: ['linux-dind'], last_dind_ms: fx.NOW - 21 * 86_400_000 }))[0]);
+  assert.match(unused, /held off here: profile 'linux-dind' grants dind\. No run in the last 7 days was given a Docker daemon; the last was 21d ago\./);
+  assert.match(unused, /dind = false on every docker profile and a fresh Linux VM disk/);
+  assert.match(unused, /an operator step with risks of its own/);
+  assert.match(unused, /the last was 21d ago\. Denying the unused grant is not itself a trust widening\. The way back is/);
+  // Nothing asks for the mirror, so the way back ends in the step that does widen trust.
+  assert.match(unused, /No profile sets git_mirror yet, so the mirror stays off after those steps until git_mirror = true is set on a docker profile\. That widens trust: each refresh puts faber’s GitHub token on the Docker engine\./);
+  // A config that already asks for it has only the dind step left, which widens nothing.
+  const asked = text(run(hint('dind_granted', { profiles: ['linux-dind'], asked: true }))[0]);
+  assert.doesNotMatch(asked, /widens trust|git_mirror = true/, 'denying dind widens nothing');
+
+  const never = text(run(hint('dind_granted', { profiles: ['a', 'b'] }))[0]);
+  assert.match(never, /profiles 'a' and 'b' grant dind\. No run in the last 7 days was given a Docker daemon\. Denying the unused grant is not itself a trust widening\. The way back/);
+
+  const used = text(run(hint('dind_granted', { profiles: ['linux-dind'], dind_runs: 40 }))[0]);
+  assert.match(used, /40 of 300 runs on docker profiles in the last 7 days were given a Docker daemon\./);
+  assert.match(text(run(hint('dind_granted', { profiles: ['linux-dind'], dind_runs: 1 }))[0]), /1 of 300 runs on docker profiles in the last 7 days was given/);
+
+  const marked = text(run(hint('engine_marked'))[0]);
+  assert.match(marked, /held off here: this host’s Docker engine has granted dind\./);
+  assert.match(marked, /fresh Linux VM disk/);
+  assert.match(marked, /git_mirror = true/, 'a marked engine with no ask also names the widening');
+  assert.doesNotMatch(text(run(hint('engine_marked', { asked: true }))[0]), /git_mirror = true/);
+  // Only a grant that is still there and unused: a used one costs its jobs, and a marked engine has none left to deny.
+  for (const t of [used, marked]) assert.doesNotMatch(t, /not itself a trust widening/);
+});
+
+test('a dismissed hint stays dismissed while its figures move, and shows again when its cause changes', () => {
+  const [row] = run(hint('off'));
+  const dismissed = (s) => alarms.activeAlarms({ ...s, attention: { dismissed: [{ key: row.key, ident: attention.rowIdent(row), at_ms: 1 }] } }, NOW());
+  assert.deepEqual(dismissed(hint('off', { runs: 311, median_ms: 31_000, total_ms: 9_000_000 })).active, []);
+  assert.deepEqual(dismissed(hint('engine_marked')).active.map((a) => a.key), ['hint:git_mirror']);
+});
+
+test('the popover never shows a hint', () => {
+  assert.deepEqual(attention.daemonRows(hint('off'), NOW()).filter((r) => r.key.startsWith('hint:')), []);
 });
 
 // ADR-0064 § 3: one dismissal holds on every surface, so a row the popover and the dashboard both
@@ -512,7 +582,7 @@ test('alarms that stop jobs are blocking; the rest are dismissable', () => {
   for (const k of ['credential-opted-in-not-granted', 'missing:linux:registry.example/acme/runner:2.330.0', 'git-mirror:acme/api', 'paused', 'draining', 'hold', 'unhealthy', 'frozen', 'machine', 'frozen-disk']) {
     assert.ok(blocking.has(k), `${k} is blocking`);
   }
-  for (const k of ['gate-public', 'dind-wall', 'credential-expiring', 'retire:linux', 'peers', 'awake-error']) {
+  for (const k of ['gate-public', 'dind-wall', 'credential-expiring', 'retire:linux', 'peers', 'awake-error', 'hint:git_mirror']) {
     assert.ok(!blocking.has(k), `${k} is dismissable`);
   }
   assert.ok(run(cred({ status: 'missing', reason: 'x' }))[0].blocking);

@@ -793,6 +793,14 @@ const HOST_FIELDS: &[FieldSpec] = &[
         ),
         ..f("host.prevent_sleep", "Prevent sleep", "enum")
     },
+    FieldSpec {
+        hint: Some(
+            "Show a neutral dashboard row when a faster way to run jobs exists on this host \
+             and is off, with what the step it shortens costs here. A hint changes nothing \
+             faber does and stops no job. Needs a restart.",
+        ),
+        ..f("host.speed_hints", "Speed-up hints", "bool")
+    },
 ];
 
 const LINUX_VM_FIELDS: &[FieldSpec] = &[

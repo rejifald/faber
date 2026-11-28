@@ -339,14 +339,14 @@ export function daemonRows(s: DaemonState, now: number): AttentionRow[] {
     });
   }
   if (b.machine?.hold) {
-    // ADR-0021 § 2c: the machine's own memory, not the VM's.
+    // ADR-0021 § 2c: the machine's own memory, not the VM's. Both holds keep a floor of one job.
     const why = b.machine.hold === 'swap' ? 'swap is growing' : `memory pressure is ${b.machine.pressure || 'high'}`;
     rows.push({
       key: 'machine',
       sev: 'warn',
       icon: 'frozen',
       blocking: true,
-      parts: [{ strong: 'Machine under pressure' }, ` — ${why}; nothing new starts until it eases.`],
+      parts: [{ strong: 'Machine under pressure' }, ` — ${why}; a job starts only when none is running, until it eases.`],
     });
   }
   if (b.machine?.encroaches?.length) {

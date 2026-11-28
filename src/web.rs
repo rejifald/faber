@@ -25,6 +25,7 @@ use crate::audit::TrustChanges;
 use crate::config::{FileConfig, HardCeiling, Hold, Overrides};
 use crate::control::{Caller, Class, FrontDoor, Verdict};
 use crate::docker::{Limits, ResourceLimits};
+use crate::hints::Hints;
 use crate::limiter::{LimiterView, Pause};
 use crate::reconcile::{Drain, Notice, Orchestrator, StateView};
 use crate::settings::{FormSchema, SettingsStore, FORM_SCHEMA};
@@ -53,6 +54,10 @@ struct Web {
     /// a-warning-that-does-not-stop-jobs-can-be-dismissed, ADR-0064 §3): opaque to
     /// the daemon, stitched into every state snapshot, persisted by the store.
     attention: Arc<AttentionStore>,
+    /// Speed-up hints (ADR faber-says-when-a-faster-way-to-run-jobs-is-off):
+    /// what this boot's config leaves unused, and the figures last read for it
+    /// from the audit log.
+    hints: Arc<Hints>,
     /// The port we're serving on — read-only on the settings page, since it is a
     /// CLI flag (changing it here would cut the page off from the daemon).
     port: u16,
@@ -67,6 +72,7 @@ struct Web {
 
 /// Serve the dashboard on `127.0.0.1:<port>`, and the control API on the
 /// control socket, through `door`, until the process exits.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     orch: Arc<Orchestrator>,
     door: Arc<FrontDoor>,
@@ -75,6 +81,7 @@ pub async fn serve(
     notices: Vec<Notice>,
     trust_changes: Arc<TrustChanges>,
     attention: Arc<AttentionStore>,
+    hints: Arc<Hints>,
 ) -> anyhow::Result<()> {
     let port = door.port();
     let app = routes(Web {
@@ -84,6 +91,7 @@ pub async fn serve(
         notices: Arc::new(notices),
         trust_changes,
         attention,
+        hints,
         port,
         save_lock: Arc::default(),
         write_overrides: true,
@@ -271,6 +279,15 @@ async fn with_update(w: &Web) -> StateView {
     }
     view.trust_changes = w.trust_changes.list();
     view.attention = w.attention.view();
+    // The figures come from the whole audit log, so a state read never waits on
+    // them: it serves the last ones and, when they are due, starts the next read.
+    let now = crate::audit::now_ms();
+    if w.hints.due(now) {
+        let hints = w.hints.clone();
+        let audit = w.orch.audit_log().clone();
+        tokio::task::spawn_blocking(move || hints.refresh(&audit, now));
+    }
+    view.hints = w.hints.view();
     view.cli_copy = crate::upgrade_cli::cli_copy_view().await;
     view
 }
@@ -1869,6 +1886,7 @@ mod tests {
             notices: Arc::new(Vec::new()),
             trust_changes: Arc::new(TrustChanges::new(Arc::new(crate::audit::now_ms))),
             attention: Arc::new(AttentionStore::in_memory()),
+            hints: Arc::new(Hints::none()),
             port: 0,
             save_lock: Arc::default(),
             write_overrides: false,
@@ -1890,6 +1908,54 @@ mod tests {
         assert_eq!(notices[0].kind, "linux_vm_waiting");
         web.orch.limiter().set_linux_vm_waiting(None);
         assert!(with_update(&web).await.notices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hints_are_served_from_the_last_read_of_the_audit_log() {
+        // A host with nothing to gain serves none, and reads nothing.
+        let (mut web, _tmp) = test_web();
+        assert!(with_update(&web).await.hints.is_empty());
+
+        // A docker host whose config leaves the git mirror off.
+        let cfg = FileConfig::load_from_str(
+            "[[profile]]\nname = \"linux\"\nlabels = [\"faber\"]\nbackend = \"docker\"\n\
+             image = \"faber-runner:local\"\ndind = false\n",
+            "test",
+        )
+        .unwrap();
+        let plan = crate::hints::Plan::of(&cfg, &crate::mirror_beside_dind::decide(&cfg, false));
+        web.hints = Arc::new(Hints::new(plan));
+        let line = serde_json::json!({
+            "ts_ms": crate::audit::now_ms(),
+            "kind": "outcome",
+            "repo": "owner/demo",
+            "dind": "denied",
+            "steps": [{"name": "Run actions/checkout@v4", "bucket": "setup",
+                       "started_ms": 1_000, "completed_ms": 21_000}],
+        });
+        let path = web.orch.audit_log().path().to_path_buf();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        // A state read never waits on the file: it starts the read and serves
+        // the figures once they are in.
+        let mut hints = Vec::new();
+        for _ in 0..500 {
+            hints = with_update(&web).await.hints;
+            if !hints.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let json = serde_json::to_value(&hints).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "kind": "git_mirror", "cause": "off", "asked": false, "window_days": 7,
+                "docker_runs": 1, "dind_runs": 0,
+                "runs": 1, "median_ms": 20_000, "total_ms": 20_000,
+            }])
+        );
     }
 
     #[tokio::test]

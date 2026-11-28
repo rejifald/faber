@@ -632,8 +632,37 @@ export interface DaemonState {
   awake?: AwakeView;
   credential?: CredentialView;
   git_mirrors?: GitMirror[];
+  /** Speed-up hints (ADR faber-says-when-a-faster-way-to-run-jobs-is-off): faster ways to run jobs that this host leaves off. Empty with nothing to gain; absent from an older daemon. */
+  hints?: SpeedHint[];
   /** The operator's dismissals and trust acknowledgement (ADR-0064). Absent from an older daemon. */
   attention?: AttentionState;
+}
+
+/**
+ * One speed-up hint (ADR faber-says-when-a-faster-way-to-run-jobs-is-off): a capability faber has that this host leaves off, and what the
+ * step it shortens costs here. Every figure is this host's own, over `window_days`; with no timed
+ * step on record `runs`, `median_ms` and `total_ms` are absent and the row says so.
+ */
+export interface SpeedHint {
+  /** The capability: `git_mirror` (ADR-0035). */
+  kind: string;
+  /** Why it is not in use: no profile asks for it, or it is held off beside dind. */
+  cause: 'off' | 'dind_granted' | 'engine_marked';
+  /** The docker profiles that grant dind, for `dind_granted`. */
+  profiles?: string[];
+  /** Whether a docker profile already sets `git_mirror`; absent from an older daemon. */
+  asked?: boolean;
+  window_days: number;
+  /** Docker runs in the window, and how many of them were handed a Docker daemon. */
+  docker_runs: number;
+  dind_runs: number;
+  /** When the last run handed a Docker daemon finished; absent when none is on record. */
+  last_dind_ms?: number;
+  /** Runs in the window with a timed step of the kind the capability shortens. */
+  runs?: number;
+  /** The median time in such steps per run, and the sum over the window. */
+  median_ms?: number;
+  total_ms?: number;
 }
 
 /** One dismissed attention row (ADR-0064 § 2): its key and the identity it had when dismissed. */
