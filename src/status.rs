@@ -646,6 +646,7 @@ mod tests {
             repo: "o/r".to_string(),
             job_id: 1,
             run_id: None,
+            run_attempt: None,
             event: None,
             dind: None,
             actor: None,

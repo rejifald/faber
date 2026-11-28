@@ -832,11 +832,34 @@ struct Metrics {
     /// or not: the per-repository count the dashboard and the boot warning
     /// show (ADR-0059 §4). Seeded from the audit log.
     refusals_at_start: VecDeque<(u64, String)>,
-    /// When each hook fault of the last week was recorded (ADR-0059 §2):
-    /// the source of the 7-day count. Seeded from the audit log.
-    hook_faults: VecDeque<u64>,
+    /// The hook faults of the last week (ADR-0059 §2), by the repository and
+    /// runner each is on. The record-once dedup, and the source of the 7-day
+    /// count. Seeded from the audit log at boot, and bounded by
+    /// [`BYPASS_WINDOW`].
+    hook_faults: HashMap<(String, String), HookFaultSeen>,
     /// Recent hook faults, newest last. Bounded by [`BYPASS_RECENT_CAP`].
     recent_hook_faults: VecDeque<JobStartView>,
+}
+
+/// What is on record of one runner's hook fault (ADR-0059 §2).
+#[derive(Debug)]
+struct HookFaultSeen {
+    /// When it was first recorded: what the 7-day count goes by.
+    first_ms: u64,
+    /// Every audit `action` written for it so far.
+    actions: Vec<String>,
+}
+
+/// What [`Metrics::note_hook_fault`] made of one report of a hook fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookFaultNote {
+    /// The runner's first: a fault to count and to write down.
+    First,
+    /// A fault already counted, and something faber had not yet said it did
+    /// about it: a line to write, and nothing to count.
+    NewAction,
+    /// Already written down as this: nothing to add.
+    Known,
 }
 
 /// The provision-throttle verdict for one job this cycle (bug-002).
@@ -1243,12 +1266,72 @@ impl Metrics {
         out
     }
 
-    /// Hook faults recorded within [`BYPASS_WINDOW`] of `now`.
+    /// Record-once gate for a hook fault (ADR-0059 §2). A fault is one runner's
+    /// job running with no hook waiting, and a JIT runner takes one job, so it
+    /// is one fault for `runner` on `repo` however often it is reported: by
+    /// every cycle of bypass detection that still sees the job, and by the
+    /// watch the next process begins on the runner after a restart.
+    ///
+    /// `action` is what faber did about it this time, and each is written
+    /// once. A fault only recorded on a host that records, then stopped by a
+    /// later process that enforces, leaves both lines and counts once. Entries
+    /// older than [`BYPASS_WINDOW`] are dropped on the way.
+    fn note_hook_fault(
+        &mut self,
+        repo: &str,
+        runner: &str,
+        action: &str,
+        now: u64,
+    ) -> HookFaultNote {
+        let window = BYPASS_WINDOW.as_millis() as u64;
+        self.hook_faults
+            .retain(|_, f| now.saturating_sub(f.first_ms) <= window);
+        match self
+            .hook_faults
+            .entry((repo.to_string(), runner.to_string()))
+        {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(HookFaultSeen {
+                    first_ms: now,
+                    actions: vec![action.to_string()],
+                });
+                HookFaultNote::First
+            }
+            std::collections::hash_map::Entry::Occupied(mut seen) => {
+                let actions = &mut seen.get_mut().actions;
+                if actions.iter().any(|a| a == action) {
+                    HookFaultNote::Known
+                } else {
+                    actions.push(action.to_string());
+                    HookFaultNote::NewAction
+                }
+            }
+        }
+    }
+
+    /// Read the week's hook faults back from audit `entries`, as a boot does:
+    /// the 7-day count, and the record-once gate, so the process that adopts
+    /// a runner does not record again a fault the log already holds.
+    fn restore_hook_faults(&mut self, entries: &[crate::audit::Entry]) {
+        for e in replayed_scope(entries, "hook_fault") {
+            // Every line faber writes names the runner. One that does not can
+            // be matched to none, so it stays a fault of its own.
+            let runner = e
+                .runner
+                .clone()
+                .unwrap_or_else(|| format!("unnamed, at {}", e.ts_ms));
+            let action = e.action.as_deref().unwrap_or_default();
+            self.note_hook_fault(&e.repo, &runner, action, e.ts_ms);
+        }
+    }
+
+    /// Hook faults first recorded within [`BYPASS_WINDOW`] of `now`: one for
+    /// each runner.
     fn hook_faults_since(&self, now: u64) -> usize {
         let window = BYPASS_WINDOW.as_millis() as u64;
         self.hook_faults
-            .iter()
-            .filter(|ts| now.saturating_sub(**ts) <= window)
+            .values()
+            .filter(|f| now.saturating_sub(f.first_ms) <= window)
             .count()
     }
 
@@ -2161,9 +2244,7 @@ impl Orchestrator {
         if let Some(msg) = refused_at_start_note(&metrics.refusals_at_start_since(now_ms())) {
             warn!("{msg}");
         }
-        for (_, ts) in replayed_scope(&week, "hook_fault") {
-            metrics.hook_faults.push_back(ts);
-        }
+        metrics.restore_hook_faults(&week);
         if let Some(msg) = hook_fault_warning(metrics.hook_faults_since(now_ms())) {
             warn!("{msg}");
         }
@@ -2544,7 +2625,11 @@ impl Orchestrator {
             .min()
             .unwrap_or(0)
             .saturating_sub(MINT_RECORD_SLACK_MS);
-        let records = mint_records(&self.audit.read_since(since));
+        let entries = self.audit.read_since(since);
+        let records = mint_records(&entries);
+        // ADR-0059 §2: which of them faber's own records say are already past
+        // their job-started hook. Written after the mint, so in the same window.
+        let passed = passed_hooks(&entries);
         let mut adopted = 0usize;
         for a in scan.adoptable {
             let Some(profile_idx) = self.cfg.profiles.iter().position(|p| p.name == a.profile)
@@ -2678,14 +2763,28 @@ impl Orchestrator {
             self.note_minted(&a.registration(), a.job_id, profile_idx);
             // ADR-0059 §2: a runner adopted after a restart gets its verdict. One
             // started before the hook existed has none, and is left to detection.
+            // One whose job got past its hook before the restart has no hook
+            // waiting either, and only faber's own record of that tells it from
+            // a job whose hook never ran: the watch is given the record, and
+            // judges the job again.
             if let Some(outcome) = a.hook {
-                self.watch_job_start(crate::job_start::Watch::new(
+                let passed = passed.get(&(a.repo.clone(), a.registration())).copied();
+                if let Some(p) = passed {
+                    info!(
+                        "adopt: {}'s job was past its job-started hook before this start ({}) — \
+                         judging it again",
+                        a.runner(),
+                        p.word()
+                    );
+                }
+                self.watch_job_start(crate::job_start::Watch::adopted(
                     &a.repo,
                     &a.registration(),
                     a.job_id,
                     a.run_id,
                     profile_idx,
                     outcome,
+                    passed,
                 ));
             }
             spawn(self.clone(), a, minted, profile_idx, guard);
@@ -5891,6 +5990,31 @@ fn mint_records(entries: &[crate::audit::Entry]) -> HashSet<(String, String)> {
         .iter()
         .filter(|e| e.kind == crate::audit::MINT)
         .filter_map(|e| Some((e.repo.clone(), e.runner.clone()?)))
+        .collect()
+}
+
+/// How the job on each runner got past its job-started hook, by `(repo, runner
+/// name)`, from the `job_start` lines in `entries` (ADR-0059 §2): what a watch
+/// begun on an adopted runner is told ([`crate::job_start::Watch::adopted`]).
+///
+/// The line is faber's own, written by the process that saw the hook waiting,
+/// and it is matched as a `mint` line is: on the repo and the name together, so
+/// a container claiming another repo, or named after a runner nobody recorded,
+/// matches nothing and is watched as one whose hook was never seen. It is as
+/// trustworthy as the audit log it is read from: see [`mint_records`]. A line
+/// that does not read as a record is left out, and a runner takes one job, so
+/// its last line is the one that stands.
+fn passed_hooks(
+    entries: &[crate::audit::Entry],
+) -> HashMap<(String, String), crate::job_start::Passed> {
+    entries
+        .iter()
+        .filter(|e| e.kind == crate::audit::JOB_START)
+        .filter_map(|e| {
+            let passed =
+                crate::job_start::Passed::read(e.action.as_deref()?, e.run_id.zip(e.run_attempt))?;
+            Some(((e.repo.clone(), e.runner.clone()?), passed))
+        })
         .collect()
 }
 
@@ -9364,7 +9488,7 @@ impl Orchestrator {
 
     /// Do one thing [`crate::job_start::Watch::step`] decided.
     async fn job_start_act(&self, runner: &str, act: crate::job_start::Act) {
-        use crate::job_start::{Act, StartDecision};
+        use crate::job_start::{Act, Passed};
         let Some(w) = self.job_start_watch(runner) else {
             return;
         };
@@ -9402,19 +9526,8 @@ impl Orchestrator {
                 }
             },
             Act::Deliver(d) => {
-                if let Err(e) = crate::docker::deliver_verdict(runner, d.archive()).await {
-                    warn!(
-                        "{}: delivering the verdict to runner {runner}: {e:#}",
-                        w.repo
-                    );
-                    // A refusal is enforced by the kill that follows it. An allow
-                    // that did not land is tried again while the hook waits.
-                    if d.decision == StartDecision::Allow {
-                        if let Some(w) = self.job_starts.lock().unwrap().get_mut(runner) {
-                            w.redeliver();
-                        }
-                    }
-                }
+                let landed = crate::docker::deliver_verdict(runner, d.archive()).await;
+                self.delivery_done(&w, &d, landed).await;
             }
             Act::Kill => match crate::docker::force_kill_runner(runner).await {
                 Ok(()) => {
@@ -9449,6 +9562,44 @@ impl Orchestrator {
                 )
                 .await;
             }
+            Act::RanUnverified => self.record_passed_hook(&w, Passed::Unverified).await,
+            Act::Stands(passed) => {
+                // Loud, and in the audit log: a job runs on here on a verdict
+                // from before the restart, because faber could not ask again.
+                let stands = match passed {
+                    Passed::Allowed {
+                        run_id,
+                        run_attempt,
+                        ..
+                    } => format!(
+                        "the allow faber delivered before the restart (run {run_id}, attempt \
+                         {run_attempt}) stands"
+                    ),
+                    Passed::Unverified => {
+                        "its hook let it run unverified before the restart, and that stands"
+                            .to_string()
+                    }
+                };
+                let why = w
+                    .last_miss()
+                    .map_or_else(String::new, |m| format!(" ({})", m.words()));
+                warn!(
+                    "{}: runner {}'s job was past its hook before this start and could not be \
+                     judged again by the search deadline{why} — {stands} (ADR-0059 §2)",
+                    w.repo, w.runner
+                );
+                self.record_fault(
+                    &w.repo,
+                    "job_start",
+                    "not_judged_again",
+                    Some(format!(
+                        "runner {} (minted for job {}): not judged again by the search deadline \
+                         after a restart{why}; {stands}",
+                        w.runner, w.minted_for
+                    )),
+                )
+                .await;
+            }
             Act::HookFault { stop, why } => {
                 let judged = w.judged().cloned();
                 if stop {
@@ -9460,23 +9611,102 @@ impl Orchestrator {
                         self.metrics.lock().await.note_killed(j.job_id, now_ms());
                     }
                 }
-                let view = self.job_start_view(&w, why);
-                self.metrics.lock().await.recent_hook_faults.push_back(view);
-                self.record_hook_fault_line(
-                    &w.repo,
-                    &w.runner,
-                    judged.as_ref().map(|j| j.job_id),
-                    judged.as_ref().map(|j| j.run_id),
-                    if stop { "stopped" } else { "recorded" },
-                    format!(
-                        "runner {} (minted for job {}): {why}{}",
-                        w.runner,
-                        w.minted_for,
-                        if stop { "; faber stopped it" } else { "" }
-                    ),
-                )
-                .await;
+                let written = self
+                    .record_hook_fault_line(
+                        &w.repo,
+                        &w.runner,
+                        judged.as_ref().map(|j| j.job_id),
+                        judged.as_ref().map(|j| j.run_id),
+                        if stop { "stopped" } else { "recorded" },
+                        format!(
+                            "runner {} (minted for job {}): {why}{}",
+                            w.runner,
+                            w.minted_for,
+                            if stop { "; faber stopped it" } else { "" }
+                        ),
+                    )
+                    .await;
+                // Shown where it was written: a fault the log already holds,
+                // seen again by the watch a restart began, is not news.
+                if written {
+                    let view = self.job_start_view(&w, why);
+                    let mut m = self.metrics.lock().await;
+                    m.recent_hook_faults.push_back(view);
+                    while m.recent_hook_faults.len() > BYPASS_RECENT_CAP {
+                        m.recent_hook_faults.pop_front();
+                    }
+                }
             }
+        }
+    }
+
+    /// What follows the delivery of verdict `d` to `w`'s runner, by whether it
+    /// `landed`.
+    ///
+    /// An allow that landed let the job past its hook, and that is written
+    /// down ([`Self::record_passed_hook`]). A refusal is enforced by the kill
+    /// that follows it, landed or not. An allow that did not land is tried
+    /// again while the hook waits, and nothing is written for it.
+    async fn delivery_done(
+        &self,
+        w: &crate::job_start::Watch,
+        d: &crate::job_start::Delivery,
+        landed: anyhow::Result<()>,
+    ) {
+        match landed {
+            Ok(()) => {
+                if let Some(passed) = w.passed_by(d) {
+                    self.record_passed_hook(w, passed).await;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "{}: delivering the verdict to runner {}: {e:#}",
+                    w.repo, w.runner
+                );
+                if d.decision == crate::job_start::StartDecision::Allow {
+                    if let Some(w) = self.job_starts.lock().unwrap().get_mut(&w.runner) {
+                        w.redeliver();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write down that the job on `w`'s runner got past its job-started hook,
+    /// and how (ADR-0059 §2): one `job_start` line in the audit log.
+    ///
+    /// The watch that saw it ends here and does not outlive this process. A
+    /// restart adopts the runner mid-job (ADR-0011) and finds its worker
+    /// running with no hook waiting, which is also all it could see of a job
+    /// whose hook never ran. This line is what [`Self::adopt_scan`] gives the
+    /// new watch to tell the two apart ([`passed_hooks`]).
+    async fn record_passed_hook(
+        &self,
+        w: &crate::job_start::Watch,
+        passed: crate::job_start::Passed,
+    ) {
+        let j = w.judged();
+        let rec = Record {
+            label: j.map(|j| job_label(&w.repo, Some(&j.workflow), &j.job_name)),
+            ..Record::job_start(
+                &w.repo,
+                j.map_or(0, |j| j.job_id),
+                &w.runner,
+                passed.word(),
+                passed.run(),
+                j.map(|j| j.verdict.clone()),
+            )
+        };
+        if let Err(e) = self.audit.append(&rec).await {
+            warn!(
+                "{}: the record that runner {}'s job got past its hook ({}) was not written: \
+                 {e} — a restart before that job ends will find it in progress with no waiting \
+                 hook, and no record of why",
+                w.repo,
+                w.runner,
+                passed.word()
+            );
         }
     }
 
@@ -9524,6 +9754,7 @@ impl Orchestrator {
             workflow: run.name.clone().unwrap_or_default(),
             verdict: verdict_str(&verdict),
             decision: crate::job_start::start_decision(&verdict, self.on_bypass()),
+            record_only: crate::job_start::allowed_only_under_record(&verdict, self.on_bypass()),
         })
     }
 
@@ -9688,6 +9919,11 @@ impl Orchestrator {
     /// One `hook_fault` line on the faults feed and in the audit log, and the
     /// 7-day count (ADR-0059 §2): a job in progress with no waiting hook. Loud
     /// wherever a bypass is.
+    ///
+    /// Once for a runner, whoever reports it and however often
+    /// ([`Metrics::note_hook_fault`]): the fault is counted once, and a line
+    /// is written once for each `action` faber took over it. Returns whether
+    /// this report was written.
     async fn record_hook_fault_line(
         &self,
         repo: &str,
@@ -9696,15 +9932,13 @@ impl Orchestrator {
         run_id: Option<u64>,
         action: &str,
         cause: String,
-    ) {
+    ) -> bool {
         let now = now_ms();
         let count = {
             let mut m = self.metrics.lock().await;
-            let window = BYPASS_WINDOW.as_millis() as u64;
-            m.hook_faults.retain(|ts| now.saturating_sub(*ts) <= window);
-            m.hook_faults.push_back(now);
-            while m.recent_hook_faults.len() > BYPASS_RECENT_CAP {
-                m.recent_hook_faults.pop_front();
+            if m.note_hook_fault(repo, runner, action, now) == HookFaultNote::Known {
+                debug!("{repo}: hook fault on runner {runner} is on record already ({action})");
+                return false;
             }
             m.recent_faults.push_back(FaultEvent {
                 ts_ms: now,
@@ -9731,6 +9965,7 @@ impl Orchestrator {
         if let Err(e) = self.audit.append(&rec).await {
             warn!("audit append failed: {e}");
         }
+        true
     }
 
     /// Try again every bypass kill that failed (ADR-0059 §4: faber retries until
@@ -10203,13 +10438,14 @@ fn refused_at_start_note(per_repo: &BTreeMap<String, usize>) -> Option<String> {
     })
 }
 
-/// The `(job_id, ts_ms)` of each audit fault line of `scope` in `entries`.
-fn replayed_scope(entries: &[crate::audit::Entry], scope: &str) -> Vec<(u64, u64)> {
+/// The audit fault lines of `scope` in `entries`, in the order they hold them.
+fn replayed_scope<'a>(
+    entries: &'a [crate::audit::Entry],
+    scope: &'a str,
+) -> impl Iterator<Item = &'a crate::audit::Entry> {
     entries
         .iter()
-        .filter(|e| e.kind == "fault" && e.result.as_deref() == Some(scope))
-        .map(|e| (e.job_id, e.ts_ms))
-        .collect()
+        .filter(move |e| e.kind == "fault" && e.result.as_deref() == Some(scope))
 }
 
 /// What enforcement does about one bypass (ADR-0030). Everything or nothing:
@@ -17228,6 +17464,7 @@ pub(crate) mod tests {
             .expect("the wide search finds it");
         assert_eq!((judged.job_id, judged.run_id), (7, 70));
         assert_eq!(judged.decision, StartDecision::Allow);
+        assert!(!judged.record_only, "the gate admits it in either mode");
 
         let seen = seen.lock().unwrap();
         assert!(
@@ -17475,6 +17712,7 @@ pub(crate) mod tests {
             workflow: "CI".into(),
             verdict: "refuse:actor:dependabot[bot]".into(),
             decision: StartDecision::Refuse(Reason::Actor),
+            record_only: false,
         });
         orch.record_refused_at_start(&w, Reason::Actor).await;
 
@@ -17504,11 +17742,11 @@ pub(crate) mod tests {
         assert_eq!(lines[0]["job_id"], 7);
         assert_eq!(lines[0]["runner"], "faber-5-100");
         // A restart reads it back.
-        let replayed = replayed_scope(&orch.audit.read_since(0), "refused_at_start");
-        assert_eq!(
-            replayed.iter().map(|(j, _)| *j).collect::<Vec<_>>(),
-            vec![7]
-        );
+        let week = orch.audit.read_since(0);
+        let replayed: Vec<u64> = replayed_scope(&week, "refused_at_start")
+            .map(|e| e.job_id)
+            .collect();
+        assert_eq!(replayed, vec![7]);
 
         // A step after the hook's started: a bypass after all, and a hook fault.
         runs[0].1[0].steps = hook_steps(true);
@@ -17546,6 +17784,792 @@ pub(crate) mod tests {
         orch.detect_bypasses("owner/demo", &runs, &Codes::new())
             .await;
         assert!(orch.was_bypass(7).await);
+    }
+
+    /// [`adopted`], with the label a runner started with a job-started hook
+    /// carries (ADR-0059 §1).
+    fn adopted_with_hook(container: &str, repo: &str) -> crate::docker::Adopted {
+        let line = serde_json::json!({
+            "Name": container,
+            "Running": true,
+            "StartedAt": "2026-08-28T10:00:00Z",
+            "Memory": 1073741824i64,
+            "NanoCpus": 0,
+            "Image": "ghcr.io/owner/my-runner:latest",
+            "Labels": {
+                "org.faber.repo": repo,
+                "org.faber.run-id": "900",
+                "org.faber.provision-attempt": "1",
+                "org.faber.profile": "linux-docker",
+                "org.faber.class": format!("{repo}::900::build"),
+                "org.faber.reserved-mib": "1024",
+                "org.faber.serves": "",
+                "org.faber.hook": "refuse",
+            }
+        });
+        crate::docker::parse_adopted(&line.to_string()).expect("adoptable")
+    }
+
+    /// The job on `faber-<job_id>-…`, in run 900, as the job-start check
+    /// judges it: allowed.
+    fn allowed_job(job_id: u64) -> crate::job_start::Judged {
+        crate::job_start::Judged {
+            job_id,
+            run_id: 900,
+            run_attempt: 1,
+            job_name: "build".into(),
+            workflow: "CI".into(),
+            verdict: "provision".into(),
+            decision: crate::job_start::StartDecision::Allow,
+            record_only: false,
+        }
+    }
+
+    /// Every act an adopted runner's watch asks for while its job is in
+    /// mid-run, with the worker running and no hook waiting, from its first
+    /// pass until after the search deadline. Its first search finds `judged`,
+    /// or with `None` no search finds anything.
+    fn acts_mid_run(
+        orch: &Orchestrator,
+        runner: &str,
+        judged: Option<crate::job_start::Judged>,
+    ) -> (Vec<crate::job_start::Act>, crate::job_start::Watch) {
+        use crate::job_start::{Seen, Top};
+        let mut w = orch
+            .job_start_watch(runner)
+            .expect("an adopted runner with a hook is watched");
+        let d = orch.cfg.job_start;
+        let search = d.search.as_millis() as u64;
+        let mid_run = Seen::Running(Top {
+            worker: true,
+            hook_waiting: false,
+        });
+        let mut acts = w.step(0, mid_run, &d, orch.on_bypass());
+        if let Some(judged) = judged {
+            w.judge(judged);
+        }
+        for now in [2_000, search, search + 2_000] {
+            acts.extend(w.step(now, mid_run, &d, orch.on_bypass()));
+        }
+        (acts, w)
+    }
+
+    /// A restart, as far as the job-start check sees one. Before it, the
+    /// process that minted `faber-7-1000` sees its hook waiting, judges the job
+    /// it took and delivers the allow, which lands. After it, a new process has
+    /// only the log the first one wrote and the containers it left running:
+    /// that runner, and `faber-8-2000`, whose hook nothing recorded. Both are
+    /// adopted. Returns the new process and its log.
+    async fn restarted_past_a_delivered_allow() -> (Arc<Orchestrator>, TempDir) {
+        use crate::job_start::{Act, DeadlineOutcome, Seen, Top, Watch};
+        let (before, log) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        let d = before.cfg.job_start;
+        let waiting = Seen::Running(Top {
+            worker: true,
+            hook_waiting: true,
+        });
+        let mut w = Watch::new(
+            "owner/demo",
+            "faber-7-1000",
+            7,
+            900,
+            0,
+            DeadlineOutcome::Refuse,
+        );
+        w.step(0, waiting, &d, OnBypass::Enforce);
+        w.judge(allowed_job(7));
+        let acts = w.step(2_000, waiting, &d, OnBypass::Enforce);
+        let [Act::Deliver(delivery)] = acts.as_slice() else {
+            panic!("an allow is delivered to the waiting hook: {acts:?}");
+        };
+        before.delivery_done(&w, delivery, Ok(())).await;
+
+        let (after, log_after) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        std::fs::copy(
+            log.path.join("audit.jsonl"),
+            log_after.path.join("audit.jsonl"),
+        )
+        .expect("the log the first process wrote");
+        let scan = crate::docker::Scan {
+            adoptable: vec![
+                adopted_with_hook("/faber-runner-7-1000", "owner/demo"),
+                adopted_with_hook("/faber-runner-8-2000", "owner/demo"),
+            ],
+            opaque: Vec::new(),
+        };
+        assert_eq!(after.adopt_scan(scan, |_, _, _, _, _| {}).await, 2);
+        (after, log_after)
+    }
+
+    /// The fault a job in progress whose hook never ran gets under `enforce`.
+    const STOPPED_FOR_NO_HOOK: crate::job_start::Act = crate::job_start::Act::HookFault {
+        stop: true,
+        why: "no job-started hook was seen waiting",
+    };
+
+    /// ADR-0059 §2 across a restart (ADR-0011): a job that got past its hook
+    /// before the restart is in mid-run when the next process adopts its
+    /// runner. Its worker is running and no hook is waiting, because the hook
+    /// already let it through. Under `enforce` that job used to be stopped as
+    /// a hook fault once the search deadline passed.
+    ///
+    /// It is told from a job whose hook never ran by faber's own record of the
+    /// allow it delivered, and by nothing else: the second runner here is in
+    /// the same state with no such record, and is still a hook fault.
+    #[tokio::test]
+    async fn an_adopted_job_already_past_its_hook_is_not_a_hook_fault() {
+        use crate::job_start::{Act, Passed};
+        let (after, _log) = restarted_past_a_delivered_allow().await;
+
+        let (acts, w) = acts_mid_run(&after, "faber-7-1000", Some(allowed_job(7)));
+        assert_eq!(
+            w.passed(),
+            Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1,
+                record_only: false
+            })
+        );
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Act::HookFault { .. } | Act::Kill)),
+            "a job its hook let through before the restart was stopped: {acts:?}"
+        );
+        assert!(w.ended(), "and there is nothing left to watch");
+
+        // The control: nothing recorded that this runner's hook ever ran.
+        let (acts, w) = acts_mid_run(&after, "faber-8-2000", Some(allowed_job(8)));
+        assert_eq!(w.passed(), None);
+        assert!(
+            acts.contains(&STOPPED_FOR_NO_HOOK) && acts.contains(&Act::Kill),
+            "a job in progress whose hook never ran is still stopped: {acts:?}"
+        );
+    }
+
+    /// The same restart while GitHub does not answer: the new process cannot
+    /// judge the job again by the search deadline. Under `enforce` that job
+    /// too used to be stopped as a hook fault, though faber's own log showed
+    /// the allow it had delivered. The recorded allow stands, the job runs on,
+    /// and faber says so on the faults feed and in the audit log. A runner
+    /// with no record is stopped, as before.
+    #[tokio::test]
+    async fn an_adopted_job_faber_cannot_judge_again_runs_on_its_recorded_allow() {
+        use crate::job_start::{Act, Miss, Passed};
+        let (after, log) = restarted_past_a_delivered_allow().await;
+        for runner in ["faber-7-1000", "faber-8-2000"] {
+            after
+                .job_starts
+                .lock()
+                .unwrap()
+                .get_mut(runner)
+                .expect("adopted and watched")
+                .missed(Miss::Github("timed out".to_string()));
+        }
+
+        let stands = Passed::Allowed {
+            run_id: 900,
+            run_attempt: 1,
+            record_only: false,
+        };
+        let (acts, w) = acts_mid_run(&after, "faber-7-1000", None);
+        assert_eq!(acts.last(), Some(&Act::Stands(stands)), "{acts:?}");
+        assert!(
+            !acts
+                .iter()
+                .any(|a| matches!(a, Act::HookFault { .. } | Act::Kill | Act::Unverified)),
+            "a job faber's own log says it allowed was faulted: {acts:?}"
+        );
+        assert!(w.ended(), "and there is nothing left to watch");
+
+        // Said aloud: the job runs on a verdict from before the restart.
+        after
+            .job_start_act("faber-7-1000", Act::Stands(stands))
+            .await;
+        let said: Vec<_> = audit_lines(&log)
+            .into_iter()
+            .filter(|l| l["kind"] == "fault" && l["result"] == "job_start")
+            .collect();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(said[0]["action"], "not_judged_again");
+        let cause = said[0]["cause"].as_str().expect("a cause");
+        for part in [
+            "runner faber-7-1000",
+            "not judged again by the search deadline after a restart",
+            "GitHub did not answer: timed out",
+            "run 900, attempt 1",
+            "stands",
+        ] {
+            assert!(cause.contains(part), "{part:?} missing from: {cause}");
+        }
+        let view = after.view().await;
+        assert!(
+            view.faults
+                .iter()
+                .any(|f| f.scope == "job_start" && f.action == "not_judged_again"),
+            "{:?}",
+            view.faults
+        );
+
+        // The control: with nothing recorded, no verdict is no verdict.
+        let (acts, _) = acts_mid_run(&after, "faber-8-2000", None);
+        assert!(
+            acts.contains(&STOPPED_FOR_NO_HOOK) && acts.contains(&Act::Kill),
+            "a job in progress whose hook never ran is still stopped: {acts:?}"
+        );
+    }
+
+    /// The judgement says whether its allow is one only `record` gives
+    /// (ADR-0059 §5). A trust refusal, here a denied actor, is allowed at
+    /// start on a host that records and refused on one that enforces, and
+    /// only the first is marked.
+    #[tokio::test]
+    async fn a_trust_refusal_let_through_under_record_is_marked_as_such() {
+        use crate::job_start::{DeadlineOutcome, Reason, StartDecision, Watch};
+        for (mode, decision, record_only) in [
+            (OnBypass::Record, StartDecision::Allow, true),
+            (
+                OnBypass::Enforce,
+                StartDecision::Refuse(Reason::Actor),
+                false,
+            ),
+        ] {
+            let (base, _seen) = spawn_routed_api(|request| {
+                if request.contains("/actions/runs/50/jobs") {
+                    (
+                        "200 OK",
+                        r#"{"jobs":[{"id":7,"name":"build","status":"in_progress","runner_name":"faber-5-100","labels":["faber","docker"]}]}"#,
+                    )
+                } else if request.contains("/actions/runs/50") {
+                    (
+                        "200 OK",
+                        r#"{"id":50,"event":"push","name":"CI","status":"in_progress","head_branch":"main","actor":{"login":"dependabot[bot]"},"triggering_actor":{"login":"dependabot[bot]"},"repository":{"full_name":"owner/demo","private":true}}"#,
+                    )
+                } else {
+                    ("404 Not Found", r#"{"message":"stand-in"}"#)
+                }
+            })
+            .await;
+            let (orch, _tmp) = test_orch_on(bypass_profiles(mode), Github::at(base));
+            let w = Watch::new(
+                "owner/demo",
+                "faber-5-100",
+                5,
+                50,
+                0,
+                DeadlineOutcome::Refuse,
+            );
+            let judged = orch
+                .judge_started_job(&w, false)
+                .await
+                .expect("the job is in the run its runner was minted for");
+            assert_eq!(judged.verdict, "refuse:actor:dependabot[bot]", "{mode:?}");
+            assert_eq!(
+                (judged.decision, judged.record_only),
+                (decision, record_only),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// What is written when a job gets past its hook, and when nothing is. An
+    /// allow that landed and a hook that left at its deadline each leave one
+    /// `job_start` line. An allow that did not land leaves none, and is tried
+    /// again; a refusal lets nothing past.
+    #[tokio::test]
+    async fn a_job_past_its_hook_is_written_down_once_it_is() {
+        use crate::job_start::{
+            Act, DeadlineOutcome, Delivery, Passed, Reason, Seen, StartDecision, Top, Watch,
+        };
+        let (orch, tmp) = test_orch_with(profiles());
+        let lines = |tmp: &TempDir| -> Vec<serde_json::Value> {
+            audit_lines(tmp)
+                .into_iter()
+                .filter(|l| l["kind"] == "job_start")
+                .collect()
+        };
+        let d = orch.cfg.job_start;
+        let waiting = Seen::Running(Top {
+            worker: true,
+            hook_waiting: true,
+        });
+        let mut w = Watch::new(
+            "owner/demo",
+            "faber-7-1000",
+            7,
+            900,
+            0,
+            DeadlineOutcome::Allow,
+        );
+        w.step(0, waiting, &d, OnBypass::Record);
+        w.judge(allowed_job(7));
+        let acts = w.step(2_000, waiting, &d, OnBypass::Record);
+        let [Act::Deliver(allow)] = acts.as_slice() else {
+            panic!("an allow is delivered to the waiting hook: {acts:?}");
+        };
+        assert!(w.ended(), "the watch counts the allow as delivered");
+        orch.watch_job_start(w.clone());
+
+        // Not landed: nothing is written, and the allow is owed again.
+        orch.delivery_done(&w, allow, Err(anyhow::anyhow!("no such container")))
+            .await;
+        assert!(lines(&tmp).is_empty(), "{:?}", lines(&tmp));
+        assert!(
+            !orch.job_start_watch("faber-7-1000").unwrap().ended(),
+            "an allow that did not land is delivered again while the hook waits"
+        );
+        // A refusal, landed or not, lets nothing past.
+        let refuse = Delivery {
+            decision: StartDecision::Refuse(Reason::Actor),
+            ..*allow
+        };
+        orch.delivery_done(&w, &refuse, Ok(())).await;
+        assert!(lines(&tmp).is_empty(), "{:?}", lines(&tmp));
+
+        // Landed.
+        orch.delivery_done(&w, allow, Ok(())).await;
+        let written = lines(&tmp);
+        assert_eq!(written.len(), 1, "{written:?}");
+        let mut keys: Vec<&str> = written[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "action",
+                "job_id",
+                "kind",
+                "label",
+                "repo",
+                "run_attempt",
+                "run_id",
+                "runner",
+                "ts_ms",
+                "verdict"
+            ]
+        );
+        assert_eq!(written[0]["action"], "allowed");
+        assert_eq!(written[0]["repo"], "owner/demo");
+        assert_eq!(written[0]["runner"], "faber-7-1000");
+        assert_eq!(written[0]["job_id"], 7);
+        assert_eq!(written[0]["run_id"], 900);
+        assert_eq!(written[0]["run_attempt"], 1);
+        assert_eq!(written[0]["verdict"], "provision");
+
+        // The hook leaving at its own deadline, for a job faber never judged.
+        let unjudged = Watch::new(
+            "owner/demo",
+            "faber-8-2000",
+            8,
+            900,
+            0,
+            DeadlineOutcome::Allow,
+        );
+        orch.watch_job_start(unjudged);
+        orch.job_start_act("faber-8-2000", Act::RanUnverified).await;
+        let written = lines(&tmp);
+        assert_eq!(written.len(), 2, "{written:?}");
+        assert_eq!(written[1]["action"], "unverified");
+        assert_eq!(written[1]["runner"], "faber-8-2000");
+        assert_eq!(written[1]["job_id"], 0);
+        assert!(
+            written[1].get("run_id").is_none() && written[1].get("verdict").is_none(),
+            "{}",
+            written[1]
+        );
+
+        // An allow that only `record` gives says so, in the line's `action`:
+        // a trust refusal the gate let through because this host records.
+        let mut lenient = Watch::new(
+            "owner/demo",
+            "faber-9-3000",
+            9,
+            900,
+            0,
+            DeadlineOutcome::Allow,
+        );
+        lenient.judge(crate::job_start::Judged {
+            verdict: "refuse:actor:octo-bot".into(),
+            record_only: true,
+            ..allowed_job(9)
+        });
+        orch.watch_job_start(lenient.clone());
+        orch.delivery_done(&lenient, allow, Ok(())).await;
+        let written = lines(&tmp);
+        assert_eq!(written.len(), 3, "{written:?}");
+        assert_eq!(written[2]["action"], "allowed_under_record");
+        assert_eq!(written[2]["verdict"], "refuse:actor:octo-bot");
+        assert_eq!(written[2]["runner"], "faber-9-3000");
+
+        // Each reads back as what a watch begun on that runner is told.
+        let read = passed_hooks(&orch.audit.read_since(0));
+        let told = |runner: &str| {
+            read.get(&("owner/demo".to_string(), runner.to_string()))
+                .copied()
+        };
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert_eq!(
+            told("faber-7-1000"),
+            Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1,
+                record_only: false
+            })
+        );
+        assert_eq!(told("faber-8-2000"), Some(Passed::Unverified));
+        assert_eq!(
+            told("faber-9-3000"),
+            Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1,
+                record_only: true
+            })
+        );
+    }
+
+    /// A watch begun on an adopted runner is given the record that names that
+    /// runner on that repo, and no other: matched as a `mint` line is. A line
+    /// that does not read as a record is none, and a runner started before the
+    /// hook existed is not watched at all.
+    #[tokio::test]
+    async fn adoption_gives_each_watch_only_the_hook_record_that_names_its_runner() {
+        use crate::job_start::Passed;
+        let (orch, _tmp) = test_orch_with(profiles());
+        for rec in [
+            Record::job_start(
+                "owner/demo",
+                7,
+                "faber-7-1000",
+                "allowed",
+                Some((900, 1)),
+                Some("provision".to_string()),
+            ),
+            Record::job_start("owner/demo", 0, "faber-8-2000", "unverified", None, None),
+            Record::job_start(
+                "owner/demo",
+                13,
+                "faber-13-7000",
+                "allowed_under_record",
+                Some((900, 1)),
+                Some("refuse:actor:octo-bot".to_string()),
+            ),
+            // This host's record of a runner on another repo.
+            Record::job_start(
+                "owner/other",
+                9,
+                "faber-9-3000",
+                "allowed",
+                Some((900, 1)),
+                None,
+            ),
+            // An allow that does not say which run it was for.
+            Record::job_start("owner/demo", 10, "faber-10-4000", "allowed", None, None),
+            // The same runner's name on a line of another kind.
+            Record::mint("owner/demo", 11, "faber-11-5000", "linux-docker"),
+        ] {
+            orch.audit.append(&rec).await.expect("audit append");
+        }
+        let scan = crate::docker::Scan {
+            adoptable: vec![
+                adopted_with_hook("/faber-runner-7-1000", "owner/demo"),
+                adopted_with_hook("/faber-runner-8-2000", "owner/demo"),
+                adopted_with_hook("/faber-runner-9-3000", "owner/demo"),
+                adopted_with_hook("/faber-runner-10-4000", "owner/demo"),
+                adopted_with_hook("/faber-runner-11-5000", "owner/demo"),
+                adopted("/faber-runner-12-6000", "owner/demo"),
+                adopted_with_hook("/faber-runner-13-7000", "owner/demo"),
+            ],
+            opaque: Vec::new(),
+        };
+        assert_eq!(orch.adopt_scan(scan, |_, _, _, _, _| {}).await, 7);
+
+        let told = |runner: &str| orch.job_start_watch(runner).map(|w| w.passed());
+        let allowed = |record_only| {
+            Some(Some(Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1,
+                record_only,
+            }))
+        };
+        assert_eq!(told("faber-7-1000"), allowed(false));
+        assert_eq!(told("faber-13-7000"), allowed(true));
+        assert_eq!(told("faber-8-2000"), Some(Some(Passed::Unverified)));
+        assert_eq!(told("faber-9-3000"), Some(None), "another repo's record");
+        assert_eq!(told("faber-10-4000"), Some(None), "not a readable record");
+        assert_eq!(told("faber-11-5000"), Some(None), "a mint is not a record");
+        assert_eq!(told("faber-12-6000"), None, "no hook, so no watch");
+    }
+
+    /// The `hook_fault` lines in the test orchestrator's audit log.
+    fn hook_fault_lines(tmp: &TempDir) -> Vec<serde_json::Value> {
+        audit_lines(tmp)
+            .into_iter()
+            .filter(|l| l["kind"] == "fault" && l["result"] == "hook_fault")
+            .collect()
+    }
+
+    /// The process that starts on the log another one wrote: a new orchestrator
+    /// that has read the week's hook faults back from it, as a boot does.
+    async fn restarted_on(log: &TempDir, on_bypass: OnBypass) -> (Arc<Orchestrator>, TempDir) {
+        let (after, log_after) = test_orch_with(bypass_profiles(on_bypass));
+        std::fs::copy(
+            log.path.join("audit.jsonl"),
+            log_after.path.join("audit.jsonl"),
+        )
+        .expect("the log the first process wrote");
+        let week = after.audit.read_since(0);
+        after.metrics.lock().await.restore_hook_faults(&week);
+        (after, log_after)
+    }
+
+    /// [`acts_mid_run`], with the hook fault the watch asks for recorded as the
+    /// job-start loop records it. Nothing here reaches Docker: a kill the watch
+    /// asks for is returned and not carried out.
+    async fn watched_mid_run(
+        orch: &Orchestrator,
+        runner: &str,
+        judged: Option<crate::job_start::Judged>,
+    ) -> Vec<crate::job_start::Act> {
+        let (acts, w) = acts_mid_run(orch, runner, judged);
+        orch.watch_job_start(w);
+        for act in &acts {
+            if matches!(act, crate::job_start::Act::HookFault { .. }) {
+                orch.job_start_act(runner, act.clone()).await;
+            }
+        }
+        acts
+    }
+
+    /// ADR-0059 §2 on a host that records: a job whose hook never ran is a hook
+    /// fault, written down and left to run. The process that adopts its runner
+    /// after a restart sees what the first one saw, a worker and no hook
+    /// waiting, and used to write the same fault down again, so one job
+    /// counted twice in the week.
+    #[tokio::test]
+    async fn a_hook_fault_is_recorded_once_however_many_processes_watch_its_runner() {
+        use crate::job_start::{Act, DeadlineOutcome, Watch};
+        const RECORDED: Act = Act::HookFault {
+            stop: false,
+            why: "no job-started hook was seen waiting",
+        };
+        let (before, log) = test_orch_with(bypass_profiles(OnBypass::Record));
+        before.watch_job_start(Watch::new(
+            "owner/demo",
+            "faber-7-1000",
+            7,
+            900,
+            0,
+            DeadlineOutcome::Refuse,
+        ));
+        let acts = watched_mid_run(&before, "faber-7-1000", Some(allowed_job(7))).await;
+        assert!(
+            acts.contains(&RECORDED) && !acts.contains(&Act::Kill),
+            "{acts:?}"
+        );
+        assert_eq!(hook_fault_lines(&log).len(), 1);
+        assert_eq!(before.view().await.hook_faults_7d, 1);
+
+        let (after, log) = restarted_on(&log, OnBypass::Record).await;
+        assert_eq!(after.view().await.hook_faults_7d, 1, "read back at boot");
+        let scan = crate::docker::Scan {
+            adoptable: vec![adopted_with_hook("/faber-runner-7-1000", "owner/demo")],
+            opaque: Vec::new(),
+        };
+        assert_eq!(after.adopt_scan(scan, |_, _, _, _, _| {}).await, 1);
+        let acts = watched_mid_run(&after, "faber-7-1000", Some(allowed_job(7))).await;
+        assert!(!acts.contains(&Act::Kill), "{acts:?}");
+
+        let lines = hook_fault_lines(&log);
+        assert_eq!(lines.len(), 1, "one job's fault, written once: {lines:?}");
+        let view = after.view().await;
+        assert_eq!(view.hook_faults_7d, 1, "and counted once");
+        assert!(
+            view.hook_faults.is_empty(),
+            "nothing new happened in this process: {:?}",
+            view.hook_faults
+        );
+    }
+
+    /// What the record-once gate must not take away. A fault a host only
+    /// recorded is still stopped by the next process if that one enforces,
+    /// and the stop is news: it is written and shown, though the fault is
+    /// counted once. A process after that, finding the runner still there,
+    /// stops it again and has nothing to add to the log.
+    #[tokio::test]
+    async fn a_hook_fault_a_later_process_stops_says_so_and_is_still_one_fault() {
+        use crate::job_start::{Act, DeadlineOutcome, Watch};
+        let (before, log) = test_orch_with(bypass_profiles(OnBypass::Record));
+        before.watch_job_start(Watch::new(
+            "owner/demo",
+            "faber-7-1000",
+            7,
+            900,
+            0,
+            DeadlineOutcome::Refuse,
+        ));
+        let acts = watched_mid_run(&before, "faber-7-1000", Some(allowed_job(7))).await;
+        assert!(!acts.contains(&Act::Kill), "{acts:?}");
+        assert!(!before.was_stopped_at_start("faber-7-1000"));
+
+        let mut log = log;
+        for (process, written, shown) in [("the first to enforce", 2, 1), ("the next", 2, 0)] {
+            let (after, log_after) = restarted_on(&log, OnBypass::Enforce).await;
+            let scan = crate::docker::Scan {
+                adoptable: vec![adopted_with_hook("/faber-runner-7-1000", "owner/demo")],
+                opaque: Vec::new(),
+            };
+            assert_eq!(after.adopt_scan(scan, |_, _, _, _, _| {}).await, 1);
+            let acts = watched_mid_run(&after, "faber-7-1000", Some(allowed_job(7))).await;
+            assert!(
+                acts.contains(&STOPPED_FOR_NO_HOOK) && acts.contains(&Act::Kill),
+                "{process}: a job whose hook never ran is stopped under enforce: {acts:?}"
+            );
+            assert!(
+                after.was_stopped_at_start("faber-7-1000"),
+                "{process}: and the learner is kept off the runner it stopped"
+            );
+
+            let lines = hook_fault_lines(&log_after);
+            let actions: Vec<_> = lines.iter().map(|l| l["action"].clone()).collect();
+            assert_eq!(actions.len(), written, "{process}: {lines:?}");
+            assert_eq!(actions[..2], ["recorded", "stopped"], "{process}");
+            assert!(lines.iter().all(|l| l["runner"] == "faber-7-1000"));
+            let view = after.view().await;
+            assert_eq!(view.hook_faults_7d, 1, "{process}: one job, one fault");
+            assert_eq!(view.hook_faults.len(), shown, "{process}");
+            log = log_after;
+        }
+    }
+
+    /// The gate itself: a hook fault is one for its runner on its repository,
+    /// a line is written once for each thing faber did about it, and both are
+    /// forgotten a week after the fault was first recorded.
+    #[test]
+    fn a_hook_fault_is_one_for_its_runner_and_forgotten_past_the_window() {
+        use HookFaultNote::{First, Known, NewAction};
+        let mut m = Metrics::default();
+        let window = BYPASS_WINDOW.as_millis() as u64;
+        let demo = "owner/demo";
+        for (repo, runner, action, now, note) in [
+            (demo, "faber-7-1000", "recorded", 1_000, First),
+            (demo, "faber-7-1000", "recorded", 2_000, Known),
+            (demo, "faber-7-1000", "stopped", 3_000, NewAction),
+            (demo, "faber-7-1000", "stopped", 4_000, Known),
+            (demo, "faber-7-1000", "recorded", 4_000, Known),
+            // Another runner, and a runner of the same name on another repository.
+            (demo, "faber-8-2000", "bypass", 5_000, First),
+            ("owner/other", "faber-7-1000", "recorded", 5_000, First),
+        ] {
+            assert_eq!(
+                m.note_hook_fault(repo, runner, action, now),
+                note,
+                "{repo} {runner} {action} at {now}"
+            );
+        }
+        assert_eq!(m.hook_faults_since(5_000), 3);
+        // Counted from when it was first recorded, not from its latest line.
+        assert_eq!(m.hook_faults_since(1_001 + window), 2);
+        let later = 1_001 + window;
+        assert_eq!(
+            m.note_hook_fault(demo, "faber-9-3000", "recorded", later),
+            First
+        );
+        assert!(
+            !m.hook_faults
+                .contains_key(&(demo.to_string(), "faber-7-1000".to_string())),
+            "pruned past the window"
+        );
+    }
+
+    /// A boot reads the week back runner by runner. A log an older version
+    /// wrote can hold one fault several times over, and counts it once.
+    #[test]
+    fn a_boot_reads_each_runners_hook_fault_back_once() {
+        let line = |ts_ms: u64, runner: Option<&str>, scope: &str, action: &str| {
+            serde_json::from_value::<crate::audit::Entry>(serde_json::json!({
+                "ts_ms": ts_ms,
+                "kind": "fault",
+                "repo": "owner/demo",
+                "job_id": 7,
+                "runner": runner,
+                "result": scope,
+                "action": action,
+            }))
+            .expect("an audit line")
+        };
+        let mut m = Metrics::default();
+        m.restore_hook_faults(&[
+            line(1_000, Some("faber-7-1000"), "hook_fault", "recorded"),
+            // The same fault, written again by the process that adopted the
+            // runner, and by every cycle that saw a refused job run on.
+            line(2_000, Some("faber-7-1000"), "hook_fault", "recorded"),
+            line(3_000, Some("faber-7-1000"), "hook_fault", "stopped"),
+            line(4_000, Some("faber-8-2000"), "hook_fault", "bypass"),
+            line(4_500, Some("faber-8-2000"), "hook_fault", "bypass"),
+            // A fault of another kind on a third runner.
+            line(5_000, Some("faber-9-3000"), "refused_at_start", "actor"),
+            // Lines that name no runner can be matched to none.
+            line(6_000, None, "hook_fault", "recorded"),
+            line(7_000, None, "hook_fault", "recorded"),
+        ]);
+        assert_eq!(m.hook_faults_since(7_000), 4);
+        let demo = "owner/demo";
+        assert_eq!(
+            m.note_hook_fault(demo, "faber-7-1000", "stopped", 8_000),
+            HookFaultNote::Known
+        );
+        assert_eq!(
+            m.note_hook_fault(demo, "faber-8-2000", "bypass", 8_000),
+            HookFaultNote::Known
+        );
+        assert_eq!(
+            m.note_hook_fault(demo, "faber-9-3000", "recorded", 8_000),
+            HookFaultNote::First
+        );
+    }
+
+    /// The same fault from the other place one is found (ADR-0059 §6): a job
+    /// refused at start whose steps ran anyway. Bypass detection sees that job
+    /// on every cycle until it ends, and it is one hook fault.
+    #[tokio::test]
+    async fn a_job_that_ran_past_its_refusal_is_one_hook_fault_however_many_cycles_see_it() {
+        use crate::job_start::{DeadlineOutcome, Judged, Reason, StartDecision, Watch};
+        let (orch, tmp) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        orch.note_minted("faber-5-100", 5, 0);
+        let mut w = Watch::new(
+            "owner/demo",
+            "faber-5-100",
+            5,
+            50,
+            0,
+            DeadlineOutcome::Refuse,
+        );
+        w.judge(Judged {
+            job_id: 7,
+            run_id: 70,
+            run_attempt: 1,
+            job_name: "build".into(),
+            workflow: "CI".into(),
+            verdict: "refuse:actor:dependabot[bot]".into(),
+            decision: StartDecision::Refuse(Reason::Actor),
+            record_only: false,
+        });
+        orch.record_refused_at_start(&w, Reason::Actor).await;
+
+        let mut runs = ran_on("faber-5-100", "dependabot[bot]");
+        runs[0].1[0].steps = hook_steps(true);
+        for _ in 0..3 {
+            orch.detect_bypasses("owner/demo", &runs, &Codes::new())
+                .await;
+        }
+        let lines = hook_fault_lines(&tmp);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["action"], "bypass");
+        assert_eq!(orch.view().await.hook_faults_7d, 1);
     }
 
     #[test]
