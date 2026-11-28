@@ -273,14 +273,18 @@ faber has two surfaces:
   new row is classified by "does this stop jobs?".
 - **A speed-up hint is a neutral row, on the dashboard only, with no button**
   ([the speed-up hints ADR](../adrs/0068-faber-says-when-a-faster-way-to-run-jobs-is-off.md)). It
-  says that a faster way to run jobs exists on this host and is off, what the step it shortens
-  costs here (this host's own step timings, never an estimated saving), why it is off, and what
-  the way back takes, naming what a fix that widens trust accepts. It is `info`, so it sorts
-  last and never colours the dashboard; it carries Dismiss like any row that does not stop
-  jobs; and its fix is a config change, so it has no action. The popover never shows one: a
-  healthy popover is calm. *Source:* owner, 2026-11-27. *Enforced:* test
-  (`ui/scripts/dashboard.test.mjs`) and review: a new hint is asked "is the figure this
-  host's, and does the row name what the fix accepts?".
+  says that a faster way to run jobs exists on this host and is off, what that costs here (a
+  figure from this host's own records, a step's time or a count, never an estimated saving),
+  why it is off, and what the way back takes, naming what a fix that widens trust accepts. It
+  is `info`, so it sorts last and never colours the dashboard; it carries Dismiss like any row
+  that does not stop jobs; and its fix is a config change, so it has no action. The popover
+  never shows one: a healthy popover is calm. **Hints that share a cause share a row:** when
+  one cause holds off more than one faster way and the way back is the same, the row says the
+  cause, whether it is still in use and the way back once, and each thing held off adds a line
+  with its own figure. Another cause is another row. *Source:* owner, 2026-11-27; the shared
+  row, owner, 2026-11-28. *Enforced:* test (`ui/scripts/dashboard.test.mjs`) and review: a new
+  hint is asked "is the figure this host's, does the row name what the fix accepts, and does
+  its cause already have a row?".
 - **Every state has a story.** The React kit's stories run in Storybook (`npm run storybook`
   in `ui/`, [ADR-0043](../adrs/0043-stories-run-in-storybook.md)), with Theme and Text size
   switches in the toolbar. Each state in a part's `@states` docstring has its own story, and
