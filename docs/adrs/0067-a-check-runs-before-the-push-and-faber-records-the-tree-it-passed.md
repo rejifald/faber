@@ -72,8 +72,9 @@ A third check, of §12 on 2026-11-28 against `31c952c`, found:
   key, so §7's record needs that label;
 - that the first slice was said to record nothing while its Jobs class needs the
   outcome record;
-- that the row for a host-wide cause does not fit the proposed hints ADR as written,
-  in its figure and in sharing a cause with that ADR's first hint;
+- that the row for a host-wide cause did not fit the proposed hints ADR as it then
+  read, in its figure and in sharing a cause with that ADR's first hint (that ADR has
+  since taken up both, and §12 follows it);
 - three statements that were imprecise about ADR-0056's phases, the Memory view and
   what specifies the dashboard.
 
@@ -532,16 +533,16 @@ started a check would know it exists, while it holds budget a CI job is parked f
   "why did CI repeat the work?" is answered after the terminal is gone.
 - **A cause that holds for the whole host is said once.** On an engine that has granted
   dind no pass is ever posted. Repeating that on every row is noise, and an alarm would
-  be wrong, since nothing is broken. It is one neutral row on the dashboard, in the
-  manner of the hints the proposed ADR `faber-says-when-a-faster-way-to-run-jobs-is-off`
-  describes (rejifald/faber#115, not merged): it can be dismissed, has no button, is not
-  in the popover and is never delivered outward, and it shows only while the host has
-  passes it could not post. It is not one of that ADR's hints as written, in two ways
-  that ADR would have to take up. Its figure is a count, how many passes of the last 7
-  days could not be posted, where a hint's figure is what a step costs. And the same
-  grant already has a row there, the git mirror held off beside dind, which names the
-  way back. One cause should not get two rows, so how the two are joined is decided
-  with that ADR, when this row is built. It is built only once both ADRs are accepted.
+  be wrong, since nothing is broken. It is a hint under the proposed ADR
+  `faber-says-when-a-faster-way-to-run-jobs-is-off` (rejifald/faber#115, not merged):
+  neutral, on the dashboard only, with no button, never delivered outward, and one an
+  operator can dismiss. It shows only while the host has passes it could not post. Its
+  figure is a count, the passes of the last 7 days that could not be posted, which that
+  ADR's §3 allows. The same grant already has a row there, the git mirror held off
+  beside dind, which names the way back. That ADR's §8 has hints that share a cause and
+  a way back share a row (the owner, 2026-11-28), so this is a line on the grant's row,
+  and a row of its own only where nothing else is held off. It is built only once both
+  ADRs are accepted.
 
 The popover's content is frozen by `popover.md`: that document changes before the
 popover does. The dashboard's views are specified by the anatomy under
