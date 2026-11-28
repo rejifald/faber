@@ -203,6 +203,43 @@ Docker-API exception, which #107 and #108 close.
 - **Two deadlines.** faber gives up its search before the hook's deadline. Both come
   from config, and both outlast one poll interval plus a daemon restart. Runners
   adopted after a restart get their verdicts.
+- **A job already past its hook at a restart is not a hook fault.** The process that
+  adopts its runner (ADR-0011) finds the worker running and no hook waiting, which
+  is also all it could see of a job whose hook never ran. faber's own record tells
+  them apart, never GitHub's record of the job's steps, since a workflow can name a
+  step *Set up runner* (§6). faber writes a `job_start` line to its audit log when
+  an allow it delivered to a waiting hook has landed, and when a hook it saw
+  waiting leaves at its own deadline under an allow outcome. The adopting process
+  reads the line that names the runner and its repository, and judges the job
+  again. If the gate still allows the job, and an allow that was delivered was for
+  that job's run and attempt, the missing hook is no fault and the job runs on.
+  With no such line the job is a hook fault, and a job the gate now refuses is
+  stopped. A job that got past its hook under a version that wrote no such line
+  has none.
+- **When faber cannot judge that job again, what it recorded stands.** If no
+  verdict comes by the search deadline, as when GitHub does not answer, the job is
+  not stopped for it. Its hook did not fail, and the job is not at its start, so
+  there is no hook to give the deadline's outcome to. faber records that it could
+  not judge again, as a fault of its own, and the job runs on as it would have
+  with no restart. This holds only as far as §5 would still decide it under the
+  mode now in force. An allow the gate gives in either mode stands in both. A
+  trust refusal let through under `record`, and a job that ran with no verdict,
+  stand only under `record`: under `enforce` each is handled as if there were no
+  line. The line says which of these an allow was. The mode is the one change to
+  the gate it can see. Had the gate changed in another way across the restart, or
+  GitHub's facts with it, only a judgement would find that: faber's own, when it
+  gets one, or bypass detection (ADR-0030), which judges every job on a runner
+  this host minted except the one the runner was minted for.
+- **A hook fault is one for its runner.** A runner takes one job, so a job that ran
+  with no waiting hook is one fault, whoever finds it and however often: the check
+  that watches the runner, the process that adopts the runner after a restart and
+  sees the same worker and no hook, and bypass detection (§6) on every cycle that
+  a refused job is still running. faber counts it once in the week, and writes a
+  line once for each thing it did about it. A fault a host only recorded, which a
+  later process stops because it enforces, leaves two lines and counts once. What
+  faber knows of the week's faults it reads back from its own audit log at boot,
+  as it does for bypasses (ADR-0030). Stopping the job never waits on that memory:
+  it decides only what is written and counted.
 
 The mint-time verdict stays as the first filter: faber still mints only for jobs it
 would run. The job-start verdict is the one that decides what executes.
@@ -453,6 +490,9 @@ macOS VM:
 | The hook file missing; the hook failing with an error of its own | faber does not start the runner; the hook kills its parent, and no step runs |
 | What GitHub shows after a refusal | the job's conclusion and log recorded |
 | A refusal at start, and a runner that ignores the hook | faber records refused at start for the first, and a hook fault for the second |
+| A daemon restart under `enforce` while a job is past its hook and still running | the job runs to its end, and no hook fault is recorded |
+| The same restart with GitHub unreachable for the whole search deadline | the job runs to its end, and faber records that it could not judge it again |
+| A daemon restart under `record` while a job whose hook never ran is still running | one hook fault in the audit log and in the 7-day count, not two |
 | A job taken by a runner minted for another job | judged at start as the job it is, found by `runner_name` |
 | A job past the 100th in its run | found |
 | A stranger's fork PR, and a merge group carrying it, on a test repository | both refused before their first step |
