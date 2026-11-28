@@ -12,7 +12,8 @@ owner: rejifald
 
 proposed (2026-11-27). The owner decided the shape on 2026-11-27, with the first
 hint drawn on the dashboard before any daemon code: a neutral row, on the
-dashboard only, with no button, beside the notices that already exist.
+dashboard only, with no button, beside the notices that already exist. On
+2026-11-28 the owner added §8: hints that share a cause share a row.
 
 It adds a row to the attention list that
 [ADR-0064](0064-a-warning-that-does-not-stop-jobs-can-be-dismissed.md) lets an
@@ -75,10 +76,13 @@ host whose config already asks for everything stays as quiet as it is today.
 
 ### 3. The figure is this host's own, and it is a cost, never a saving
 
-A hint states what the step it is about costs on this host today, read from the
-step timings of the last 7 days: how many runs, the median per run, and the sum.
-It never states what the capability would save, because faber has no record to
-say it from (§ Context). With no timed step on record it says so and states no
+A hint states what this host's records of the last 7 days hold about the thing
+the capability would act on. For a step, that is its time, read from the step
+timings: how many runs, the median per run, and the sum. For something that is
+not a step, it is a count of what happened: how many times the capability would
+have applied and did not. Either is a fact on record. A hint never states what
+the capability would save, in time or in runs, because faber has no record to
+say it from (§ Context). With nothing on record it says so and states no
 figure.
 
 The daemon computes the figures and sends them as numbers; the dashboard words
@@ -141,6 +145,31 @@ The existing `mirrors_beside_dind` notice stays as it is. It says why a mirror
 the config asks for is off; the hint says what that costs and what the way back
 takes, and shows whether or not the config asks.
 
+### 8. Hints that share a cause share a row
+
+A hint row is about one thing an operator could do. When one cause holds off
+more than one capability and the way back is the same, they share one row (the
+owner, 2026-11-28):
+
+- **The cause is said once.** The row names the cause, says whether it is still
+  in use, and gives the way back, as §7 does for the dind grant.
+- **Each capability held off adds a line** with its own figure (§3). With one
+  capability held off, the row is that capability's own, as §7 words it.
+- **Another cause is another row.** The git mirror that is off because no
+  profile asks for it has a different way back, a widening, and does not join
+  the row of a grant that holds things off.
+- **A dismissed row shows again when it gains a line.** That is ADR-0064 as it
+  stands: a dismissal is the row's key and its words with the digits replaced,
+  and a new line changes the words.
+
+The rule is among hints. The `mirrors_beside_dind` notice is a row at another
+level that answers another question (§7), and stays.
+
+One kind ships today, so no row has a second line yet. The build that adds the
+second chooses whether the daemon sends one entry for each capability and the
+dashboard joins them, or sends them joined, and what the shared row's key and
+heading are: today both name the one capability.
+
 ## Consequences
 
 - An operator sees, on the dashboard, time a host is leaving unused, with a
@@ -150,7 +179,8 @@ takes, and shows whether or not the config asks.
   mirror (docs/git-mirror.md). It never overstates a saving, because it states
   none.
 - Every new hint is a review question: does faber detect it reliably, is the
-  figure this host's, and does the row name what the fix accepts?
+  figure this host's, does the row name what the fix accepts, and does its cause
+  already have a row (§8)?
 - The audit log is read in full for the figures, like the Jobs view (ADR-0056).
   The read is in the background and no more often than every 10 minutes.
 
@@ -169,6 +199,16 @@ takes, and shows whether or not the config asks.
   faber cannot tell whether a job used its Docker daemon or what it started in
   it, so it cannot say the job could run without one. What it can count, runs
   handed a daemon, is part of the git mirror hint (§7).
+- **Passed checks that cannot be posted.** The proposed ADR
+  `a-check-runs-before-the-push-and-faber-records-the-tree-it-passed`
+  ([rejifald/faber#116](https://github.com/rejifald/faber/pull/116), not merged)
+  posts a passed local check so a workflow can skip the same work, and never
+  posts from an engine that has granted dind. That is a faster way held off, so
+  it is a hint by §1. Its figure is a count, the passes of the last 7 days that
+  could not be posted, which §3 allows. Its cause and way back are the git
+  mirror's held case, so by §8 it is a line on that row and not a row of its
+  own. Nothing of it is built here: it is built with that ADR's row, once both
+  ADRs are accepted.
 - **`autolimit.reserve = "p75"`, auto-retry, the poll interval.** faber knows the
   time jobs waited, not how much of it the switch would cut; and a bigger VM is
   never a suggestion (AGENTS.md).
