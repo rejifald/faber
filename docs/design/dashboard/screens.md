@@ -66,7 +66,9 @@ ship together, then both are deleted. Repositories stays out of the sidebar unti
   alarms on Overview and also sit at the top of Memory.
 - **S8 → No alarm lives only in a view** (ADR-0054 § 3). Overview's *Needs attention* lists
   every alarm. The model is `dashboardAlarms` (`ui/src/dashboard/alarms.ts`): the popover's rows
-  plus the old page's notices the popover never had.
+  plus the old page's notices the popover never had. Speed-up hints
+  ([the speed-up hints ADR](../../adrs/0068-faber-says-when-a-faster-way-to-run-jobs-is-off.md)) join it as
+  neutral rows, last in the list: the dashboard is the only surface that shows them.
 - **S9 → The old page's header facts.** Owner, topic, profiles and the gate line are
   configuration, and Settings shows them. A gate that allows public repositories is an alarm.
   The status word (paused, draining, held, image missing) becomes the PageHeader's state and an

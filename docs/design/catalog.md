@@ -101,7 +101,7 @@ How many stories show each entry. Counted per story file.
 | LimitsView | Screens | 10 |
 | Maintenance | Screens | 11 |
 | Memory | Screens | 9 |
-| Overview | Screens | 7 |
+| Overview | Screens | 12 |
 | Popover | Screens | 46 |
 | PopoverFallback | Screens | 46 |
 | Settings | Screens | 56 |
@@ -1604,9 +1604,9 @@ Memory (/memory, M1): the budget, then every job class with its caps and measure
 The dashboard's home view (screens.md § 4): is the host healthy, what is it doing, what needs me. The memory budget, four since-start tiles, the jobs in flight and the latest activity, and a rail with the alarms, the host and the learned caps. Host actions (Reconcile, Pause, Hold, Drain) live in Maintenance (S13); an alarm card keeps the one fix it names.
 
 - **Use when:** the dashboard's `/` view. A pure function of the state it is handed; actions go through `run`.
-- **States:** busy, healthy, fresh host (empty panels), stale, alarm action failed, alarms dismissed, dismissed open, trust changes acknowledged
+- **States:** busy, healthy, fresh host (empty panels), stale, alarm action failed, alarms dismissed, dismissed open, trust changes acknowledged, speed-up hint
 - **Source:** `src/screens/Overview.tsx`
-- **Stories:** 7
+- **Stories:** 12
 
 | Prop | Type | Description |
 | --- | --- | --- |

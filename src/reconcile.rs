@@ -1880,6 +1880,12 @@ pub struct StateView {
     /// a-warning-that-does-not-stop-jobs-can-be-dismissed, ADR-0064 §3). Filled
     /// in by the web layer like `trust_changes`. Additive: older clients ignore it.
     pub attention: crate::attention::AttentionView,
+    /// Speed-up hints: a faster way to run jobs that this host has and leaves
+    /// off, with what the step it shortens costs here (ADR
+    /// faber-says-when-a-faster-way-to-run-jobs-is-off). Empty with nothing to
+    /// gain. Filled in by the web layer like `notices`. Additive: older clients
+    /// ignore it.
+    pub hints: Vec<crate::hints::Hint>,
 }
 
 /// One standing condition of this boot, for a dashboard banner (ADR-0025).
@@ -3715,6 +3721,7 @@ impl Orchestrator {
             cli_copy: None,
             trust_changes: Vec::new(),
             attention: Default::default(),
+            hints: Vec::new(),
         }
     }
 

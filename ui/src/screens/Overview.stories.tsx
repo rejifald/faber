@@ -1,7 +1,7 @@
 import type { Meta, StoryObj } from '@storybook/react-vite';
 import { waitFor } from 'storybook/test';
-import { dismissedAlarms, full, NOW, quiet } from '../dashboard/fixtures';
-import type { DaemonState } from '../popover/types';
+import { checkoutHint, dismissedAlarms, full, NOW, quiet } from '../dashboard/fixtures';
+import type { DaemonState, SpeedHint } from '../popover/types';
 import { Overview, type OverviewProps } from './Overview';
 
 // The Overview at the dashboard's primary width (screens.md § 6): the main column only, the shell
@@ -41,7 +41,7 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-/** Every alarm, a parked and a frozen job, faults and refusals in the feed. */
+/** Every alarm, a parked and a frozen job, faults and refusals in the feed; the speed-up hint sorts last, neutral. */
 export const Busy: Story = {};
 /** One job running, nothing to attend to. */
 export const Healthy: Story = { args: { state: quiet } };
@@ -70,3 +70,22 @@ export const AlarmsDismissed: Story = { args: { state: dismissedAlarms } };
 
 /** The dismissed alarms opened, each with Restore, then Restore all. */
 export const DismissedOpen: Story = { args: { state: dismissedAlarms, defaultDismissedOpen: true } };
+
+// Speed-up hints (ADR faber-says-when-a-faster-way-to-run-jobs-is-off): a neutral card with what
+// checkout costs on this host, why the git mirror is not in use, and what the way back takes.
+const hinted = (hint: SpeedHint): DaemonState => ({ ...quiet, hints: [hint] });
+
+/** The git mirror is off: no profile asks for it. The fix widens trust, and the card says so. */
+export const SpeedHintOff: Story = { args: { state: hinted(checkoutHint('off')) } };
+/** Held off by a dind grant nothing has used for weeks: the card names the unused grant. */
+export const SpeedHintDindUnused: Story = {
+  args: { state: hinted(checkoutHint('dind_granted', { profiles: ['linux-dind'], last_dind_ms: NOW - 21 * 86_400_000 })) },
+};
+/** Held off by a dind grant jobs still take: the card counts them. */
+export const SpeedHintDindUsed: Story = { args: { state: hinted(checkoutHint('dind_granted', { profiles: ['linux-dind'], dind_runs: 40 })) } };
+/** No profile grants dind any more, but this engine has: the way back is a fresh disk. */
+export const SpeedHintEngineMarked: Story = { args: { state: hinted(checkoutHint('engine_marked')) } };
+/** No timed checkout step on record: the card says so and states no figure. */
+export const SpeedHintNoTimings: Story = {
+  args: { state: hinted(checkoutHint('off', { runs: undefined, median_ms: undefined, total_ms: undefined })) },
+};

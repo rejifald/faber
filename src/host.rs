@@ -912,6 +912,7 @@ mod tests {
             prevent_sleep: None,
             prevent_sleep_while_busy: None,
             dind_requires_label: None,
+            speed_hints: true,
         }
     }
 

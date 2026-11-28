@@ -62,7 +62,7 @@ const DISMISSED = ' dismissed';
  *
  * @useWhen the dashboard's `/` view. A pure function of the state it is handed; actions go
  * through `run`.
- * @states busy, healthy, fresh host (empty panels), stale, alarm action failed, alarms dismissed, dismissed open, trust changes acknowledged
+ * @states busy, healthy, fresh host (empty panels), stale, alarm action failed, alarms dismissed, dismissed open, trust changes acknowledged, speed-up hint
  */
 export function Overview({ state, now, run, stale = false, defaultDismissedOpen = false }: OverviewProps) {
   const [filter, setFilter] = useState<ActivityFilter>('all');
