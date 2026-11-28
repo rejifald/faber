@@ -84,9 +84,13 @@ Set these by hand at the cut and re-check them after any repository change.
   Security tab, which takes reports only once this is on: Settings → Code security
   → Private vulnerability reporting, or
   `PUT /repos/{owner}/{repo}/private-vulnerability-reporting`.
-- **Code scanning.** CodeQL's default setup, which picks the languages itself:
-  Settings → Code security → CodeQL analysis, or
-  `PATCH /repos/{owner}/{repo}/code-scanning/default-setup` with `state=configured`.
+- **Code scanning: CodeQL's default setup stays off.** CodeQL runs from
+  `.github/workflows/codeql.yml`, and GitHub refuses a workflow's analyses while
+  default setup is on. Turn it off in Settings → Code security → CodeQL analysis,
+  or `PATCH /repos/{owner}/{repo}/code-scanning/default-setup` with
+  `state=not-configured`. Why: default setup builds Swift itself and finds nothing
+  here it can build, since scripts compile the Swift code, so it analysed every
+  language but Swift (the workflow's header says more).
 - **Approval for outside contributors' workflow runs.** "Require approval for all
   external contributors" (Settings → Actions → General), or
   `PUT /repos/{owner}/{repo}/actions/permissions/fork-pr-contributor-approval`
