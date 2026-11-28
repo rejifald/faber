@@ -346,7 +346,7 @@ export function daemonRows(s: DaemonState, now: number): AttentionRow[] {
       sev: 'warn',
       icon: 'frozen',
       blocking: true,
-      parts: [{ strong: 'Machine under pressure' }, ` — ${why}; no more than one job runs until it eases.`],
+      parts: [{ strong: 'Machine under pressure' }, ` — ${why}; a job starts only when none is running, until it eases.`],
     });
   }
   if (b.machine?.encroaches?.length) {

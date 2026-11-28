@@ -412,16 +412,16 @@ impl MachineHold {
             MachineHold::Pressure(level) => (
                 "machine-pressure",
                 format!(
-                    "this machine's memory pressure is {} — no more than one job runs until it \
-                     is normal",
+                    "this machine's memory pressure is {} — a job starts only when none is \
+                     running, until it is normal",
                     level.as_str()
                 ),
             ),
             MachineHold::Swap { rise_mib } => (
                 "swap",
                 format!(
-                    "swap grew {} GiB in the last 5 minutes — no more than one job runs until it \
-                     has been flat for 2",
+                    "swap grew {} GiB in the last 5 minutes — a job starts only when none is running, \
+                     until it has been flat for 2 minutes",
                     fmt_gib(*rise_mib)
                 ),
             ),
@@ -1099,8 +1099,8 @@ mod tests {
             MachineHold::Pressure(PressureLevel::Warn).view(),
             (
                 "machine-pressure",
-                "this machine's memory pressure is warn — no more than one job runs until it is \
-                 normal"
+                "this machine's memory pressure is warn — a job starts only when none is \
+                 running, until it is normal"
                     .to_string()
             )
         );
@@ -1108,8 +1108,8 @@ mod tests {
             MachineHold::Swap { rise_mib: 1_536 }.view(),
             (
                 "swap",
-                "swap grew 1.5 GiB in the last 5 minutes — no more than one job runs until it has \
-                 been flat for 2"
+                "swap grew 1.5 GiB in the last 5 minutes — a job starts only when none is running, \
+                 until it has been flat for 2 minutes"
                     .to_string()
             )
         );
