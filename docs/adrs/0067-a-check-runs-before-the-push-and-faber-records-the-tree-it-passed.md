@@ -31,10 +31,13 @@ The owner set the direction and then settled the points below in a session on
   while its image is unchanged (§8).
 - The caller tells faber when the commit is pushed, and discovery is the fallback (§9).
 - The first caller runs its slow gates through faber and keeps its cheap ones in the
-  pre-push hook. A whole gate, as a sweep runs it, is one more named check (§2, §12).
+  pre-push hook. A whole gate, as a sweep runs it, is one more named check (§2, §13).
 - v1 has no token, no secrets, no LFS content, no dind and no macOS VM checks (§5).
 - On 2026-11-28: which tree a workflow compares, the pull request head's or the merge
   result's, is the repository's choice (§10).
+- On 2026-11-28: a check shows wherever jobs show, marked as local, with no view of its
+  own. The dashboard says how it ended and what became of a pass. The popover draws it
+  as it draws a job (§12).
 
 Revised the same day after two independent checks of its statements against `31c952c`.
 The first found:
@@ -62,6 +65,17 @@ The second, after the owner's decisions were written in, found:
   too (§5);
 - three statements about the gate that claimed more than it does (§3), and one that
   cited ADR-0046 for something it does not say.
+
+A third check, of §12 on 2026-11-28 against `31c952c`, found:
+
+- that the Jobs view names a class from the outcome record's label and not from its
+  key, so §7's record needs that label;
+- that the first slice was said to record nothing while its Jobs class needs the
+  outcome record;
+- that the row for a host-wide cause does not fit the proposed hints ADR as written,
+  in its figure and in sharing a cause with that ADR's first hint;
+- three statements that were imprecise about ADR-0056's phases, the Memory view and
+  what specifies the dashboard.
 
 It amends:
 
@@ -476,13 +490,77 @@ attest_ttl_hours = 24
 - It applies to the host it is set on. A follower that updates gains nothing until its
   operator writes the table.
 
-### 12. It is built in three slices
+### 12. A check shows wherever jobs show, marked as local
+
+The four routes of §3 are on the socket only. Without more, only the terminal that
+started a check would know it exists, while it holds budget a CI job is parked for. So
+(the owner, 2026-11-28):
+
+- **No view of its own.** A local job joins the surfaces that already show jobs.
+  [ADR-0054](0054-the-dashboard-is-views-in-a-sidebar.md) has a new section join a view
+  and a new view change that ADR. This adds neither.
+- **The state snapshot carries local jobs,** in flight and recently finished, each
+  marked as local, with its repo, its check's name, its tree id, its phase and why it is
+  parked. An in-flight entry is identified today by its GitHub job id, which a local job
+  does not have, so it carries the check's id (§3) instead. Whether local jobs sit in
+  the lists the snapshot has or in lists of their own is the build's choice.
+- **In the popover it is a job group.** A group is one pull request, or a repo and a
+  workflow when there is none ([popover.md](../design/popover.md)). A local job has
+  neither, so its group is its repo and its check: `demo | check verify`, and
+  `demo | check adhoc` for a run with no definition. Its pips are a job's: waiting,
+  running, frozen. A check that ran to its end draws the done pip whether it passed or
+  failed, and the red ring stays what it is for a job, a fault of faber's own (§7). The
+  popover shows no pass or fail, as it shows none for CI: the caller has the verdict in
+  the terminal.
+- **In the dashboard it is a row in Activity and a class in Jobs.** Activity lists a
+  finished check as an event of a kind of its own, so the Kind facet filters on it. The
+  row says how it ended: passed, failed, or did not run, which is faber's fault. Its
+  detail names the check, the tree id, the base or `full`, and what was overridden. The
+  Jobs view ranks classes from the audit trail's outcome records
+  ([ADR-0056](0056-a-run-records-where-its-time-and-resources-went.md) § 5), so §7's
+  record must be one it reads. The view names a class from the record's label, not from
+  its key, so the record carries a label in the shape the view reads, with the check's
+  name where a job's name stands. The class is marked as local. ADR-0056 clocks a run's
+  `job` phase from GitHub's timestamps and splits it by GitHub's steps. A check has
+  neither, so faber clocks its command's run itself and the phase is not split. Memory
+  shows the class's learned cap as any class's, and a parked check counts in its tally
+  of what parked jobs.
+- **A passed row says what became of the pass,** in one line: posted, with the commit;
+  recorded and not published yet; not recorded, because the run was overridden or had no
+  definition; or cannot be posted, with the condition of §8 that failed. For the first
+  of these faber keeps, beside the record, the commit it posted to. This line is how
+  "why did CI repeat the work?" is answered after the terminal is gone.
+- **A cause that holds for the whole host is said once.** On an engine that has granted
+  dind no pass is ever posted. Repeating that on every row is noise, and an alarm would
+  be wrong, since nothing is broken. It is one neutral row on the dashboard, in the
+  manner of the hints the proposed ADR `faber-says-when-a-faster-way-to-run-jobs-is-off`
+  describes (rejifald/faber#115, not merged): it can be dismissed, has no button, is not
+  in the popover and is never delivered outward, and it shows only while the host has
+  passes it could not post. It is not one of that ADR's hints as written, in two ways
+  that ADR would have to take up. Its figure is a count, how many passes of the last 7
+  days could not be posted, where a hint's figure is what a step costs. And the same
+  grant already has a row there, the git mirror held off beside dind, which names the
+  way back. One cause should not get two rows, so how the two are joined is decided
+  with that ADR, when this row is built. It is built only once both ADRs are accepted.
+
+The popover's content is frozen by `popover.md`: that document changes before the
+popover does. The dashboard's views are specified by the anatomy under
+[docs/design/dashboard](../design/dashboard/screens.md), which the change that builds
+the rows updates. Both are reviewed against the design guidelines, like any change to
+the UI.
+
+### 13. It is built in three slices
 
 1. **The sized run.** The routes, the bundle and the prepare step, the container, the
-   claim path and its classes, the CLI. Nothing is recorded or posted. This alone gives
-   a caller the container and the admission.
+   claim path and its classes, the CLI. No pass is recorded or posted (§8). This alone
+   gives a caller the container and the admission. With no definition yet, every run is
+   ad hoc and learns the `adhoc` class. It includes §7's outcome record, which the Jobs
+   view reads, the local jobs in the state snapshot, the popover group, and the Activity
+   row and Jobs class with how the run ended (§12): a check is never running where the
+   operator cannot see it.
 2. **The vouched check.** The definition, the record, the conditions of §8, `publish`
-   and the fallback, and the permission row.
+   and the fallback, the permission row, and the line that says what became of a pass
+   (§12).
 3. **The first repository adopts it.** Its workflow gains the comparison of §10, its
    pre-push tooling calls `faber check`, and the rows of *Validation* are measured.
 
@@ -490,6 +568,9 @@ attest_ttl_hours = 24
 
 - **A pre-push check gets what a CI job gets:** the runner image, admission, a learned
   cap, declared services and a cache. The operator's desktop stops being where it runs.
+- **A check is as visible as a job.** It shows in the popover and the dashboard from
+  the first slice, which also means the popover opens to its two-column width for a
+  check as it does for a job.
 - **The pool pays for it.** A local job takes budget a CI job could have had. With the
   skip of §10 working, the work is done once, earlier. It is done twice without it,
   on an engine that has granted dind, and, where a repository compares the merge
@@ -575,6 +656,20 @@ a pull request opened quickly.
 **Tell jobs through the runner's environment.** faber could give each runner the list of
 its repo's passed trees. No GitHub call and no race, but only on the host that ran the
 check, and a job on another host or a hosted runner would learn nothing.
+
+**A Checks view of its own.** Everything about checks in one place, the record of what
+was vouched included. It changes ADR-0054, and it splits "what is using the pool now"
+across two views: the operator asking why a job is parked would have to look in both.
+
+**Show checks in the dashboard only.** The popover would stay about CI. A check that
+parks a CI job would then be missing from the surface the operator glances at.
+
+**Pass and fail in the popover.** It would answer "did my check pass?" at a glance. The
+popover draws no verdict for a CI job, and a red failed check would sit beside the red
+ring that means faber broke.
+
+**Keep what became of a pass in the CLI only.** Less to build. "Why did CI repeat the
+work?" could then be answered only by whoever still has the terminal's output.
 
 **Use the git mirror for the base objects.** A thin bundle against ADR-0035's mirror
 needs no second store. The mirror is off on every engine that has granted dind until a
