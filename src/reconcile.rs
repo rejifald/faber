@@ -845,6 +845,12 @@ struct Metrics {
     /// auto-retry off the job, and bypass detection off a job faber allowed.
     /// Seeded from the audit log at boot, and bounded by [`BYPASS_WINDOW`].
     stopped_after_start: HashMap<(String, String), (u64, bool)>,
+    /// The allows faber delivered at a job-started hook within the last week
+    /// (`allowed` and `allowed_under_record` lines), by repository and runner →
+    /// when, and the allow. What bypass detection reads to tell a job faber
+    /// let past its hook from one it never judged, once the watch that
+    /// delivered the allow has ended. Seeded from the audit log at boot.
+    allowed_lines: HashMap<(String, String), (u64, crate::job_start::Passed)>,
 }
 
 /// What is on record of one runner, for one kind of fact about its job.
@@ -1373,6 +1379,24 @@ impl Metrics {
         );
     }
 
+    /// Remember an allow faber delivered to the hook on `runner`.
+    fn note_allowed_line(
+        &mut self,
+        repo: &str,
+        runner: &str,
+        passed: crate::job_start::Passed,
+        now: u64,
+    ) {
+        if !matches!(passed, crate::job_start::Passed::Allowed { .. }) {
+            return;
+        }
+        let window = BYPASS_WINDOW.as_millis() as u64;
+        self.allowed_lines
+            .retain(|_, (ts, _)| now.saturating_sub(*ts) <= window);
+        self.allowed_lines
+            .insert((repo.to_string(), runner.to_string()), (now, passed));
+    }
+
     /// Read the week's job-start records back from audit `entries`, as a boot
     /// does (ADR-0059). Refusals at start stay out of bypass detection and
     /// auto-retry across a restart. Refusals and hook faults stay counted,
@@ -1390,6 +1414,19 @@ impl Metrics {
             .restore(replayed_scope(entries, "refused_at_start"));
         self.hook_faults
             .restore(replayed_scope(entries, "hook_fault"));
+        for e in entries.iter().filter(|e| e.kind == crate::audit::JOB_START) {
+            let (Some(action), Some(runner)) = (e.action.as_deref(), e.runner.clone()) else {
+                continue;
+            };
+            if let Some(passed) =
+                crate::job_start::Passed::read(action, e.run_id.zip(e.run_attempt))
+            {
+                if matches!(passed, crate::job_start::Passed::Allowed { .. }) {
+                    self.allowed_lines
+                        .insert((e.repo.clone(), runner), (e.ts_ms, passed));
+                }
+            }
+        }
         for (repo, runner, ts_ms, allowed_at_start) in replayed_stops_after_start(entries) {
             self.stopped_after_start
                 .insert((repo, runner), (ts_ms, allowed_at_start));
@@ -2056,7 +2093,7 @@ pub struct Orchestrator {
     /// Enforced trust bypasses whose runner faber failed to kill, by runner name,
     /// tried again every cycle until the runner is gone (ADR-0059 §4). A runner
     /// whose kill failed is still executing a job the gate refuses.
-    kill_retries: std::sync::Mutex<BTreeMap<String, BypassView>>,
+    kill_retries: std::sync::Mutex<BTreeMap<String, (BypassView, bool)>>,
     /// The runners whose job faber judges when it starts (ADR-0059 §2), by
     /// the name each registered with GitHub. Written at mint and adoption; a
     /// watch leaves once its container is gone or its job was allowed.
@@ -9307,6 +9344,10 @@ impl Orchestrator {
                 StartStanding::Undecided
                 | StartStanding::RefusedAtStart
                 | StartStanding::StoppedAfterStart => continue,
+                StartStanding::AllowedAtStart => {
+                    self.stop_allowed_job(&b, on_bypass, now).await;
+                    continue;
+                }
                 StartStanding::RanPastRefusal => {
                     self.record_hook_fault_line(
                         &b.repo,
@@ -9364,6 +9405,61 @@ impl Orchestrator {
         }
     }
 
+    /// A job faber allowed at its start (an allow line of its own record, the
+    /// watch that delivered it long over) that the gate now refuses: stopped
+    /// at once, as the watch stops one it sees refused later, and written as a
+    /// `stopped_after_start` line. It is no bypass: no `gate_bypass` line, no
+    /// hold and no cache purge (ADR-0059 §2, §6). Only where `on_bypass` would
+    /// kill a bypass; otherwise nothing is done, as the watch does.
+    async fn stop_allowed_job(&self, b: &BypassView, on_bypass: OnBypass, now: u64) {
+        if !bypass_response(on_bypass, b.class).kill {
+            return;
+        }
+        self.stopped_runners
+            .lock()
+            .unwrap()
+            .insert(b.runner.clone(), now);
+        {
+            let mut m = self.metrics.lock().await;
+            m.note_killed(b.job_id, now);
+            m.note_stopped_after_start(&b.repo, &b.runner, true, now);
+        }
+        warn!(
+            "{}: stopping runner {} — the gate now refuses job {}, which faber allowed at its \
+             start (ADR-0059 §2)",
+            b.repo, b.runner, b.job_id
+        );
+        let cause = format!(
+            "runner {} (minted for job {}): the gate now refuses a job faber allowed at its \
+             start (job {}, {}); faber stopped it",
+            b.runner, b.minted_for, b.job_id, b.verdict
+        );
+        {
+            let mut m = self.metrics.lock().await;
+            m.recent_faults.push_back(FaultEvent {
+                ts_ms: now,
+                repo: b.repo.clone(),
+                scope: "job_start".to_string(),
+                action: "stopped_after_start".to_string(),
+                cause: cause.clone(),
+            });
+            while m.recent_faults.len() > FAULT_RECENT_CAP {
+                m.recent_faults.pop_front();
+            }
+        }
+        let rec = Record {
+            job_id: b.job_id,
+            run_id: Some(b.run_id),
+            runner: Some(b.runner.clone()),
+            verdict: Some(b.verdict.clone()),
+            ..Record::fault(&b.repo, "job_start", "stopped_after_start", Some(cause))
+        };
+        if let Err(e) = self.audit.append(&rec).await {
+            warn!("audit append failed: {e}");
+        }
+        self.kill_runner(b, false).await;
+    }
+
     /// One `gate_bypass` line on the faults feed and in the audit log, naming the
     /// job that ran, the runner, and (in `cause`) the job that runner was minted
     /// for. `action` is the class for the detection itself, or what enforcement
@@ -9399,6 +9495,13 @@ impl Orchestrator {
     /// (ADR-0030; ADR-0017's clearance protects legitimate work, and this is not).
     /// Nothing to do once its claim is gone: the runner already exited.
     async fn kill_bypassed_runner(&self, b: &BypassView) {
+        self.kill_runner(b, true).await;
+    }
+
+    /// Kill the runner `b` ran on. `bypass` is whether `b` is a recorded gate
+    /// bypass: only then is the kill written as a `gate_bypass` line. A job faber
+    /// allowed and stopped later is no bypass, and its stop is already written.
+    async fn kill_runner(&self, b: &BypassView, bypass: bool) {
         let containerized = self
             .inflight
             .lock()
@@ -9419,15 +9522,17 @@ impl Orchestrator {
             Some(true) => match crate::docker::force_kill_runner(&b.runner).await {
                 Ok(()) => {
                     self.metrics.lock().await.note_killed(b.job_id, now_ms());
-                    self.record_bypass_line(
-                        b,
-                        "killed",
-                        format!(
-                            "killed runner {} mid-job: job {} is a trust bypass ({})",
-                            b.runner, b.job_id, b.verdict
-                        ),
-                    )
-                    .await
+                    if bypass {
+                        self.record_bypass_line(
+                            b,
+                            "killed",
+                            format!(
+                                "killed runner {} mid-job: job {} is a trust bypass ({})",
+                                b.runner, b.job_id, b.verdict
+                            ),
+                        )
+                        .await
+                    }
                 }
                 Err(e) => {
                     // Not done: the runner may still be running the refused job.
@@ -9439,7 +9544,7 @@ impl Orchestrator {
                     self.kill_retries
                         .lock()
                         .unwrap()
-                        .insert(b.runner.clone(), b.clone());
+                        .insert(b.runner.clone(), (b.clone(), bypass));
                 }
             },
         }
@@ -9469,6 +9574,23 @@ impl Orchestrator {
             .is_some_and(|(_, allowed_at_start)| *allowed_at_start)
         {
             return StartStanding::StoppedAfterStart;
+        }
+        let attempt = runs
+            .iter()
+            .find(|(r, _)| r.id == b.run_id)
+            .map(|(r, _)| r.run_attempt);
+        let allowed_line = self
+            .metrics
+            .lock()
+            .await
+            .allowed_lines
+            .get(&(b.repo.clone(), b.runner.clone()))
+            .is_some_and(|(_, p)| {
+                matches!(p, crate::job_start::Passed::Allowed { run_id, run_attempt, .. }
+                    if *run_id == b.run_id && attempt.is_none_or(|a| a == *run_attempt))
+            });
+        if allowed_line {
+            return StartStanding::AllowedAtStart;
         }
         if !self.was_refused_at_start(b.job_id).await {
             return StartStanding::None;
@@ -9911,6 +10033,10 @@ impl Orchestrator {
                 j.map(|j| j.verdict.clone()),
             )
         };
+        self.metrics
+            .lock()
+            .await
+            .note_allowed_line(&w.repo, &w.runner, passed, now_ms());
         if let Err(e) = self.audit.append(&rec).await {
             warn!(
                 "{}: the record that runner {}'s job got past its hook ({}) was not written: \
@@ -10199,12 +10325,12 @@ impl Orchestrator {
     /// the runner is gone). A runner whose claim has gone has exited, which is
     /// what the kill was for.
     async fn retry_bypass_kills(&self) {
-        let pending: Vec<BypassView> = {
+        let pending: Vec<(BypassView, bool)> = {
             let mut retries = self.kill_retries.lock().unwrap();
             std::mem::take(&mut *retries).into_values().collect()
         };
-        for b in pending {
-            self.kill_bypassed_runner(&b).await;
+        for (b, bypass) in pending {
+            self.kill_runner(&b, bypass).await;
         }
     }
 
@@ -10640,6 +10766,9 @@ enum StartStanding {
     /// later judgement or because that allow no longer holds: not a bypass.
     /// Its code ran under an allow that was right by the rules then in force.
     StoppedAfterStart,
+    /// Allowed at its start by an allow line of faber's own record, and not
+    /// yet stopped: the gate now refuses it, so it is stopped, and no bypass.
+    AllowedAtStart,
 }
 
 /// The boot and dashboard warning while hook faults have been seen this week
@@ -19241,6 +19370,76 @@ pub(crate) mod tests {
         orch.detect_bypasses("owner/demo", &runs, &Codes::new())
             .await;
         assert!(orch.was_bypass(7).await, "never allowed, so a bypass");
+    }
+
+    /// A job faber let past its hook with an allow, whose watch has ended
+    /// (the allow was delivered), is stopped when bypass detection later sees
+    /// the gate refuse it: written once as `stopped_after_start`, no bypass,
+    /// no hold, no cache purge. The same after a restart. An `unverified`
+    /// line is no allow, and the job is still a bypass.
+    #[tokio::test]
+    async fn an_allowed_job_whose_watch_ended_is_stopped_not_a_bypass_when_refused_later() {
+        use crate::job_start::{DeadlineOutcome, Passed, Watch};
+        const RUNNER: &str = "faber-5-1000";
+        let stops = |log: &TempDir| -> usize {
+            job_start_faults(log)
+                .iter()
+                .filter(|l| l["action"] == "stopped_after_start")
+                .count()
+        };
+        let check = |orch: Arc<Orchestrator>, log: PathBuf, fresh: bool| async move {
+            for _ in 0..2 {
+                orch.detect_bypasses(
+                    "owner/demo",
+                    &ran_on(RUNNER, "dependabot[bot]"),
+                    &Codes::new(),
+                )
+                .await;
+            }
+            assert!(!orch.was_bypass(7).await);
+            let view = orch.view().await;
+            assert!(view.bypasses.is_empty(), "{:?}", view.bypasses);
+            assert!(view.repo_holds.is_empty(), "{:?}", view.repo_holds);
+            assert!(orch.cache_purges.lock().unwrap().is_empty());
+            if fresh {
+                assert!(orch.was_stopped_at_start(RUNNER));
+                assert!(orch.was_force_killed(7).await);
+            }
+            assert!(orch.stopped_its_job("owner/demo", RUNNER).await);
+            let lines = std::fs::read_to_string(log.join("audit.jsonl")).unwrap_or_default();
+            assert!(!lines.contains("gate_bypass"), "{lines}");
+        };
+        let (orch, log) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        orch.note_minted(RUNNER, 5, 0);
+        let mut w = Watch::new("owner/demo", RUNNER, 5, 50, 0, DeadlineOutcome::Refuse);
+        w.judge(allowed_job(7));
+        orch.record_passed_hook(
+            &w,
+            Passed::Allowed {
+                run_id: 900,
+                run_attempt: 1,
+                record_only: false,
+            },
+        )
+        .await;
+        check(orch.clone(), log.path.clone(), true).await;
+        assert_eq!(stops(&log), 1, "{:?}", job_start_faults(&log));
+
+        let (after, log_after) = restarted_on(&log, OnBypass::Enforce).await;
+        after.note_minted(RUNNER, 5, 0);
+        check(after, log_after.path.clone(), false).await;
+
+        // The control: a job that ran with no verdict was never allowed.
+        let (orch, _log) = test_orch_with(bypass_profiles(OnBypass::Enforce));
+        orch.note_minted(RUNNER, 5, 0);
+        orch.record_passed_hook(&w, Passed::Unverified).await;
+        orch.detect_bypasses(
+            "owner/demo",
+            &ran_on(RUNNER, "dependabot[bot]"),
+            &Codes::new(),
+        )
+        .await;
+        assert!(orch.was_bypass(7).await, "unverified is no allow");
     }
 
     /// Which stops the next process reads back as stops of a job faber had
