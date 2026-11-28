@@ -27,7 +27,7 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RunLine {
     pub ts_ms: u64,
-    kind: String,
+    pub(crate) kind: String,
     #[serde(default)]
     pub repo: String,
     #[serde(default)]
@@ -42,6 +42,10 @@ pub struct RunLine {
     pub label: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Whether the run was handed a Docker daemon: `granted` or `denied`, and
+    /// absent for a run with no container ([`crate::audit::Record`]).
+    #[serde(default)]
+    pub dind: Option<String>,
     #[serde(default)]
     pub result: Option<String>,
     #[serde(default)]

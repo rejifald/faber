@@ -198,11 +198,95 @@ Docker-API exception, which #107 and #108 close.
   the agent writes the verdict where the hook reads it, and confirms in its reply
   that a hook was waiting. The host still asks, the guest volunteers nothing, and
   `_faber` still parses no guest bytes (ADR-0025). A job in progress with no waiting
-  hook is a hook fault: faber stops it under `enforce`, and under `record` whenever
-  §5 refuses it at start.
+  hook is a hook fault, where faber can show one (below): faber stops it under
+  `enforce`, and under `record` whenever §5 refuses it at start.
 - **Two deadlines.** faber gives up its search before the hook's deadline. Both come
   from config, and both outlast one poll interval plus a daemon restart. Runners
   adopted after a restart get their verdicts.
+- **The watch and its records are the same for every backend.** What follows is
+  said of the watch faber keeps on each runner, and holds for a Docker runner and a
+  macOS VM alike. A backend supplies three things: what it sees of the worker and
+  the hook, how a verdict is delivered, and how a runner is stopped. The owner
+  decided the rules below on 2026-11-27, after a review of what a restart still got
+  wrong (rejifald/faber#106).
+- **A job already past its hook at a restart is not a hook fault.** The process that
+  adopts its runner (ADR-0011) finds the worker running and no hook waiting, which
+  is also all it could see of a job whose hook never ran. faber's own record tells
+  them apart, never GitHub's record of the job's steps, since a workflow can name a
+  step *Set up runner* (§6). faber writes a `job_start` line to its audit log when
+  an allow it delivered to a waiting hook has landed, and when a hook it saw
+  waiting leaves at its own deadline under an allow outcome. The adopting process
+  reads the line that names the runner and its repository, and judges the job
+  again. If the gate still allows the job, the missing hook is no fault and the
+  job runs on. An allow that was delivered for another run or attempt than the job
+  found on the runner is no record of that job.
+- **A hook fault is a claim, and faber makes it only where it can show one.** This
+  narrows "a job in progress with no waiting hook is a hook fault". The hook lets a
+  job run in two ways only: on an allow it accepts, and at its own deadline where
+  its outcome is allow, which is a private repository under `record` (§5). So:
+  - *A hook that leaves with the job running and no verdict delivered* is a hook
+    fault under a refuse outcome: there the hook stops the job at its deadline, so
+    one that left it running was killed, or took an allow the watch did not
+    deliver. Under an allow outcome it is a fault only where faber saw the runner
+    with no hook waiting less than one hook deadline before it saw the hook gone.
+    Otherwise faber cannot place the hook's start, because its first sight of the
+    hook came late, after a restart or a slow pass. The job is then written as run
+    unverified under `record`, and stopped under `enforce`.
+  - *A runner adopted with no hook in sight and no line* is a hook fault under a
+    refuse outcome, as before. Under an allow outcome its hook may have waited and
+    let the job run while no process watched. Under `record` faber writes a fault
+    of its own, `not_watched`, and the job runs unverified. Under `enforce` the
+    job is stopped.
+  - *One limit stays.* An allow leaves a line only if the line was written. If the
+    write failed, or the process died between the delivery and the write, a job
+    faber allowed is found with no line. Under a refuse outcome it is then a hook
+    fault, stopped under `enforce`: the evidence is the line, and where it is
+    missing faber does not let the job run on.
+- **When faber cannot judge that job again, what it recorded stands until it can.**
+  If no verdict comes by the search deadline, as when GitHub does not answer, the
+  job is not stopped for it. Its hook did not fail, and the job is not at its
+  start, so there is no hook to give the deadline's outcome to. faber records that
+  it could not judge again (`not_judged_again`), the job runs on as it would have
+  with no restart, and the watch stays and looks again about once a minute. A
+  judgement that allows the job closes it (`recovered`). One that refuses it stops
+  it. This holds only as far as §5 would still decide it under the mode in force.
+  An allow the gate gives in either mode stands in both. A trust refusal let
+  through under `record`, and a job that ran with no verdict, stand only under
+  `record`: under `enforce` such a job is stopped at the search deadline. The line
+  says which of these an allow was. A job written as `not_watched` that faber has
+  not judged is looked at again in the same way.
+- **A running job that faber stops, other than as a hook fault, is a record of its
+  own** (`stopped_after_start`). It covers a job with a line that a judgement
+  refuses, at once and not at the search deadline, since the line already explains
+  the missing hook. It covers a line that does not hold under `enforce` with no
+  judgement in time. It covers, on a host that moved to `enforce`, a hook whose
+  start faber cannot place and a job it did not watch start. And it covers, under
+  `record`, a job faber did not watch start that the gate refuses. The learner
+  learns nothing from that runner, and auto-retry leaves the job alone, across a
+  restart too.
+- **A job faber allowed at its start is not a bypass when it is stopped later.**
+  Its code ran under an allow that was right by the rules then in force. So for a
+  job with a line of an allow, faber records no bypass, holds no repository and
+  deletes no cache, whether or not the job is its runner's own, and bypass
+  detection (§6) waits for the watch of that job where it would have judged it.
+  A job that ran with no verdict of faber's is judged by detection as before: if
+  it is not its runner's own. For the runner's own job the watch's later judgement
+  is the only one.
+- **A hook fault is one for its runner, and so is a refusal at start.** A runner
+  takes one job, so each is one fact, whoever finds it and however often: the
+  check that watches the runner, the process that adopts the runner after a
+  restart and sees the same thing, and bypass detection (§6) on every cycle that a
+  refused job is still running. faber counts it once in the week, and writes a
+  line once for each thing it did about it. A hook fault a host only recorded,
+  which a later process stops because it enforces, leaves two lines and counts
+  once. A refusal whose delivery and stop both failed, and which the next process
+  delivers, is one refusal. What faber knows of the week it reads back from its
+  own audit log at boot, as it does for bypasses (ADR-0030). Stopping the job
+  never waits on that memory: it decides only what is written and counted.
+- **The records a restart adds are lines, not counts.** `not_judged_again`,
+  `not_watched`, `recovered` and `stopped_after_start` are fault lines: each is in
+  the audit log, and on the dashboard while it is among the daemon's most recent
+  faults. None has a 7-day count or a boot warning.
 
 The mint-time verdict stays as the first filter: faber still mints only for jobs it
 would run. The job-start verdict is the one that decides what executes.
@@ -307,6 +391,9 @@ get `enforce` from the starter config, as the review settled.
   nothing from it. **Otherwise it is a bypass,** whatever the job's steps are called,
   since a workflow can name a step *Set up runner*: ADR-0030's kill, cache deletion
   and hold, plus a hook fault.
+- **Nor is a job faber allowed at its start and stopped later** (§2). Its hook did
+  its work and its code ran under faber's allow. It is stopped and recorded, and
+  ADR-0030's cache deletion and hold are not applied to it.
 - **Detection stays, with a sharper meaning.** Under `enforce`, a trust bypass now
   means that a runner ran a trust-refused job's steps without faber's verdict: the
   hook is broken, missing or ignored. That is a fault of its own, loud on every
@@ -453,6 +540,13 @@ macOS VM:
 | The hook file missing; the hook failing with an error of its own | faber does not start the runner; the hook kills its parent, and no step runs |
 | What GitHub shows after a refusal | the job's conclusion and log recorded |
 | A refusal at start, and a runner that ignores the hook | faber records refused at start for the first, and a hook fault for the second |
+| A daemon restart under `enforce` while a job is past its hook and still running | the job runs to its end, and no hook fault is recorded |
+| The same restart with GitHub unreachable for the whole search deadline | the job runs to its end, and faber records that it could not judge it again |
+| A daemon restart under `record` while a job whose hook never ran is still running | one hook fault in the audit log and in the 7-day count, not two |
+| A restart inside a hook's wait, with no verdict before the hook's deadline, on a private repository under `record` | the job is written as run unverified, and no hook fault is recorded |
+| A stop longer than a hook's wait while a job starts, on a private repository under `record` | after the restart the job is written as not watched, and no hook fault is recorded |
+| A restart with GitHub unreachable past the search deadline, then reachable again | the job runs on, faber judges it within about a minute of GitHub answering, and writes the closing line |
+| The same, after the gate was changed to refuse that job | the runner is stopped once GitHub answers, the repository is not held and its cache is kept |
 | A job taken by a runner minted for another job | judged at start as the job it is, found by `runner_name` |
 | A job past the 100th in its run | found |
 | A stranger's fork PR, and a merge group carrying it, on a test repository | both refused before their first step |

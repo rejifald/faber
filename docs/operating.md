@@ -190,6 +190,28 @@ dashboard. Once the engine has granted dind, they stay off on it. If either mirr
 ran beside dind on your Mac, regenerate the token and review what it could have changed:
 [docs/git-mirror.md](git-mirror.md#not-beside-dind) has the steps.
 
+### Speed-up hints
+
+When a faster way to run jobs exists on this host and is off, the dashboard's Overview
+says so in a neutral row ([the speed-up hints ADR](adrs/0068-faber-says-when-a-faster-way-to-run-jobs-is-off.md)).
+Today there is one: the git mirror, when no Docker profile turns it on or when it is held
+off beside dind. The row says how long checkout took on this host's runs in the last
+7 days, why the mirror is not in use, whether the dind grant holding it off is still
+used, and what the way back takes. For a grant no run used in those 7 days it adds that
+denying it (`dind = false`) is not a trust widening.
+
+- **The figure is your host's own.** It comes from the step timings faber records for
+  each run. faber does not record whether a run used the mirror, so the row states what
+  checkout costs today and never what the mirror would save. With no timed checkout step
+  on record it says so.
+- **A hint changes nothing.** It stops no job, has no button, and is never sent as a
+  notification. Its fix is a config change, and where that change widens trust the row
+  says what it accepts.
+- **Dismiss it, or turn hints off.** Dismiss hides the row while its cause stays the
+  same. `[host] speed_hints = false` turns every hint off; it applies on restart.
+- **A host with nothing to gain shows none:** no Docker profile, the mirror already on,
+  or no Docker run in the last 7 days.
+
 ## Declared services instead of dind
 
 A job that only needs a database, a cache or a mail catcher doesn't need a Docker daemon.
@@ -488,6 +510,43 @@ Jobs already running carry on: the new process adopts them
 Settings page lists the keys the running daemon hasn't taken yet. A few apply at once:
 the autolimiter's `reserve_mib`, `headroom_mib`, `margin` and `hard_ceiling`, and every
 `[update]` key.
+
+The new process also judges each adopted Docker job again, as it judges a job that
+starts ([ADR-0059](adrs/0059-the-gate-runs-again-when-a-job-starts.md)). A job in
+mid-run has no hook waiting, because its hook let it through before the restart. faber
+knows that from a `job_start` line it wrote to the audit log at the time, and leaves
+the job running if your gate still allows it.
+
+If faber can't judge the job within `job_start_search_secs` of the restart, because
+GitHub isn't answering, the earlier decision stands for now and the job runs on. faber
+records that as a `job_start` fault, `not_judged_again`, and looks again about once a
+minute. When GitHub answers, it closes the fault with `recovered`, or stops the job.
+
+faber stops an adopted job, and records `stopped_after_start`, in three cases:
+
+- your gate now refuses it. It is stopped as soon as faber has judged it;
+- faber can't judge it again on a Mac that now enforces, and only `record` allowed the
+  earlier decision. That is a job the gate refused on trust and let run because the
+  Mac only recorded, or one that ran with no verdict;
+- it started while faber wasn't watching, and nothing in the log says its hook let it
+  through, on a runner whose hook lets a job run when no verdict comes: one started for
+  a private repository while the Mac recorded. It is stopped if the Mac now enforces,
+  or if your gate refuses the job.
+
+A job stopped this way is not a hook fault. Where faber had allowed it at its start it
+is not a bypass either: the repository isn't held and its cache is kept.
+
+On a Mac that records, a job on a private repository that started while faber wasn't
+watching runs on, and faber records `not_watched`. Its hook may have waited and let it
+run, and faber can't tell.
+
+A hook fault is what faber records when it can show a hook didn't do its work: no hook
+waited for a job faber watched start, a hook left early, or a job is running with
+nothing in the log on a runner whose hook stops a job when no verdict comes. It is
+stopped under `enforce`. A hook fault is written and counted once for a runner, and so
+is a refusal at start. If the audit log already holds one for a job that is still running, the new
+process adds nothing for it, unless it does something new about it: on a Mac that now
+enforces it stops the job, and writes that.
 
 Some keys tighten what faber does, and a release must not tighten a Mac that didn't ask.
 Those have a third state, *unstated*: left out, faber behaves as it did before the key

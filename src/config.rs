@@ -144,6 +144,10 @@
 //! # that grants one (ADR-0026). Absent is "unstated": every job on a granting
 //! # profile gets a daemon, as before, warned at boot. The cut sets it true.
 //! # dind_requires_label = true
+//! # Show a neutral dashboard row when a faster way to run jobs exists on this
+//! # host and is off (a git mirror, say), with what the step it shortens costs
+//! # here. A hint changes nothing faber does. false = no hints.
+//! speed_hints = true
 //!
 //! # Registry credentials for the images a *job* pulls. HELD: a credential mounted
 //! # into a job can be read by the job's code, so faber mounts none, and
@@ -2915,6 +2919,14 @@ pub struct HostPolicy {
     /// holding unconditionally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dind_requires_label: Option<bool>,
+    /// Show speed-up hints on the dashboard: a faster way to run jobs that this
+    /// host has and leaves off, with what the step it shortens costs here (ADR
+    /// faber-says-when-a-faster-way-to-run-jobs-is-off). On by default, and safe
+    /// to be: a hint is a neutral dashboard row that changes nothing faber does,
+    /// stops no job and can be dismissed, and a host with nothing to gain gets
+    /// none. `false` turns every hint off. Needs a restart. See [`crate::hints`].
+    #[serde(default = "default_true")]
+    pub speed_hints: bool,
 }
 
 fn default_true() -> bool {
@@ -2956,6 +2968,7 @@ impl Default for HostPolicy {
             prevent_sleep: None,
             prevent_sleep_while_busy: None,
             dind_requires_label: None,
+            speed_hints: default_true(),
         }
     }
 }

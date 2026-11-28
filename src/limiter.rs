@@ -41,9 +41,9 @@
 //!   profile grants dind is charged 10 GiB, any other 3 GiB.
 //! - **The machine** has a share too, once `[host] keep_memory_gib` / `keep_cpus`
 //!   are stated (ADR-0021): Gate 1 and the CPU budget plan within what the share
-//!   leaves CI of the machine, and admission pauses — macOS VM jobs included —
-//!   while the machine reports memory pressure or its swap is growing
-//!   (ADR-0032 §3). See [`crate::machine`].
+//!   leaves CI of the machine, and admission pauses — macOS VM jobs included,
+//!   and down to one job, never zero — while the machine reports memory
+//!   pressure or its swap is growing (ADR-0032 §3). See [`crate::machine`].
 //! - With that share declared, Gate 1's reserve is **measured** too (ADR-0021
 //!   §3): the larger of `reserve_mib` and the 24-hour peak of what the VM uses
 //!   beyond faber's own containers, sampled once a minute. See
@@ -2041,8 +2041,7 @@ impl Limiter {
         let machine_hold = self.current_machine_hold();
         let mut inner = self.inner.lock().unwrap();
         if let Some(hold) = machine_hold {
-            let floor = matches!(hold, MachineHold::Pressure(_))
-                && inner.docker_inflight + inner.vm.macos_running == 0;
+            let floor = inner.docker_inflight + inner.vm.macos_running == 0;
             if !floor {
                 return Err(self.machine_wait(hold));
             }
@@ -2282,7 +2281,7 @@ impl Limiter {
         if gate(was) != gate(hold) {
             match hold {
                 Some(h) => warn!(
-                    "machine: {} (ADR-0021; memory pressure still lets one Docker job run)",
+                    "machine: {} (ADR-0021; one job still runs while nothing else does)",
                     h.view().1
                 ),
                 None => info!("machine: memory pressure normal and swap flat — resuming admission"),
@@ -2602,13 +2601,14 @@ impl Limiter {
         // The machine before the daemon (ADR-0021 §2c): it stops CI adding work to
         // a machine that is already paging, whatever the VM's own gates say.
         //
-        // Memory pressure keeps a floor of one Docker job (#160): the VM never
-        // returns memory, so with nothing running the pressure cannot fall, and a
-        // gate that held at zero would take the host out of the pool for good. Swap
-        // has no floor: it clears on its own once nothing adds to it.
+        // Both machine holds keep a floor of one job (#160): the VM never returns
+        // memory, so with nothing running the pressure cannot fall, and a gate that
+        // held at zero would take the host out of the pool for good. Growing swap
+        // keeps the same floor (ADR-0021, amendment of 2026-11-27): on a machine
+        // with other tenants it kept growing with no CI job running, so stopping
+        // CI did not clear it.
         if let Some(hold) = self.current_machine_hold() {
-            let floor = matches!(hold, MachineHold::Pressure(_))
-                && inner.docker_inflight + inner.vm.macos_running == 0;
+            let floor = inner.docker_inflight + inner.vm.macos_running == 0;
             if !floor {
                 return Err(self.machine_wait(hold));
             }
@@ -7321,7 +7321,8 @@ mod tests {
                 PressureLevel::Critical
             )))
         );
-        // Swap has no floor: it clears once nothing adds to it.
+        // Growing swap keeps the same floor (ADR-0021, amendment of 2026-11-27):
+        // on a machine with other tenants, stopping CI does not stop the growth.
         let lim = Limiter::new(cfg(), &HashMap::new());
         lim.set_vm_total_for_test(1 << 20);
         lim.set_machine_share(example_share());
@@ -7331,7 +7332,12 @@ mod tests {
             ..machine(Some(PressureLevel::Normal))
         };
         lim.set_machine_for_test(Some(swap(3_000)), t0);
-        lim.set_machine_for_test(Some(swap(4_200)), t0 + 1);
+        lim.set_machine_for_test(Some(swap(5_000)), t0 + 1);
+        assert!(matches!(
+            lim.current_machine_hold(),
+            Some(MachineHold::Swap { .. })
+        ));
+        assert_eq!(lim.try_admit(NO_TICKET, 100), Ok(()));
         assert!(matches!(
             lim.try_admit(NO_TICKET, 100),
             Err(Wait::Machine(MachineHold::Swap { .. }))
@@ -7339,7 +7345,7 @@ mod tests {
     }
 
     #[test]
-    fn growing_swap_holds_even_under_pressure_with_nothing_admitted() {
+    fn under_pressure_growing_swap_is_reported_as_pressure_and_keeps_the_floor() {
         let lim = Limiter::new(cfg(), &HashMap::new());
         lim.set_vm_total_for_test(12 * 1024);
         lim.set_machine_share(example_share());
@@ -7349,11 +7355,16 @@ mod tests {
             ..machine(Some(PressureLevel::Warn))
         };
         lim.set_machine_for_test(Some(both(3_000)), t0);
-        lim.set_machine_for_test(Some(both(4_200)), t0 + 1);
-        assert!(matches!(
+        lim.set_machine_for_test(Some(both(5_000)), t0 + 1);
+        assert_eq!(
+            lim.current_machine_hold(),
+            Some(MachineHold::Pressure(PressureLevel::Warn))
+        );
+        assert_eq!(lim.try_admit(NO_TICKET, 100), Ok(()));
+        assert_eq!(
             lim.try_admit(NO_TICKET, 100),
-            Err(Wait::Machine(MachineHold::Swap { .. }))
-        ));
+            Err(Wait::Machine(MachineHold::Pressure(PressureLevel::Warn)))
+        );
     }
 
     #[test]
@@ -7412,11 +7423,13 @@ mod tests {
             ..machine(Some(PressureLevel::Normal))
         };
         lim.set_machine_for_test(Some(swap(3_000)), t0);
-        lim.set_machine_for_test(Some(swap(4_200)), t0 + 1);
+        lim.set_machine_for_test(Some(swap(5_000)), t0 + 1);
+        // One job already running: the floor (#160) is spent.
+        let _running = lim.adopt(100.into());
         let refused = lim.try_admit(NO_TICKET, 100).unwrap_err();
         assert_eq!(
             refused,
-            Wait::Machine(MachineHold::Swap { rise_mib: 1_200 })
+            Wait::Machine(MachineHold::Swap { rise_mib: 2_000 })
         );
         assert_eq!(refused.view().gate, "swap");
         assert_eq!(lim.snapshot().machine.hold, Some("swap"));

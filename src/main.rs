@@ -816,6 +816,10 @@ async fn cli() -> anyhow::Result<()> {
                 faber::audit::now_ms(),
             );
             beside_dind.apply(&mut cfg.profiles, &mut cfg.mirror);
+            // What this config leaves unused that would make jobs faster, for
+            // the dashboard's hints. Decided from the file as written, before
+            // the line above takes the held mirrors out of what runs.
+            let hint_plan = faber::hints::Plan::of(&boot, &beside_dind);
             if let Some(text) = beside_dind.warning(dind_marker.as_deref()) {
                 tracing::warn!("{text}");
                 notices.push(faber::reconcile::Notice {
@@ -1150,6 +1154,7 @@ async fn cli() -> anyhow::Result<()> {
                         notices,
                         trust_changes,
                         attention,
+                        Arc::new(faber::hints::Hints::new(hint_plan)),
                     )
                     .await
                     {
