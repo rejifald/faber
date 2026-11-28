@@ -173,6 +173,10 @@ quiet `VMs:` line under the attention list, shown beside the peer rows; the
 panel shows the same states. A wall that has never been read is not a row: a
 host without the wall has nothing to report.
 
+Speed-up hints ([the speed-up hints ADR](../adrs/0068-faber-says-when-a-faster-way-to-run-jobs-is-off.md)) are
+not in the popover. They are the dashboard's: a hint is not something that needs the
+operator now, and a healthy popover is calm.
+
 Update notices join the list only when they need an action or report trouble.
 Checking, downloading, a plain "available", deferred and failed phases are not
 shown in the popover; the panel has them, and the ⋯ menu shows only the

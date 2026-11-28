@@ -33,6 +33,7 @@ pub mod freeze;
 pub mod gate;
 pub mod git_mirror;
 pub mod github;
+pub mod hints;
 pub mod host;
 pub mod image;
 pub mod instance;
