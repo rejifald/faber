@@ -119,6 +119,10 @@ Admission cannot stop a job that outgrows its charge once it has started. So:
 
 ### 3. Growing swap is a pressure signal
 
+- **Amended 2026-11-27** by ADR-0021's amendment of that date: growing swap
+  keeps the one-job floor, gives way to the pressure level under `warn`, scales
+  its threshold to 5% of the machine's memory (1 GiB at least), counts net
+  growth, and resumes after 2 flat minutes. The figures below are the original.
 - **The signal.** This amends ADR-0021 §2c. Besides `warn` and `critical`,
   admission also pauses while swap use has grown by at least 1 GiB in the last
   5 minutes, and it resumes once swap has stopped growing for 5 minutes. On macOS,
