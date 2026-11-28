@@ -293,13 +293,13 @@ carries it under `hints` (an additive field), with the figures as numbers:
 
 ```json
 "hints": [
-  {"kind": "git_mirror", "cause": "dind_granted", "profiles": ["linux-dind"],
+  {"kind": "git_mirror", "cause": "dind_granted", "profiles": ["linux-dind"], "asked": false,
    "window_days": 7, "docker_runs": 300, "dind_runs": 0,
    "runs": 280, "median_ms": 24000, "total_ms": 7500000}
 ]
 ```
 
-`cause` is `off`, `dind_granted` or `engine_marked`. `runs`, `median_ms` and
+`cause` is `off`, `dind_granted` or `engine_marked`. `asked` is whether a docker profile already sets `git_mirror`: when it is `false` and the mirror is held off, the row adds that `git_mirror = true` must be set after the way back, and that this widens trust. `runs`, `median_ms` and
 `total_ms` are absent when no run in the window has a timed checkout step: a
 step GitHub named `Run actions/checkout@…`, or one a workflow named beginning
 with "Checkout". The figures are illustrative. `[host] speed_hints = false`

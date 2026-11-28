@@ -68,6 +68,10 @@ pub struct Hint {
     /// The docker profiles that grant dind, for [`Cause::DindGranted`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub profiles: Vec<String>,
+    /// Whether the config already asks for the mirror (a docker profile sets
+    /// `git_mirror`). When it does not, the way back from a hold also has to
+    /// set it, and that is the step that widens trust.
+    pub asked: bool,
     /// The window every count and figure below covers.
     pub window_days: u64,
     /// Docker runs in the window, and how many were handed a Docker daemon.
@@ -95,6 +99,8 @@ pub struct Plan {
     /// Why the git mirror is not in use, and the profiles that grant dind.
     /// `None`: it is in use, or this host has no docker profile to use it.
     git_mirror: Option<(Cause, Vec<String>)>,
+    /// A docker profile sets `git_mirror`, held off or not.
+    asked: bool,
 }
 
 impl Plan {
@@ -116,15 +122,16 @@ impl Plan {
         if docker().next().is_none() {
             return Self::default();
         }
+        let asked = docker().any(|p| p.git_mirror);
         let git_mirror = match &beside_dind.cause {
             Some(mirror_beside_dind::Cause::Granted(names)) => {
                 Some((Cause::DindGranted, names.clone()))
             }
             Some(mirror_beside_dind::Cause::Marked) => Some((Cause::EngineMarked, Vec::new())),
-            None if docker().any(|p| p.git_mirror) => None,
+            None if asked => None,
             None => Some((Cause::Off, Vec::new())),
         };
-        Self { git_mirror }
+        Self { git_mirror, asked }
     }
 
     /// Whether any hint could ever show on this boot.
@@ -137,7 +144,7 @@ impl Plan {
     pub fn hints(&self, runs: &[RunLine], now_ms: u64) -> Vec<Hint> {
         self.git_mirror
             .iter()
-            .filter_map(|(cause, profiles)| git_mirror_hint(cause, profiles, runs, now_ms))
+            .filter_map(|(cause, profiles)| git_mirror_hint(cause, profiles, self.asked, runs, now_ms))
             .collect()
     }
 }
@@ -173,6 +180,7 @@ fn median(values: &mut [u64]) -> Option<u64> {
 fn git_mirror_hint(
     cause: &Cause,
     profiles: &[String],
+    asked: bool,
     runs: &[RunLine],
     now_ms: u64,
 ) -> Option<Hint> {
@@ -195,6 +203,7 @@ fn git_mirror_hint(
         kind: "git_mirror",
         cause: cause.clone(),
         profiles: profiles.to_vec(),
+        asked,
         window_days: WINDOW_DAYS,
         docker_runs: window.len(),
         dind_runs: window.iter().filter(|r| granted(r)).count(),
@@ -341,7 +350,7 @@ mod tests {
 
     #[test]
     fn a_granting_profile_holds_it_off_whether_or_not_the_config_asks() {
-        for mirror in ["", "git_mirror = true"] {
+        for (mirror, asked) in [("", false), ("git_mirror = true", true)] {
             let toml = format!(
                 "{}{}",
                 docker_profile("linux", &format!("dind = false\n{mirror}")),
@@ -352,6 +361,7 @@ mod tests {
                 Some((Cause::DindGranted, vec!["linux-dind".to_string()])),
                 "{mirror:?}"
             );
+            assert_eq!(plan(&toml, true).asked, asked, "{mirror:?}");
         }
         // No `dind` key still grants (ADR-0013).
         assert_eq!(

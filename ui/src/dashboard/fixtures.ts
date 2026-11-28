@@ -203,6 +203,7 @@ export const quiet: DaemonState = {
 export const checkoutHint = (cause: SpeedHint['cause'], over: Partial<SpeedHint> = {}): SpeedHint => ({
   kind: 'git_mirror',
   cause,
+  asked: false,
   window_days: 7,
   docker_runs: 300,
   dind_runs: 0,

@@ -1951,7 +1951,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!([{
-                "kind": "git_mirror", "cause": "off", "window_days": 7,
+                "kind": "git_mirror", "cause": "off", "asked": false, "window_days": 7,
                 "docker_runs": 1, "dind_runs": 0,
                 "runs": 1, "median_ms": 20_000, "total_ms": 20_000,
             }])

@@ -284,7 +284,7 @@ function checkoutCost(h: SpeedHint): string {
 
 /**
  * Whether the dind grant that holds a mirror off is in use: the runs handed a daemon, or how long
- * ago the last one was, and for an unused grant that denying it widens nothing.
+ * ago the last one was, and for an unused grant that denying it is not itself a widening.
  */
 function dindUse(h: SpeedHint, now: number): string {
   if (h.dind_runs > 0) {
@@ -292,7 +292,7 @@ function dindUse(h: SpeedHint, now: number): string {
   }
   const last = h.last_dind_ms != null ? `; the last was ${fmtAgo((now - h.last_dind_ms) / 1000)} ago` : '';
   // A grant still on a profile and used by nothing: taking it away narrows trust, and the row says so.
-  const deny = h.cause === 'dind_granted' ? 'Denying the unused grant is not a trust widening. ' : '';
+  const deny = h.cause === 'dind_granted' ? 'Denying the unused grant is not itself a trust widening. ' : '';
   return `No run in ${lastDays(h)} was given a Docker daemon${last}. ${deny}`;
 }
 
@@ -324,6 +324,16 @@ function hintAlarms(s: DaemonState, now: number): Alarm[] {
         { mono: 'docs/git-mirror.md' },
         ', “Turning them back on”.',
       );
+      // No profile asks for the mirror yet: the steps above leave it off, and setting the key is the widening.
+      if (h.asked === false) {
+        parts.push(
+          ' No profile sets ',
+          { mono: 'git_mirror' },
+          ' yet, so the mirror stays off after those steps until ',
+          { mono: 'git_mirror = true' },
+          ' is set on a docker profile. That widens trust: each refresh puts faber’s GitHub token on the Docker engine.',
+        );
+      }
     }
     out.push(alarm(`hint:${h.kind}`, 'info', parts));
   }

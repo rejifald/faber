@@ -127,14 +127,17 @@ neutral, dismissable row is not one. The key applies on restart.
   docker runs in the window were handed a Docker daemon, and when the last one
   was. A grant nothing has used for weeks is then visible as what holds the
   mirror off, and for a grant no run in the window used the row adds that
-  denying it is not a trust widening (owner, 2026-11-28): setting
+  denying it is not itself a trust widening (owner, 2026-11-28): setting
   `dind = false` narrows what jobs reach. The count compares the `outcome` line's `dind` field with
   `granted`: the field is `granted` or `denied`, and absent only for a run with
   no container.
 - **The way back.** `off`: `git_mirror = true`, a trust widening that puts
   faber's token on the engine for each refresh. Held: `dind = false` on every
   docker profile and a fresh Linux VM disk, an operator step with risks of its
-  own (docs/git-mirror.md, "Turning them back on"). The row says which.
+  own (docs/git-mirror.md, "Turning them back on"). When no profile sets
+  `git_mirror` either (the hint's `asked` is false), the held row's way back
+  ends with `git_mirror = true`, the trust widening, because the mirror stays
+  off after the dind steps until it is set. The row says which.
 
 What is off and why is decided at boot, from the config as written: every key it
 reads applies on restart. The figures are read from the audit log in the

@@ -650,6 +650,8 @@ export interface SpeedHint {
   cause: 'off' | 'dind_granted' | 'engine_marked';
   /** The docker profiles that grant dind, for `dind_granted`. */
   profiles?: string[];
+  /** Whether a docker profile already sets `git_mirror`; absent from an older daemon. */
+  asked?: boolean;
   window_days: number;
   /** Docker runs in the window, and how many of them were handed a Docker daemon. */
   docker_runs: number;
