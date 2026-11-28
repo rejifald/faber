@@ -518,24 +518,35 @@ knows that from a `job_start` line it wrote to the audit log at the time, and le
 the job running if your gate still allows it.
 
 If faber can't judge the job within `job_start_search_secs` of the restart, because
-GitHub isn't answering, the earlier decision stands and the job runs on. faber records
-that as a `job_start` fault, `not_judged_again`.
+GitHub isn't answering, the earlier decision stands for now and the job runs on. faber
+records that as a `job_start` fault, `not_judged_again`, and looks again about once a
+minute. When GitHub answers, it closes the fault with `recovered`, or stops the job.
 
-Three kinds of job are handled as a job whose hook never ran, which under `enforce`
-means stopped:
+faber stops an adopted job, and records `stopped_after_start`, in three cases:
 
-- a job the gate now refuses, which is stopped in either mode;
-- a job faber can't judge again, on a Mac that now enforces, if only `record` allowed
-  the earlier decision. That is a job the gate refused on trust and let run because the
+- your gate now refuses it. It is stopped as soon as faber has judged it;
+- faber can't judge it again on a Mac that now enforces, and only `record` allowed the
+  earlier decision. That is a job the gate refused on trust and let run because the
   Mac only recorded, or one that ran with no verdict;
-- a job that got past its hook under a version of faber older than that line. Every
-  job in mid-run is one of these the first time a Mac restarts onto a version that
-  writes the line, so make that restart on a drained Mac.
+- it started while faber wasn't watching, and nothing in the log says its hook let it
+  through, on a runner whose hook lets a job run when no verdict comes: one started for
+  a private repository while the Mac recorded. It is stopped if the Mac now enforces,
+  or if your gate refuses the job.
 
-A hook fault is written and counted once for a runner. If the audit log already holds
-one for a job that is still running, the new process adds nothing for it, unless it
-does something new about it: on a Mac that now enforces it stops the job, and writes
-that.
+A job stopped this way is not a hook fault. Where faber had allowed it at its start it
+is not a bypass either: the repository isn't held and its cache is kept.
+
+On a Mac that records, a job on a private repository that started while faber wasn't
+watching runs on, and faber records `not_watched`. Its hook may have waited and let it
+run, and faber can't tell.
+
+A hook fault is what faber records when it can show a hook didn't do its work: no hook
+waited for a job faber watched start, a hook left early, or a job is running with
+nothing in the log on a runner whose hook stops a job when no verdict comes. It is
+stopped under `enforce`. A hook fault is written and counted once for a runner, and so
+is a refusal at start. If the audit log already holds one for a job that is still running, the new
+process adds nothing for it, unless it does something new about it: on a Mac that now
+enforces it stops the job, and writes that.
 
 Some keys tighten what faber does, and a release must not tighten a Mac that didn't ask.
 Those have a third state, *unstated*: left out, faber behaves as it did before the key
